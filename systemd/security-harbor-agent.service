@@ -7,7 +7,7 @@ Requires=security-harbor-failsafe.service
 Type=simple
 User=security-harbor
 Group=security-harbor
-ExecStart=/usr/local/bin/security-harbor-agent --config /etc/security-harbor/config.json
+ExecStart=/usr/local/bin/security-harbor-agent --data-dir /var/lib/security-harbor
 Restart=always
 RestartSec=5s
 
@@ -20,6 +20,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+RuntimeDirectory=security-harbor
 ReadWritePaths=/var/lib/security-harbor /etc/security-harbor /run/security-harbor
 ProtectKernelTunables=false
 ProtectKernelModules=false

@@ -43,7 +43,7 @@ func TestRenderJSON(t *testing.T) {
 	foundWANBlock := false
 	for _, el := range root.Nftables {
 		if el.Rule != nil && el.Rule.Comment != "" {
-			if el.Rule.Comment == "HARD WAN MANAGEMENT BLOCK on eth0" {
+			if el.Rule.Comment == "HARD WAN DROP ALL INCOMING on eth0" || el.Rule.Comment == "HARD WAN MANAGEMENT BLOCK on eth0" {
 				foundWANBlock = true
 				break
 			}

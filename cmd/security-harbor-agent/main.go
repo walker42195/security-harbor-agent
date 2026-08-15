@@ -18,7 +18,7 @@ import (
 
 func main() {
 	configDir := flag.String("data-dir", "/var/lib/security-harbor", "Sökväg till datakatalog")
-	bindAddr := flag.String("bind", "0.0.0.0:8443", "IP/Port för Management API")
+	bindAddr := flag.String("bind", "10.0.0.163:8443", "IP/Port för Management API")
 	dryRun := flag.Bool("dry-run", false, "Starta i dry-run läge utan att ändra nftables i kärnan")
 	flag.Parse()
 
@@ -30,7 +30,7 @@ func main() {
 	}
 
 	// 32-bytes masterkey (i prod genereras eller hämtas denna från HSM/TPM/Vault)
-	masterKey := []byte("SecurityHarborMasterKey2026Secure")
+	masterKey := []byte("SecurityHarborMasterKey2026Secur")
 
 	st, err := store.NewStore(*configDir, masterKey)
 	if err != nil {

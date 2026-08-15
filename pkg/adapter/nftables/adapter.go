@@ -46,8 +46,8 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		root.Nftables = append(root.Nftables, NFTElement{Chain: &ch})
 	}
 
-	// 2. Basregler för Input chain (Loopback & Stateful + Hård WAN-mgmt-spärr)
-	// Input: Loopback accept
+	// 2. Basregler för Input chain
+	// Input 1: Loopback accept
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
 			Family: a.family,
@@ -58,7 +58,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				map[string]interface{}{
 					"match": map[string]interface{}{
 						"op": "==",
-						"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "meta", "field": "iifname"}},
+						"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
 						"right": "lo",
 					},
 				},
@@ -67,7 +67,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
-	// Input: Established / Related accept
+	// Input 2: Established / Related accept (Stateful)
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
 			Family: a.family,
@@ -87,7 +87,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
-	// Input: Hård spärr mot WAN Management API (Rule 3 in Section 3)
+	// Input 3: HÅRD WAN SPÄRR & DROP ALL INCOMING ON WAN (Placeras FÖRE alla övriga accept-regler!)
 	for _, iface := range cfg.Interfaces {
 		if iface.Zone == "WAN" && iface.Device != "" {
 			root.Nftables = append(root.Nftables, NFTElement{
@@ -95,12 +95,64 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					Family: a.family,
 					Table:  a.tableName,
 					Chain:  "input",
-					Comment: fmt.Sprintf("HARD WAN MANAGEMENT BLOCK on %s", iface.Device),
+					Comment: fmt.Sprintf("HARD WAN DROP ALL INCOMING on %s", iface.Device),
 					Expr: []interface{}{
 						map[string]interface{}{
 							"match": map[string]interface{}{
 								"op": "==",
-								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "meta", "field": "iifname"}},
+								"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": iface.Device,
+							},
+						},
+						map[string]interface{}{"drop": nil},
+					},
+				},
+			})
+		}
+	}
+
+	// Input 4: Tillåt SSH (port 22) och Management API (port 8443) ENDAST på LAN-gränssnitt
+	for _, iface := range cfg.Interfaces {
+		if iface.Zone == "LAN" && iface.Device != "" {
+			// SSH på LAN
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family: a.family,
+					Table:  a.tableName,
+					Chain:  "input",
+					Comment: fmt.Sprintf("Allow SSH on LAN %s", iface.Device),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op": "==",
+								"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": iface.Device,
+							},
+						},
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op": "==",
+								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+								"right": 22,
+							},
+						},
+						map[string]interface{}{"accept": nil},
+					},
+				},
+			})
+
+			// Management API på LAN
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family: a.family,
+					Table:  a.tableName,
+					Chain:  "input",
+					Comment: fmt.Sprintf("Allow Management API on LAN %s", iface.Device),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op": "==",
+								"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
 								"right": iface.Device,
 							},
 						},
@@ -111,7 +163,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 								"right": cfg.Settings.APIPort,
 							},
 						},
-						map[string]interface{}{"drop": nil},
+						map[string]interface{}{"accept": nil},
 					},
 				},
 			})
