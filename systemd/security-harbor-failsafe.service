@@ -1,0 +1,15 @@
+[Unit]
+Description=Security Harbor Failsafe Boot Ruleset
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=network-pre.target security-harbor-agent.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/nft -f /etc/security-harbor/security-harbor-failsafe.nft
+ExecReload=/sbin/nft -f /etc/security-harbor/security-harbor-failsafe.nft
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+# Security Harbor Failsafe nftables ruleset
+# Denna laddas av security-harbor-failsafe.service innan agenten startar.
+# Syfte: Garantera fail-closed vid krasch, omstart eller uppgradering.
+
+flush ruleset
+
+table inet security_harbor_failsafe {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # Tillåt alltid loopback
+        iifname "lo" accept
+
+        # Tillåt etablerade och relaterade anslutningar (Stateful)
+        ct state established,related accept
+
+        # Drop allt annat tyst (ingen ICMP/TCP RST respons mot okända nät)
+        drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

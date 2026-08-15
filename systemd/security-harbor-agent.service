@@ -1,0 +1,32 @@
+[Unit]
+Description=Security Harbor Firewall Management Agent
+After=network.target security-harbor-failsafe.service
+Requires=security-harbor-failsafe.service
+
+[Service]
+Type=simple
+User=security-harbor
+Group=security-harbor
+ExecStart=/usr/local/bin/security-harbor-agent --config /etc/security-harbor/config.json
+Restart=always
+RestartSec=5s
+
+# Capability-baserad behörighet istället för ren root (Steg 0.3)
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+# Systemd Sandboxning & Härdning
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/security-harbor /etc/security-harbor /run/security-harbor
+ProtectKernelTunables=false
+ProtectKernelModules=false
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target
