@@ -177,20 +177,38 @@ func (s *Server) handleTraceroute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Host saknas", http.StatusBadRequest)
 		return
 	}
-	out, _ := exec.Command("traceroute", "-w", "2", "-m", "15", req.Host).CombinedOutput()
+	out, _ := exec.Command("traceroute", "-n", "-w", "1", "-m", "15", req.Host).CombinedOutput()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
 }
 
 func (s *Server) handleGetRunningConfig(w http.ResponseWriter, r *http.Request) {
-	// ... (Implementering sker i store/engine)
+	cfg := s.engine.GetRunningConfig()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(cfg)
 }
 
 func (s *Server) handleCandidateConfig(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	switch r.Method {
+	case http.MethodGet:
+		cfg := s.engine.GetCandidateConfig()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cfg)
+	case http.MethodPost, http.MethodPut:
+		var newCfg config.Config
+		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
+			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+			return
+		}
+		if err := s.engine.UpdateCandidate(&newCfg); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "revision": newCfg.Revision})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {

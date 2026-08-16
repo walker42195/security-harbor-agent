@@ -14,16 +14,16 @@ import (
 type State string
 
 const (
-	StateIdle       State = "idle"
+	StateIdle        State = "idle"
 	StateUnconfirmed State = "unconfirmed"
 )
 
 type Engine struct {
-	mu           sync.Mutex
-	store        *store.Store
-	nftAdapter   *nftables.Adapter
-	state        State
-	confirmTimer *time.Timer
+	mu             sync.Mutex
+	store          *store.Store
+	nftAdapter     *nftables.Adapter
+	state          State
+	confirmTimer   *time.Timer
 	unconfirmedCfg *config.Config
 }
 
@@ -33,6 +33,18 @@ func NewEngine(st *store.Store, adapter *nftables.Adapter) *Engine {
 		nftAdapter: adapter,
 		state:      StateIdle,
 	}
+}
+
+func (e *Engine) GetRunningConfig() *config.Config {
+	return e.store.GetRunningConfig()
+}
+
+func (e *Engine) GetCandidateConfig() *config.Config {
+	return e.store.GetCandidateConfig()
+}
+
+func (e *Engine) UpdateCandidate(cfg *config.Config) error {
+	return e.store.SetCandidateConfig(cfg)
 }
 
 // ValidateCandidate validerar en candidate-konfiguration utan att ändra systemet.
@@ -102,7 +114,7 @@ func (e *Engine) ConfirmConfig(ctx context.Context, user string) error {
 	defer e.mu.Unlock()
 
 	if e.state != StateUnconfirmed {
-		return fmt.Errorf("ingen ubekräftad konfiguration att bekräfta")
+		return fmt.Errorf("ingen obekräftad konfiguration att bekräfta")
 	}
 
 	if e.confirmTimer != nil {

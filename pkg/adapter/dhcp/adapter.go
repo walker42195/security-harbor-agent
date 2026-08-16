@@ -70,7 +70,7 @@ func (a *Adapter) GenerateKeaConfig(cfg *config.Config) ([]byte, error) {
 	var subnets []Subnet4
 
 	for _, iface := range cfg.Interfaces {
-		if !iface.Enabled || iface.DHCP == nil || !iface.DHCP.Enabled {
+		if !iface.Enabled || iface.Zone == "WAN" || iface.DHCP == nil || !iface.DHCP.Enabled {
 			continue
 		}
 

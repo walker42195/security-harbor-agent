@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -112,4 +113,29 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 	}
 
 	return nil
+}
+
+// ApplyDNSConfig uppdaterar systemets DNS-resolvrar i /etc/resolv.conf baserat på inskrivna DNS-servrar.
+func (a *Adapter) ApplyDNSConfig(ctx context.Context, interfaces []config.Interface) error {
+	var dnsList []string
+	for _, iface := range interfaces {
+		if iface.Enabled && len(iface.DNSServers) > 0 {
+			dnsList = append(dnsList, iface.DNSServers...)
+		}
+	}
+
+	if len(dnsList) == 0 {
+		return nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# Genererad av Security Harbor Agent\n")
+	for _, dns := range dnsList {
+		trimmed := strings.TrimSpace(dns)
+		if trimmed != "" {
+			sb.WriteString(fmt.Sprintf("nameserver %s\n", trimmed))
+		}
+	}
+
+	return os.WriteFile("/etc/resolv.conf", []byte(sb.String()), 0644)
 }

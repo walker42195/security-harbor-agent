@@ -26,6 +26,7 @@ type Interface struct {
 	AddressType string      `json:"address_type"` // "static", "dhcp"
 	IPv4        string      `json:"ipv4"`         // IP/CIDR t.ex. "192.168.10.1/24"
 	Gateway     string      `json:"gateway"`      // Default gateway (främst WAN)
+	DNSServers  []string    `json:"dns_servers"`  // Statiska DNS-servrar för gränssnittet, t.ex. ["1.1.1.1", "8.8.8.8"]
 	MTU         int         `json:"mtu"`          // MTU (standard 1500)
 	DHCP        *DHCPConfig `json:"dhcp,omitempty"`// DHCP Server inställningar för detta interface/VLAN
 }
