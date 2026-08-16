@@ -46,6 +46,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/conntrack", s.authMiddleware(s.handleConntrack))
 	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddleware(s.handlePing))
 	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddleware(s.handleTraceroute))
+	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
 
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig))
@@ -308,4 +309,49 @@ func parseConntrack() []config.ConntrackEntry {
 	}
 
 	return entries
+}
+
+type NetDevStat struct {
+	Device  string `json:"device"`
+	RxBytes int64  `json:"rx_bytes"`
+	TxBytes int64  `json:"tx_bytes"`
+}
+
+func (s *Server) handleBandwidthStats(w http.ResponseWriter, r *http.Request) {
+	stats := parseProcNetDev()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(stats)
+}
+
+func parseProcNetDev() []NetDevStat {
+	file, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return []NetDevStat{}
+	}
+	defer file.Close()
+
+	var stats []NetDevStat
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ":")
+		if len(parts) != 2 {
+			continue
+		}
+		devName := strings.TrimSpace(parts[0])
+		if devName == "lo" {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) >= 9 {
+			rx, _ := strconv.ParseInt(fields[0], 10, 64)
+			tx, _ := strconv.ParseInt(fields[8], 10, 64)
+			stats = append(stats, NetDevStat{
+				Device:  devName,
+				RxBytes: rx,
+				TxBytes: tx,
+			})
+		}
+	}
+	return stats
 }
