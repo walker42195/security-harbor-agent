@@ -71,6 +71,21 @@ func (s *Store) loadOrInit() error {
 				{Name: "IOT", Description: "IoT-enheter"},
 				{Name: "VPN", Description: "VPN-klienter"},
 			},
+			Policies: []config.Policy{
+				{
+					ID:          "sys-ssh-lan",
+					Name:        "Tillåt SSH till brandväggen (LAN)",
+					Enabled:     true,
+					Priority:    1,
+					SourceZone:  "LAN",
+					DestZone:    "SELF",
+					Service:     "22",
+					Action:      config.ActionAccept,
+					Local:       true,
+					Critical:    true,
+					Description: "Tillåter SSH-inloggning till brandväggen själv från det interna nätverket. Om du inaktiverar denna behöver du en annan väg in (t.ex. tangentbord och skärm, eller seriekonsol) för att kunna administrera brandväggen.",
+				},
+			},
 			Settings: config.Settings{
 				HostName:           "security-harbor",
 				APIPort:            8443,

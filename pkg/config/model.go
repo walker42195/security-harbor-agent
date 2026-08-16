@@ -110,6 +110,8 @@ type Policy struct {
 	NAT         *NATConfig   `json:"nat,omitempty"` // Ev. NAT-parametrar vid DNAT/SNAT
 	Logging     bool         `json:"logging"`       // Om trafiken ska loggas
 	Description string       `json:"description"`
+	Local       bool         `json:"local,omitempty"`    // Om true gäller policyn åtkomst till brandväggen själv (INPUT-kedjan, t.ex. SSH/Management API) istället för vidarebefordrad trafik (FORWARD-kedjan).
+	Critical    bool         `json:"critical,omitempty"` // Om true måste GUI:t be om en uttrycklig bekräftelse innan policyn inaktiveras eller tas bort, eftersom den styr åtkomst som kan behövas för att administrera brandväggen.
 }
 
 // NATConfig innehåller parametrar för Port Forwarding eller SNAT.

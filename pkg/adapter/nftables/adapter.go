@@ -12,6 +12,66 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
+// serviceMatchExpr bygger nftables match-uttryck för en Service-sträng, t.ex.
+// "ANY", "ICMP", "22", "UDP:53". Delas mellan FORWARD-kedjans policies och
+// INPUT-kedjans lokala åtkomstpolicies för att undvika dubblerad parsning.
+func serviceMatchExpr(service string) []interface{} {
+	svcUpper := strings.ToUpper(strings.TrimSpace(service))
+	if svcUpper == "ANY" || svcUpper == "" {
+		return nil
+	}
+	if svcUpper == "ICMP" || svcUpper == "PING" {
+		return []interface{}{
+			map[string]interface{}{
+				"match": map[string]interface{}{
+					"op":    "==",
+					"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
+					"right": "icmp",
+				},
+			},
+		}
+	}
+	if strings.HasPrefix(svcUpper, "UDP") || strings.Contains(svcUpper, "UDP:") {
+		portStr := strings.TrimPrefix(svcUpper, "UDP:")
+		portStr = strings.TrimSpace(strings.TrimPrefix(portStr, "UDP"))
+		if portNum, err := strconv.Atoi(portStr); err == nil && portNum > 0 {
+			return []interface{}{
+				map[string]interface{}{
+					"match": map[string]interface{}{
+						"op":    "==",
+						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}},
+						"right": portNum,
+					},
+				},
+			}
+		}
+		return []interface{}{
+			map[string]interface{}{
+				"match": map[string]interface{}{
+					"op":    "==",
+					"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
+					"right": "udp",
+				},
+			},
+		}
+	}
+	// TCP eller rent portnummer
+	cleanPort := strings.TrimPrefix(svcUpper, "TCP:")
+	cleanPort = strings.TrimSpace(strings.TrimPrefix(cleanPort, "TCP"))
+	if portNum, err := strconv.Atoi(cleanPort); err == nil && portNum > 0 {
+		return []interface{}{
+			map[string]interface{}{
+				"match": map[string]interface{}{
+					"op":    "==",
+					"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+					"right": portNum,
+				},
+			},
+		}
+	}
+	return nil
+}
+
 type Adapter struct {
 	tableName string
 	family    string
@@ -125,36 +185,41 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		})
 	}
 
-	// Input 4: Tillåt SSH (port 22) och Management API (port 8443) ENDAST på LAN/VLAN-gränssnitt
-	for _, lanDev := range lanDevices {
-		// SSH
-		root.Nftables = append(root.Nftables, NFTElement{
-			Rule: &Rule{
-				Family: a.family,
-				Table:  a.tableName,
-				Chain:  "input",
-				Comment: fmt.Sprintf("Allow SSH on LAN %s", lanDev),
+	// Input 4: Lokala åtkomstpolicies (t.ex. SSH) mot brandväggen själv,
+	// ENDAST på LAN/VLAN-gränssnitt. Dessa är vanliga, konfigurerbara
+	// Policy-objekt (pol.Local == true) och kan alltså stängas av i GUI:t —
+	// se cfg.Policies i store.go för default-policyn "sys-ssh-lan".
+	for _, pol := range cfg.Policies {
+		if !pol.Local || !pol.Enabled {
+			continue
+		}
+		for _, lanDev := range lanDevices {
+			rule := &Rule{
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "input",
+				Comment: fmt.Sprintf("%s on LAN %s", pol.Name, lanDev),
 				Expr: []interface{}{
 					map[string]interface{}{
 						"match": map[string]interface{}{
-							"op": "==",
-							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"op":    "==",
+							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
 							"right": lanDev,
 						},
 					},
-					map[string]interface{}{
-						"match": map[string]interface{}{
-							"op": "==",
-							"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
-							"right": 22,
-						},
-					},
-					map[string]interface{}{"accept": nil},
 				},
-			},
-		})
+			}
+			rule.Expr = append(rule.Expr, serviceMatchExpr(pol.Service)...)
+			rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
+			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
+		}
+	}
 
-		// Management API
+	// Management API: alltid nåbar på LAN/VLAN — detta är INTE en
+	// konfigurerbar policy (till skillnad från SSH ovan), eftersom det är
+	// den enda vägen in i GUI:t. Att kunna stänga av den skulle riskera att
+	// låsa ute administratören helt, utan en text-baserad reservväg som SSH.
+	for _, lanDev := range lanDevices {
 		root.Nftables = append(root.Nftables, NFTElement{
 			Rule: &Rule{
 				Family: a.family,
@@ -204,7 +269,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 
 	// Användarpolicies
 	for _, pol := range cfg.Policies {
-		if !pol.Enabled {
+		if !pol.Enabled || pol.Local {
 			continue
 		}
 
@@ -239,55 +304,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
 		}
 
-		svcUpper := strings.ToUpper(strings.TrimSpace(pol.Service))
-		if svcUpper != "ANY" && svcUpper != "" {
-			if svcUpper == "ICMP" || svcUpper == "PING" {
-				rule.Expr = append(rule.Expr, map[string]interface{}{
-					"match": map[string]interface{}{
-						"op":    "==",
-						"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
-						"right": "icmp",
-					},
-				})
-			} else if strings.HasPrefix(svcUpper, "UDP") || strings.Contains(svcUpper, "UDP:") {
-				portStr := strings.TrimPrefix(svcUpper, "UDP:")
-				portStr = strings.TrimPrefix(portStr, "UDP")
-				portStr = strings.TrimSpace(portStr)
-				portNum, _ := strconv.Atoi(portStr)
-				if portNum > 0 {
-					rule.Expr = append(rule.Expr, map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}},
-							"right": portNum,
-						},
-					})
-				} else {
-					rule.Expr = append(rule.Expr, map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
-							"right": "udp",
-						},
-					})
-				}
-			} else {
-				// TCP eller rent portnummer
-				cleanPort := strings.TrimPrefix(svcUpper, "TCP:")
-				cleanPort = strings.TrimPrefix(cleanPort, "TCP")
-				cleanPort = strings.TrimSpace(cleanPort)
-				portNum, _ := strconv.Atoi(cleanPort)
-				if portNum > 0 {
-					rule.Expr = append(rule.Expr, map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
-							"right": portNum,
-						},
-					})
-				}
-			}
-		}
+		rule.Expr = append(rule.Expr, serviceMatchExpr(pol.Service)...)
 
 		if pol.Action == config.ActionAccept {
 			rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
