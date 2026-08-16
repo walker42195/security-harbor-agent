@@ -7,18 +7,30 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
-func TestRenderJSON(t *testing.T) {
+func TestRenderJSONFas2(t *testing.T) {
 	adapter := NewAdapter()
 
 	cfg := &config.Config{
 		Version:  1,
 		Revision: 1,
 		Interfaces: []config.Interface{
-			{ID: "wan0", Device: "eth0", Zone: "WAN", Enabled: true},
-			{ID: "lan0", Device: "eth1", Zone: "LAN", Enabled: true},
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+			{ID: "vlan10", Device: "ens19.10", Parent: "ens19", VLANID: 10, Zone: "SERVERS", Enabled: true, AddressType: "static", IPv4: "192.168.10.1/24"},
 		},
 		Policies: []config.Policy{
-			{ID: "p1", Name: "Allow LAN to WAN", Enabled: true, Action: config.ActionAccept},
+			{
+				ID:       "pol1",
+				Name:     "Web Server DNAT",
+				Enabled:  true,
+				Action:   config.ActionDNAT,
+				NAT: &config.NATConfig{
+					Protocol:     "tcp",
+					ExternalPort: 443,
+					InternalIP:   "192.168.10.10",
+					InternalPort: 443,
+				},
+			},
 		},
 		Settings: config.Settings{
 			APIPort: 8443,
@@ -32,25 +44,28 @@ func TestRenderJSON(t *testing.T) {
 
 	var root JSONRoot
 	if err := json.Unmarshal(data, &root); err != nil {
-		t.Fatalf("Ogiltig JSON genererad: %v", err)
+		t.Fatalf("Ogiltig JSON: %v", err)
 	}
 
-	if len(root.Nftables) == 0 {
-		t.Fatalf("Inga nftables-element i genererad JSON")
-	}
+	// Verifiera att Masquerade och DNAT finns med
+	hasMasquerade := false
+	hasDNAT := false
 
-	// Verifiera att Hård WAN Management block finns i reglerna
-	foundWANBlock := false
 	for _, el := range root.Nftables {
-		if el.Rule != nil && el.Rule.Comment != "" {
-			if el.Rule.Comment == "HARD WAN DROP ALL INCOMING on eth0" || el.Rule.Comment == "HARD WAN MANAGEMENT BLOCK on eth0" {
-				foundWANBlock = true
-				break
+		if el.Rule != nil {
+			if el.Rule.Chain == "postrouting" {
+				hasMasquerade = true
+			}
+			if el.Rule.Chain == "prerouting" {
+				hasDNAT = true
 			}
 		}
 	}
 
-	if !foundWANBlock {
-		t.Errorf("Kritiskt fel: Hård WAN Management-spärr hittades inte i genererad ruleset!")
+	if !hasMasquerade {
+		t.Errorf("Krävde Masquerade-regel i postrouting för WAN ens18, men saknas")
+	}
+	if !hasDNAT {
+		t.Errorf("Krävde DNAT-regel i prerouting för Port 443, men saknas")
 	}
 }

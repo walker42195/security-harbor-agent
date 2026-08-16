@@ -46,7 +46,21 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		root.Nftables = append(root.Nftables, NFTElement{Chain: &ch})
 	}
 
-	// 2. Basregler för Input chain
+	// Hitta WAN-interfacer och LAN-interfacer
+	var wanDevices []string
+	var lanDevices []string
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled {
+			continue
+		}
+		if iface.Zone == "WAN" && iface.Device != "" {
+			wanDevices = append(wanDevices, iface.Device)
+		} else if iface.Device != "" {
+			lanDevices = append(lanDevices, iface.Device)
+		}
+	}
+
+	// 2. INPUT CHAIN
 	// Input 1: Loopback accept
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
@@ -87,90 +101,86 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
-	// Input 3: HÅRD WAN SPÄRR & DROP ALL INCOMING ON WAN (Placeras FÖRE alla övriga accept-regler!)
-	for _, iface := range cfg.Interfaces {
-		if iface.Zone == "WAN" && iface.Device != "" {
-			root.Nftables = append(root.Nftables, NFTElement{
-				Rule: &Rule{
-					Family: a.family,
-					Table:  a.tableName,
-					Chain:  "input",
-					Comment: fmt.Sprintf("HARD WAN DROP ALL INCOMING on %s", iface.Device),
-					Expr: []interface{}{
-						map[string]interface{}{
-							"match": map[string]interface{}{
-								"op": "==",
-								"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
-								"right": iface.Device,
-							},
+	// Input 3: HARD WAN DROP ALL INCOMING (Placeras FÖRE alla övriga accept-regler!)
+	for _, wanDev := range wanDevices {
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family: a.family,
+				Table:  a.tableName,
+				Chain:  "input",
+				Comment: fmt.Sprintf("HARD WAN DROP ALL INCOMING on %s", wanDev),
+				Expr: []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op": "==",
+							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"right": wanDev,
 						},
-						map[string]interface{}{"drop": nil},
 					},
+					map[string]interface{}{"drop": nil},
 				},
-			})
-		}
+			},
+		})
 	}
 
-	// Input 4: Tillåt SSH (port 22) och Management API (port 8443) ENDAST på LAN-gränssnitt
-	for _, iface := range cfg.Interfaces {
-		if iface.Zone == "LAN" && iface.Device != "" {
-			// SSH på LAN
-			root.Nftables = append(root.Nftables, NFTElement{
-				Rule: &Rule{
-					Family: a.family,
-					Table:  a.tableName,
-					Chain:  "input",
-					Comment: fmt.Sprintf("Allow SSH on LAN %s", iface.Device),
-					Expr: []interface{}{
-						map[string]interface{}{
-							"match": map[string]interface{}{
-								"op": "==",
-								"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
-								"right": iface.Device,
-							},
+	// Input 4: Tillåt SSH (port 22) och Management API (port 8443) ENDAST på LAN/VLAN-gränssnitt
+	for _, lanDev := range lanDevices {
+		// SSH
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family: a.family,
+				Table:  a.tableName,
+				Chain:  "input",
+				Comment: fmt.Sprintf("Allow SSH on LAN %s", lanDev),
+				Expr: []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op": "==",
+							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"right": lanDev,
 						},
-						map[string]interface{}{
-							"match": map[string]interface{}{
-								"op": "==",
-								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
-								"right": 22,
-							},
-						},
-						map[string]interface{}{"accept": nil},
 					},
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op": "==",
+							"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+							"right": 22,
+						},
+					},
+					map[string]interface{}{"accept": nil},
 				},
-			})
+			},
+		})
 
-			// Management API på LAN
-			root.Nftables = append(root.Nftables, NFTElement{
-				Rule: &Rule{
-					Family: a.family,
-					Table:  a.tableName,
-					Chain:  "input",
-					Comment: fmt.Sprintf("Allow Management API on LAN %s", iface.Device),
-					Expr: []interface{}{
-						map[string]interface{}{
-							"match": map[string]interface{}{
-								"op": "==",
-								"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
-								"right": iface.Device,
-							},
+		// Management API
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family: a.family,
+				Table:  a.tableName,
+				Chain:  "input",
+				Comment: fmt.Sprintf("Allow Management API on LAN %s", lanDev),
+				Expr: []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op": "==",
+							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"right": lanDev,
 						},
-						map[string]interface{}{
-							"match": map[string]interface{}{
-								"op": "==",
-								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
-								"right": cfg.Settings.APIPort,
-							},
-						},
-						map[string]interface{}{"accept": nil},
 					},
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op": "==",
+							"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+							"right": cfg.Settings.APIPort,
+						},
+					},
+					map[string]interface{}{"accept": nil},
 				},
-			})
-		}
+			},
+		})
 	}
 
-	// 3. Forwarding chain: Stateful
+	// 3. FORWARDING CHAIN (Stateful & Inter-VLAN Policies)
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
 			Family: a.family,
@@ -190,17 +200,43 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
-	// 4. Mappa användar-policies
+	// Användarpolicies
 	for _, pol := range cfg.Policies {
 		if !pol.Enabled {
 			continue
 		}
+
+		// Om detta är en Port Forwarding (DNAT) policy sköts den i prerouting/forward
+		if pol.Action == config.ActionDNAT && pol.NAT != nil {
+			// Tillåt forwarding till den interna IP-adressen vid DNAT
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family: a.family,
+					Table:  a.tableName,
+					Chain:  "forward",
+					Comment: fmt.Sprintf("Allow DNAT forwarding for %s", pol.Name),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op": "==",
+								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+								"right": pol.NAT.InternalIP,
+							},
+						},
+						map[string]interface{}{"accept": nil},
+					},
+				},
+			})
+			continue
+		}
+
 		rule := &Rule{
 			Family:  a.family,
 			Table:   a.tableName,
 			Chain:   "forward",
 			Comment: pol.Name,
 		}
+
 		if pol.Action == config.ActionAccept {
 			rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
 			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
@@ -208,6 +244,61 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
 			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 		}
+	}
+
+	// 4. NAT PREROUTING CHAIN (Port Forwarding / DNAT)
+	for _, pol := range cfg.Policies {
+		if pol.Enabled && pol.Action == config.ActionDNAT && pol.NAT != nil {
+			proto := "tcp"
+			if pol.NAT.Protocol != "" {
+				proto = pol.NAT.Protocol
+			}
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family: a.family,
+					Table:  a.tableName,
+					Chain:  "prerouting",
+					Comment: fmt.Sprintf("Port Forwarding (DNAT): %s", pol.Name),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op": "==",
+								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
+								"right": pol.NAT.ExternalPort,
+							},
+						},
+						map[string]interface{}{
+							"dnat": map[string]interface{}{
+								"addr": pol.NAT.InternalIP,
+								"port": pol.NAT.InternalPort,
+							},
+						},
+					},
+				},
+			})
+		}
+	}
+
+	// 5. NAT POSTROUTING CHAIN (Outbound Masquerade för alla interna nät mot WAN)
+	for _, wanDev := range wanDevices {
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family: a.family,
+				Table:  a.tableName,
+				Chain:  "postrouting",
+				Comment: fmt.Sprintf("Outbound NAT Masquerade on %s", wanDev),
+				Expr: []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op": "==",
+							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "oifname"}},
+							"right": wanDev,
+						},
+					},
+					map[string]interface{}{"masquerade": nil},
+				},
+			},
+		})
 	}
 
 	return json.MarshalIndent(root, "", "  ")

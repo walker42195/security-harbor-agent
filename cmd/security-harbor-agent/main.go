@@ -23,7 +23,7 @@ func main() {
 	flag.Parse()
 
 	fmt.Println("=====================================================")
-	fmt.Println(" SECURITY HARBOR FIREWALL AGENT v0.1.0 (Fas 0)       ")
+	fmt.Println(" SECURITY HARBOR FIREWALL AGENT v0.2.0 (Fas 2)       ")
 	fmt.Println("=====================================================")
 	if *dryRun {
 		fmt.Println("[MODE] DRY-RUN AKTIVT - inga ändringar görs i kärnan!")
@@ -39,6 +39,7 @@ func main() {
 
 	nftAdapter := nftables.NewAdapter()
 	eng := engine.NewEngine(st, nftAdapter)
+	auth := api.NewAuthManager()
 
 	// Applicera initial konfiguration vid start (om ej dry-run)
 	if !*dryRun {
@@ -54,7 +55,7 @@ func main() {
 		}
 	}
 
-	server := api.NewServer(*bindAddr, st, eng)
+	server := api.NewServer(*bindAddr, eng, auth)
 
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
@@ -70,7 +71,7 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = server.Shutdown(ctx)
+	_ = server.Stop(ctx)
 
 	fmt.Println("[SHUTDOWN] Agenten avslutad säkert.")
 }

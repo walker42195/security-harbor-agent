@@ -1,6 +1,6 @@
 # Security Harbor Failsafe nftables ruleset
 # Denna laddas av security-harbor-failsafe.service innan agenten startar.
-# Syfte: Garantera fail-closed vid krasch/omstart samtidigt som lokal SSH-management tillåts på LAN.
+# Syfte: Garantera fail-closed på WAN samtidigt som SSH (22) och Management API (8443) tillåts på LAN.
 
 flush ruleset
 
@@ -14,8 +14,8 @@ table inet security_harbor_failsafe {
         # Tillåt etablerade och relaterade anslutningar (Stateful)
         ct state established,related accept
 
-        # Tillåt SSH (port 22) endast på LAN / icke-WAN interfaces
-        iifname != "ens18" tcp dport 22 accept
+        # Tillåt SSH (22) och Management API (8443) på LAN / icke-WAN interfaces
+        iifname != "ens18" tcp dport { 22, 8443 } accept
 
         # Drop allt annat tyst (WAN är 100% stängd/stealth)
         drop
