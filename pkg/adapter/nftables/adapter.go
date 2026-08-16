@@ -269,8 +269,9 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 						},
 						map[string]interface{}{
 							"dnat": map[string]interface{}{
-								"addr": pol.NAT.InternalIP,
-								"port": pol.NAT.InternalPort,
+								"family": "ip",
+								"addr":   pol.NAT.InternalIP,
+								"port":   pol.NAT.InternalPort,
 							},
 						},
 					},

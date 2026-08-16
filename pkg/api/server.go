@@ -184,6 +184,13 @@ func (s *Server) handleTraceroute(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetRunningConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := s.engine.GetRunningConfig()
+	if cfg != nil {
+		cfgCopy := *cfg
+		s.netAdapt.PopulateDynamicIPs(&cfgCopy)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&cfgCopy)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(cfg)
 }
@@ -192,6 +199,13 @@ func (s *Server) handleCandidateConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		cfg := s.engine.GetCandidateConfig()
+		if cfg != nil {
+			cfgCopy := *cfg
+			s.netAdapt.PopulateDynamicIPs(&cfgCopy)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(&cfgCopy)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(cfg)
 	case http.MethodPost, http.MethodPut:

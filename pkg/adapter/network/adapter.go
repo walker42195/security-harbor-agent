@@ -67,6 +67,36 @@ func (a *Adapter) DiscoverInterfaces() ([]DiscoveredInterface, error) {
 	return result, nil
 }
 
+// PopulateDynamicIPs populerar konfigurationens DHCP-gränssnitt med deras aktiva Linux IP-adresser.
+func (a *Adapter) PopulateDynamicIPs(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	discovered, err := a.DiscoverInterfaces()
+	if err != nil {
+		return
+	}
+
+	discMap := make(map[string][]string)
+	for _, d := range discovered {
+		discMap[d.Name] = d.IPs
+	}
+
+	for i := range cfg.Interfaces {
+		iface := &cfg.Interfaces[i]
+		if iface.AddressType == "dhcp" || iface.IPv4 == "" {
+			if ips, ok := discMap[iface.Device]; ok {
+				for _, ip := range ips {
+					if strings.Contains(ip, ".") && !strings.HasPrefix(ip, "127.") {
+						iface.IPv4 = ip
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
 // ApplyInterfaceConfig tillämpar IP-adresser, länkstatus och VLAN-gränssnitt på Linux.
 func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interface) error {
 	if iface.Device == "" {
@@ -110,6 +140,11 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 		if err != nil && !strings.Contains(string(out), "File exists") {
 			return fmt.Errorf("misslyckades sätta IP %s på %s: %w - %s", iface.IPv4, iface.Device, err, string(out))
 		}
+	} else if iface.Enabled && iface.AddressType == "dhcp" {
+		// Om gränssnittet är satt till DHCP, trigga dhclient om ingen IP ännu erhållits
+		go func(device string) {
+			_ = exec.Command("dhclient", "-v", device).Run()
+		}(iface.Device)
 	}
 
 	return nil
