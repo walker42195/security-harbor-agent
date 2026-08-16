@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
+	"strings"
 
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
@@ -234,7 +236,57 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			Family:  a.family,
 			Table:   a.tableName,
 			Chain:   "forward",
-			Comment: pol.Name,
+			Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
+		}
+
+		svcUpper := strings.ToUpper(strings.TrimSpace(pol.Service))
+		if svcUpper != "ANY" && svcUpper != "" {
+			if svcUpper == "ICMP" || svcUpper == "PING" {
+				rule.Expr = append(rule.Expr, map[string]interface{}{
+					"match": map[string]interface{}{
+						"op":    "==",
+						"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
+						"right": "icmp",
+					},
+				})
+			} else if strings.HasPrefix(svcUpper, "UDP") || strings.Contains(svcUpper, "UDP:") {
+				portStr := strings.TrimPrefix(svcUpper, "UDP:")
+				portStr = strings.TrimPrefix(portStr, "UDP")
+				portStr = strings.TrimSpace(portStr)
+				portNum, _ := strconv.Atoi(portStr)
+				if portNum > 0 {
+					rule.Expr = append(rule.Expr, map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}},
+							"right": portNum,
+						},
+					})
+				} else {
+					rule.Expr = append(rule.Expr, map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
+							"right": "udp",
+						},
+					})
+				}
+			} else {
+				// TCP eller rent portnummer
+				cleanPort := strings.TrimPrefix(svcUpper, "TCP:")
+				cleanPort = strings.TrimPrefix(cleanPort, "TCP")
+				cleanPort = strings.TrimSpace(cleanPort)
+				portNum, _ := strconv.Atoi(cleanPort)
+				if portNum > 0 {
+					rule.Expr = append(rule.Expr, map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+							"right": portNum,
+						},
+					})
+				}
+			}
 		}
 
 		if pol.Action == config.ActionAccept {
