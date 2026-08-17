@@ -71,6 +71,69 @@ func TestRenderJSONFas2(t *testing.T) {
 	}
 }
 
+// TestRenderJSONHooksChainsWithPriority skyddar mot en regression där Chain.Prio
+// hade `json:"prio,omitempty"`. Priority 0 (standard för filter-hooks) är
+// Go:s int-nollvärde, så omitempty tog tyst bort "prio" ur JSON:en helt —
+// och `nft -j` skapar då en kedja som INTE hookas in i netfilter (varken fel
+// eller varning). Upptäckt vid skarp testning 2026-08-17: INPUT/FORWARD-
+// filtreringen var därför aldrig faktiskt aktiv. Testet läser den RÅA JSON:en
+// (inte den avkodade Chain-structen) eftersom json.Unmarshal inte kan
+// skilja "fältet saknades" från "fältet var 0".
+func TestRenderJSONHooksChainsWithPriority(t *testing.T) {
+	adapter := NewAdapter()
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var raw struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Ogiltig JSON: %v", err)
+	}
+
+	checkedHookChains := map[string]bool{"input": false, "forward": false, "output": false}
+	for _, el := range raw.Nftables {
+		chainRaw, ok := el["chain"]
+		if !ok {
+			continue
+		}
+		var chain map[string]json.RawMessage
+		if err := json.Unmarshal(chainRaw, &chain); err != nil {
+			t.Fatalf("Ogiltig chain-JSON: %v", err)
+		}
+		var name string
+		_ = json.Unmarshal(chain["name"], &name)
+		if _, want := checkedHookChains[name]; !want {
+			continue
+		}
+		if _, hasHook := chain["hook"]; !hasHook {
+			continue // t.ex. inte relevant om kedjan av någon anledning saknar hook
+		}
+		if _, hasPrio := chain["prio"]; !hasPrio {
+			t.Errorf("Kedjan %q saknar \"prio\" i JSON-utdatan trots att den har \"hook\" satt — nft -j skapar då en ohookad, overksam kedja", name)
+		}
+		checkedHookChains[name] = true
+	}
+
+	for name, checked := range checkedHookChains {
+		if !checked {
+			t.Errorf("Hittade aldrig en hookad %q-kedja att verifiera \"prio\" på", name)
+		}
+	}
+}
+
 func TestRenderJSONWireGuardWANAllow(t *testing.T) {
 	adapter := NewAdapter()
 

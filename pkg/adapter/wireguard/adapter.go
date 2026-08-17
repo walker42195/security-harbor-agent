@@ -15,6 +15,9 @@ import (
 const InterfaceName = "wg0"
 
 type Adapter struct {
+	// configPath är en informativ kopia av den applicerade wg-syntax-
+	// konfigurationen (för felsökning/audit) — den läses inte av `wg`
+	// eller `ip`, som styrs direkt via subcommands nedan.
 	configPath string
 }
 
@@ -46,9 +49,10 @@ func GenerateKeypair() (privateKey, publicKey string, err error) {
 	return privateKey, publicKey, nil
 }
 
-// GenerateConfig renderar innehållet i wg0.conf. serverPrivateKey hämtas av
-// anroparen (Store.EnsureWireGuardServerKeys) — adaptern håller aldrig
-// nycklar i minnet längre än nödvändigt för att rendera filen.
+// GenerateConfig renderar en STRIKT wg-syntax-fil (bara det `wg setconf`
+// förstår: [Interface] PrivateKey/ListenPort, [Peer] PublicKey/AllowedIPs).
+// Address hör till wg-quick-varianten och sätts separat via `ip address`,
+// se ApplyConfig — annars avvisar `wg setconf` filen.
 func GenerateConfig(cfg *config.Config, serverPrivateKey string) (string, error) {
 	if cfg.WireGuard == nil || !cfg.WireGuard.Enabled {
 		return "", nil
@@ -58,15 +62,13 @@ func GenerateConfig(cfg *config.Config, serverPrivateKey string) (string, error)
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "[Interface]\n")
 	fmt.Fprintf(&b, "PrivateKey = %s\n", serverPrivateKey)
-	fmt.Fprintf(&b, "Address = %s\n", wg.Address)
 	fmt.Fprintf(&b, "ListenPort = %d\n", wg.ListenPort)
 
 	for _, peer := range wg.Peers {
 		if !peer.Enabled || peer.PublicKey == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "\n# %s\n", peer.Name)
-		fmt.Fprintf(&b, "[Peer]\n")
+		fmt.Fprintf(&b, "\n[Peer]\n")
 		fmt.Fprintf(&b, "PublicKey = %s\n", peer.PublicKey)
 		fmt.Fprintf(&b, "AllowedIPs = %s\n", peer.AllowedIPs)
 	}
@@ -74,15 +76,21 @@ func GenerateConfig(cfg *config.Config, serverPrivateKey string) (string, error)
 	return b.String(), nil
 }
 
-// ApplyConfig skriver wg0.conf och (om aktiverat) laddar om gränssnittet med
-// wg-quick. Om WireGuard är inaktiverat i cfg tas gränssnittet ner istället.
+// ApplyConfig sätter upp/river ner wg0 direkt via `ip` och `wg` istället för
+// `wg-quick`. Detta är MEDVETET, inte en stilfråga: `wg-quick` är ett
+// bash-skript som hårdkodar `[[ $UID == 0 ]] || exec sudo ...` och därmed
+// aldrig fungerar under agentens icke-root systemd-sandbox (Steg 0.3,
+// CAP_NET_ADMIN/CAP_NET_RAW via AmbientCapabilities) — upptäckt vid skarp
+// testning mot brandväggsservern 2026-08-17. `ip link add type wireguard`
+// och `wg`/`wg setconf` kräver bara CAP_NET_ADMIN, som processen redan har,
+// och är samma mönster nftables-adaptern redan använder (prata direkt med
+// kärnan, inte via en root-krävande wrapper).
 func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, serverPrivateKey string, dryRun bool) error {
 	if cfg.WireGuard == nil || !cfg.WireGuard.Enabled {
 		if dryRun {
 			return nil
 		}
-		// Säkerställ att gränssnittet inte är kvar uppe om det stängts av.
-		_ = exec.CommandContext(ctx, "wg-quick", "down", InterfaceName).Run()
+		_ = exec.CommandContext(ctx, "ip", "link", "delete", "dev", InterfaceName).Run()
 		return nil
 	}
 
@@ -102,13 +110,21 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, serverPri
 		return fmt.Errorf("misslyckades skriva %s: %w", a.configPath, err)
 	}
 
-	// wg-quick down/up är enklast och tillräckligt robust för detta projekt;
-	// `wg syncconf` (utan tunneln nere) vore snyggare men kräver striplogik
-	// vi inte behöver ännu i Fas 3.
-	_ = exec.CommandContext(ctx, "wg-quick", "down", InterfaceName).Run()
-	out, err := exec.CommandContext(ctx, "wg-quick", "up", InterfaceName).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("wg-quick up misslyckades: %w - output: %s", err, string(out))
+	// Riv ner ett ev. tidigare gränssnitt för idempotent omapplicering
+	// (ignorerar fel om det inte fanns sedan tidigare).
+	_ = exec.CommandContext(ctx, "ip", "link", "delete", "dev", InterfaceName).Run()
+
+	if out, err := exec.CommandContext(ctx, "ip", "link", "add", "dev", InterfaceName, "type", "wireguard").CombinedOutput(); err != nil {
+		return fmt.Errorf("ip link add misslyckades: %w - output: %s", err, string(out))
+	}
+	if out, err := exec.CommandContext(ctx, "wg", "setconf", InterfaceName, a.configPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("wg setconf misslyckades: %w - output: %s", err, string(out))
+	}
+	if out, err := exec.CommandContext(ctx, "ip", "address", "add", cfg.WireGuard.Address, "dev", InterfaceName).CombinedOutput(); err != nil {
+		return fmt.Errorf("ip address add misslyckades: %w - output: %s", err, string(out))
+	}
+	if out, err := exec.CommandContext(ctx, "ip", "link", "set", "up", "dev", InterfaceName).CombinedOutput(); err != nil {
+		return fmt.Errorf("ip link set up misslyckades: %w - output: %s", err, string(out))
 	}
 
 	return nil

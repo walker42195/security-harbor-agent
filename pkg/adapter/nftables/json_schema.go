@@ -28,13 +28,23 @@ type Table struct {
 }
 
 type Chain struct {
-	Family   string `json:"family"`   // "inet"
-	Table    string `json:"table"`    // "security_harbor"
-	Name     string `json:"name"`     // "input", "forward", "output", "prerouting", "postrouting"
-	Type     string `json:"type,omitempty"`     // "filter", "nat"
-	Hook     string `json:"hook,omitempty"`     // "input", "forward", "output", "prerouting", "postrouting"
-	Prio     int    `json:"prio,omitempty"`     // Priority
-	Policy   string `json:"policy,omitempty"`   // "drop", "accept"
+	Family string `json:"family"`             // "inet"
+	Table  string `json:"table"`               // "security_harbor"
+	Name   string `json:"name"`                 // "input", "forward", "output", "prerouting", "postrouting"
+	Type   string `json:"type,omitempty"`       // "filter", "nat"
+	Hook   string `json:"hook,omitempty"`       // "input", "forward", "output", "prerouting", "postrouting"
+	// Prio SAKNAR omitempty MED FLIT. Standardprioriteten för ett filter-hook
+	// (input/forward/output) är 0, vilket är Go-nollvärdet för int — med
+	// omitempty försvann "prio"-fältet helt ur JSON:en för dessa kedjor, och
+	// `nft -j` skapar då en kedja som INTE hookas in i netfilter alls (varken
+	// fel eller varning, bara en overksam, oanvänd kedja). Upptäckt vid skarp
+	// testning mot brandväggsservern 2026-08-17: INPUT/FORWARD-filtreringen
+	// har aldrig faktiskt varit aktiv trots att audit_fas2 markerade den som
+	// PASSED (testet tolkade en TCP RST från kärnan som "stängd port", inte
+	// som beviset på att paketet aldrig filtrerades). Se
+	// TestRenderJSONHooksChainsWithPriority i adapter_test.go.
+	Prio   int    `json:"prio"`
+	Policy string `json:"policy,omitempty"` // "drop", "accept"
 }
 
 type Rule struct {
