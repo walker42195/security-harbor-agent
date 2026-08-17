@@ -325,20 +325,26 @@ func (s *Server) handleRollbackConfig(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+// parseConntrack läser aktiva anslutningar via `conntrack -L`. Moderna
+// kernlar (upptäckt 2026-08-17 mot 10.0.0.163) exponerar inte längre
+// /proc/net/nf_conntrack eller /proc/net/ip_conntrack som procfs-filer —
+// conntrack-tabellen nås numera bara via netlink, vilket `conntrack`-
+// verktyget (paketet heter bara "conntrack", inte "conntrack-tools") pratar.
+// Kräver CAP_NET_ADMIN, som agentens systemd-enhet redan ger den (samma
+// mönster som nft/wg/ip).
 func parseConntrack() []config.ConntrackEntry {
-	file, err := os.Open("/proc/net/nf_conntrack")
-	if err != nil {
-		file, err = os.Open("/proc/net/ip_conntrack")
-		if err != nil {
-			return []config.ConntrackEntry{}
-		}
+	out, err := exec.Command("conntrack", "-L").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return []config.ConntrackEntry{}
 	}
-	defer file.Close()
 
 	var entries []config.ConntrackEntry
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
 		line := scanner.Text()
+		if strings.HasPrefix(line, "conntrack v") {
+			continue // sammanfattningsrad, t.ex. "conntrack v1.4.9 (...): N flow entries have been shown."
+		}
 		fields := strings.Fields(line)
 		if len(fields) < 6 {
 			continue
