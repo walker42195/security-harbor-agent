@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
 )
@@ -49,6 +50,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddleware(s.handlePing))
 	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddleware(s.handleTraceroute))
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
+	mux.HandleFunc("/api/v1/vpn/wireguard/server-info", s.authMiddleware(s.handleWireGuardServerInfo))
+	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddleware(s.handleWireGuardGeneratePeerKeys))
 
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig))
@@ -195,6 +198,49 @@ func (s *Server) handleTraceroute(w http.ResponseWriter, r *http.Request) {
 	out, _ := exec.Command("traceroute", "-n", "-w", "1", "-m", "15", req.Host).CombinedOutput()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
+}
+
+// handleWireGuardServerInfo returnerar brandväggens publika WireGuard-nyckel
+// (aldrig den privata) samt lyssningsport/endpoint från körande config, så
+// att GUI:t kan bygga färdiga klientkonfigurationer/QR-koder.
+func (s *Server) handleWireGuardServerInfo(w http.ResponseWriter, r *http.Request) {
+	pubKey, err := s.engine.GetWireGuardServerPublicKey()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	listenPort := 0
+	endpoint := ""
+	if cfg := s.engine.GetRunningConfig(); cfg != nil && cfg.WireGuard != nil {
+		listenPort = cfg.WireGuard.ListenPort
+		endpoint = cfg.WireGuard.Endpoint
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"public_key":  pubKey,
+		"listen_port": listenPort,
+		"endpoint":    endpoint,
+	})
+}
+
+// handleWireGuardGeneratePeerKeys genererar ett engångsnyckelpar åt en ny
+// VPN-klient. Den privata nyckeln returneras EN gång till den inloggade
+// admin-klienten och sparas aldrig på brandväggen — bara den publika nyckeln
+// hör hemma i den sparade Policy/Peer-konfigurationen.
+func (s *Server) handleWireGuardGeneratePeerKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	priv, pub, err := wireguard.GenerateKeypair()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"private_key": priv, "public_key": pub})
 }
 
 func (s *Server) handleGetRunningConfig(w http.ResponseWriter, r *http.Request) {

@@ -163,6 +163,38 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
+	// Input 2.5: Tillåt inkommande WireGuard (UDP) på WAN, om aktiverat.
+	// Måste ligga FÖRE Input 3 (HARD WAN DROP) annars är VPN:en meningslös.
+	if cfg.WireGuard != nil && cfg.WireGuard.Enabled && cfg.WireGuard.ListenPort > 0 {
+		for _, wanDev := range wanDevices {
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "input",
+					Comment: fmt.Sprintf("Allow WireGuard (UDP %d) on WAN %s", cfg.WireGuard.ListenPort, wanDev),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": wanDev,
+							},
+						},
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}},
+								"right": cfg.WireGuard.ListenPort,
+							},
+						},
+						map[string]interface{}{"accept": nil},
+					},
+				},
+			})
+		}
+	}
+
 	// Input 3: HARD WAN DROP ALL INCOMING (Placeras FÖRE alla övriga accept-regler!)
 	for _, wanDev := range wanDevices {
 		root.Nftables = append(root.Nftables, NFTElement{

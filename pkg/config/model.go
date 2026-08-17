@@ -4,15 +4,41 @@ import "time"
 
 // Config representerar hela brandväggens deklarativa tillstånd.
 type Config struct {
-	Version    int         `json:"version"`    // Konfigurationsversion
-	Revision   int64       `json:"revision"`   // Inkrementeras vid varje commit
-	UpdatedAt  time.Time   `json:"updated_at"` // Tidstämpel för senaste ändring
-	Interfaces []Interface `json:"interfaces"` // Fysiska nätverkskort & VLANs
-	Zones      []Zone      `json:"zones"`      // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
-	Objects    []Object    `json:"objects"`    // Objekt (Hosts, Subnets, IP-listor, GeoIP)
-	Services   []Service   `json:"services"`   // Tjänster (HTTP, HTTPS, SSH, Custom ports)
-	Policies   []Policy    `json:"policies"`   // Brandväggs- och NAT-regler
-	Settings   Settings    `json:"settings"`   // System- och management-inställningar
+	Version    int              `json:"version"`    // Konfigurationsversion
+	Revision   int64            `json:"revision"`   // Inkrementeras vid varje commit
+	UpdatedAt  time.Time        `json:"updated_at"` // Tidstämpel för senaste ändring
+	Interfaces []Interface      `json:"interfaces"` // Fysiska nätverkskort & VLANs
+	Zones      []Zone           `json:"zones"`      // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
+	Objects    []Object         `json:"objects"`    // Objekt (Hosts, Subnets, IP-listor, GeoIP)
+	Services   []Service        `json:"services"`   // Tjänster (HTTP, HTTPS, SSH, Custom ports)
+	Policies   []Policy         `json:"policies"`   // Brandväggs- och NAT-regler
+	Settings   Settings         `json:"settings"`   // System- och management-inställningar
+	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"` // VPN-serverkonfiguration (Fas 3)
+}
+
+// WireGuardConfig representerar server-sidans WireGuard-inställningar (wg0).
+// Servern har en egen keypair (privata nyckeln lagras krypterad, se
+// Store.EnsureWireGuardServerKeys — den skickas ALDRIG över API:t eller
+// sparas i denna struct). Endast klienternas publika nycklar lagras här.
+type WireGuardConfig struct {
+	Enabled         bool             `json:"enabled"`
+	ListenPort      int              `json:"listen_port"`               // t.ex. 51820
+	Address         string           `json:"address"`                   // Serverns IP i VPN-nätet, t.ex. "10.66.66.1/24"
+	Endpoint        string           `json:"endpoint"`                  // Publik host/IP klienter ansluter mot, t.ex. "vpn.example.se"
+	ServerPublicKey string           `json:"server_public_key,omitempty"` // Fylls i dynamiskt av agenten vid läsning, aldrig skriven av klienten
+	Peers           []WireGuardPeer  `json:"peers"`
+}
+
+// WireGuardPeer representerar en tillåten VPN-klient. Endast den publika
+// nyckeln lagras server-side — klientens privata nyckel genereras och visas
+// en gång i GUI:t (se /api/v1/vpn/wireguard/generate-peer-keys) och sparas
+// aldrig på brandväggen.
+type WireGuardPeer struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	PublicKey  string `json:"public_key"`
+	AllowedIPs string `json:"allowed_ips"` // t.ex. "10.66.66.2/32"
+	Enabled    bool   `json:"enabled"`
 }
 
 // Interface representerar ett nätverksgränssnitt eller VLAN.

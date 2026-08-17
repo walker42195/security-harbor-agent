@@ -10,7 +10,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/api"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
@@ -38,20 +40,21 @@ func main() {
 	}
 
 	nftAdapter := nftables.NewAdapter()
-	eng := engine.NewEngine(st, nftAdapter)
+	dhcpAdapter := dhcp.NewAdapter("")
+	wgAdapter := wireguard.NewAdapter("")
+	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter)
 	auth := api.NewAuthManager()
 
 	// Applicera initial konfiguration vid start (om ej dry-run)
 	if !*dryRun {
-		runningCfg := st.GetRunningConfig()
-		fmt.Println("[INIT] Applicerar initial konfiguration på nftables...")
+		fmt.Println("[INIT] Applicerar initial konfiguration (nftables, DHCP, WireGuard)...")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_, err := nftAdapter.ApplyConfig(ctx, runningCfg, false)
+		err := eng.ApplyRunningConfigAtBoot(ctx)
 		cancel()
 		if err != nil {
-			log.Printf("[VARNING] Initial nftables applicering misslyckades: %v", err)
+			log.Printf("[VARNING] Initial applicering misslyckades: %v", err)
 		} else {
-			fmt.Println("[INIT] Initial konfiguration laddad i nftables.")
+			fmt.Println("[INIT] Initial konfiguration laddad.")
 		}
 	}
 

@@ -6,7 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
 )
@@ -22,17 +24,54 @@ type Engine struct {
 	mu             sync.Mutex
 	store          *store.Store
 	nftAdapter     *nftables.Adapter
+	dhcpAdapter    *dhcp.Adapter
+	wgAdapter      *wireguard.Adapter
 	state          State
 	confirmTimer   *time.Timer
 	unconfirmedCfg *config.Config
 }
 
-func NewEngine(st *store.Store, adapter *nftables.Adapter) *Engine {
+func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter) *Engine {
 	return &Engine{
-		store:      st,
-		nftAdapter: adapter,
-		state:      StateIdle,
+		store:       st,
+		nftAdapter:  nftAdapter,
+		dhcpAdapter: dhcpAdapter,
+		wgAdapter:   wgAdapter,
+		state:       StateIdle,
 	}
+}
+
+// applyBackends applicerar samtliga systembackends (nftables, Kea DHCP,
+// WireGuard) för en given konfiguration. Delas mellan ApplyCandidate och
+// rollback så att en rollback verkligen återställer DHCP/VPN, inte bara
+// brandväggsreglerna.
+func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun bool) error {
+	if _, err := e.nftAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+		return fmt.Errorf("nftables: %w", err)
+	}
+	if err := e.dhcpAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+		return fmt.Errorf("dhcp: %w", err)
+	}
+	if cfg.WireGuard != nil && cfg.WireGuard.Enabled {
+		privKey, _, err := e.store.EnsureWireGuardServerKeys()
+		if err != nil {
+			return fmt.Errorf("wireguard: kunde inte hämta serverns nyckelpar: %w", err)
+		}
+		if err := e.wgAdapter.ApplyConfig(ctx, cfg, privKey, dryRun); err != nil {
+			return fmt.Errorf("wireguard: %w", err)
+		}
+	} else if err := e.wgAdapter.ApplyConfig(ctx, cfg, "", dryRun); err != nil {
+		return fmt.Errorf("wireguard: %w", err)
+	}
+	return nil
+}
+
+// ApplyRunningConfigAtBoot laddar den senast committade konfigurationen i
+// samtliga backends vid agentstart (kallas från main.go innan API-servern
+// startar). Går inte via Safe Apply/rollback-timern — det är bara att
+// återskapa det tillstånd som redan var bekräftat innan omstarten.
+func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
+	return e.applyBackends(ctx, e.store.GetRunningConfig(), false)
 }
 
 func (e *Engine) GetRunningConfig() *config.Config {
@@ -49,10 +88,9 @@ func (e *Engine) UpdateCandidate(cfg *config.Config) error {
 
 // ValidateCandidate validerar en candidate-konfiguration utan att ändra systemet.
 func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) error {
-	// 1. Kör nftables dry-run validering
-	_, err := e.nftAdapter.ApplyConfig(ctx, cfg, true)
-	if err != nil {
-		return fmt.Errorf("nftables validering misslyckades: %w", err)
+	// 1. Kör dry-run validering av samtliga backends
+	if err := e.applyBackends(ctx, cfg, true); err != nil {
+		return fmt.Errorf("validering misslyckades: %w", err)
 	}
 
 	// 2. Validera IP-överlapp och logiska fel
@@ -75,10 +113,9 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 		return fmt.Errorf("kan inte applicera ogiltig konfiguration: %w", err)
 	}
 
-	// Applicera skarpt på Linux-kärnan via nftables adapter
-	_, err := e.nftAdapter.ApplyConfig(ctx, candidate, false)
-	if err != nil {
-		return fmt.Errorf("misslyckades applicera konfiguration på nftables: %w", err)
+	// Applicera skarpt mot Linux-kärnan (nftables, Kea DHCP, WireGuard)
+	if err := e.applyBackends(ctx, candidate, false); err != nil {
+		return fmt.Errorf("misslyckades applicera konfiguration: %w", err)
 	}
 
 	e.state = StateUnconfirmed
@@ -148,8 +185,7 @@ func (e *Engine) rollbackLocked(ctx context.Context, user string) error {
 	}
 
 	running := e.store.GetRunningConfig()
-	_, err := e.nftAdapter.ApplyConfig(ctx, running, false)
-	if err != nil {
+	if err := e.applyBackends(ctx, running, false); err != nil {
 		fmt.Printf("[SAFE APPLY] fel vid återställning till running config: %v\n", err)
 	}
 
@@ -159,6 +195,13 @@ func (e *Engine) rollbackLocked(ctx context.Context, user string) error {
 
 	_ = e.store.LogAudit(user, "ROLLBACK_CONFIG", "Konfiguration återställd till senast kända säkra running config")
 	return nil
+}
+
+// GetWireGuardServerPublicKey returnerar (och vid behov genererar) brandväggens
+// egna WireGuard-publika nyckel. Den privata nyckeln lämnar aldrig denna funktion.
+func (e *Engine) GetWireGuardServerPublicKey() (string, error) {
+	_, pub, err := e.store.EnsureWireGuardServerKeys()
+	return pub, err
 }
 
 func (e *Engine) GetState() State {

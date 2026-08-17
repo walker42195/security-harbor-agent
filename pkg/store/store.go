@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
@@ -157,6 +158,55 @@ func (s *Store) CommitCandidate() error {
 	s.runningCfg = s.candidateCfg
 	runningPath := filepath.Join(s.baseDir, "running.json")
 	return s.saveConfigLocked(runningPath, s.runningCfg)
+}
+
+// wgServerKeys är den okrypterade formen som encrypteras som en blob innan
+// den skrivs till disk (se EnsureWireGuardServerKeys).
+type wgServerKeys struct {
+	PrivateKey string `json:"private_key"`
+	PublicKey  string `json:"public_key"`
+}
+
+// EnsureWireGuardServerKeys returnerar brandväggens egna WireGuard-nyckelpar,
+// och genererar+krypterar (AES-256-GCM via Store.crypto, Fas 0 steg 0.5) ett
+// nytt par vid första anropet. Den privata nyckeln lämnar aldrig disk okrypterad
+// och exponeras aldrig via Management-API:t (endast publika nyckeln görs det).
+func (s *Store) EnsureWireGuardServerKeys() (privateKey, publicKey string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	keyPath := filepath.Join(s.baseDir, "wireguard_server.key.enc")
+
+	if data, readErr := os.ReadFile(keyPath); readErr == nil {
+		plain, decErr := s.crypto.Decrypt(data)
+		if decErr != nil {
+			return "", "", fmt.Errorf("misslyckades dekryptera WireGuard-serverns nyckelpar: %w", decErr)
+		}
+		var keys wgServerKeys
+		if jsonErr := json.Unmarshal(plain, &keys); jsonErr != nil {
+			return "", "", fmt.Errorf("korrupt WireGuard-nyckelfil: %w", jsonErr)
+		}
+		return keys.PrivateKey, keys.PublicKey, nil
+	}
+
+	priv, pub, genErr := wireguard.GenerateKeypair()
+	if genErr != nil {
+		return "", "", fmt.Errorf("misslyckades generera WireGuard-serverns nyckelpar: %w", genErr)
+	}
+
+	plain, jsonErr := json.Marshal(wgServerKeys{PrivateKey: priv, PublicKey: pub})
+	if jsonErr != nil {
+		return "", "", jsonErr
+	}
+	cipherBytes, encErr := s.crypto.Encrypt(plain)
+	if encErr != nil {
+		return "", "", fmt.Errorf("misslyckades kryptera WireGuard-serverns nyckelpar: %w", encErr)
+	}
+	if writeErr := os.WriteFile(keyPath, cipherBytes, 0600); writeErr != nil {
+		return "", "", fmt.Errorf("misslyckades skriva %s: %w", keyPath, writeErr)
+	}
+
+	return priv, pub, nil
 }
 
 func (s *Store) LogAudit(user, action, details string) error {
