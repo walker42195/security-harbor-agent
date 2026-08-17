@@ -138,4 +138,21 @@ type ConntrackEntry struct {
 	DstIP    string `json:"dst_ip"`
 	DstPort  int    `json:"dst_port"`
 	State    string `json:"state"`
+	SrcMAC   string `json:"src_mac,omitempty"` // Slås upp via ARP-tabellen, LAN-sidan
+}
+
+// FirewallLogEntry representerar en nekad/blockerad paket-händelse, läst ur
+// kärnans logg (kernel/journald) för nftables "log"-regler (se
+// pkg/adapter/nftables SH-DENY-*-prefixen).
+type FirewallLogEntry struct {
+	Timestamp string `json:"timestamp"`
+	Chain     string `json:"chain"` // "INPUT" eller "FWD"
+	InIface   string `json:"in_iface,omitempty"`
+	OutIface  string `json:"out_iface,omitempty"`
+	SrcMAC    string `json:"src_mac,omitempty"`
+	SrcIP     string `json:"src_ip"`
+	DstIP     string `json:"dst_ip"`
+	Protocol  string `json:"protocol"`
+	SrcPort   int    `json:"src_port,omitempty"`
+	DstPort   int    `json:"dst_port,omitempty"`
 }

@@ -247,6 +247,23 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		})
 	}
 
+	// Input 5: Logga och neka allt annat inkommande (synliggör blockerad
+	// trafik i GUI:t via /api/v1/diagnostics/firewall-log). Kedjans policy
+	// ("drop") är fortfarande fail-safe-spärren om denna regel av någon
+	// anledning saknas.
+	root.Nftables = append(root.Nftables, NFTElement{
+		Rule: &Rule{
+			Family:  a.family,
+			Table:   a.tableName,
+			Chain:   "input",
+			Comment: "Log & deny all other input",
+			Expr: []interface{}{
+				map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-INPUT: "}},
+				map[string]interface{}{"drop": nil},
+			},
+		},
+	})
+
 	// 3. FORWARDING CHAIN (Stateful & Inter-VLAN Policies)
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
@@ -310,10 +327,27 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
 			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 		} else if pol.Action == config.ActionDrop {
+			rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD: "}})
 			rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
 			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 		}
 	}
+
+	// Forward: logga och neka allt annat mellan zoner/VLAN som inte
+	// matchade en explicit policy ovan (Default Deny Inter-VLAN, se avsnitt
+	// 2.4 i genomförandeplanen), så att det syns i firewall-loggen.
+	root.Nftables = append(root.Nftables, NFTElement{
+		Rule: &Rule{
+			Family:  a.family,
+			Table:   a.tableName,
+			Chain:   "forward",
+			Comment: "Log & deny all other forwarding",
+			Expr: []interface{}{
+				map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD: "}},
+				map[string]interface{}{"drop": nil},
+			},
+		},
+	})
 
 	// 4. NAT PREROUTING CHAIN (Port Forwarding / DNAT)
 	for _, pol := range cfg.Policies {

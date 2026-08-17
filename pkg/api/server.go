@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +45,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/system", s.authMiddleware(s.handleSystemStatus))
 	mux.HandleFunc("/api/v1/interfaces/discover", s.authMiddleware(s.handleDiscoverInterfaces))
 	mux.HandleFunc("/api/v1/diagnostics/conntrack", s.authMiddleware(s.handleConntrack))
+	mux.HandleFunc("/api/v1/diagnostics/firewall-log", s.authMiddleware(s.handleFirewallLog))
 	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddleware(s.handlePing))
 	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddleware(s.handleTraceroute))
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
@@ -153,6 +155,18 @@ func (s *Server) handleDiscoverInterfaces(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleConntrack(w http.ResponseWriter, r *http.Request) {
 	entries := parseConntrack()
+	arp := parseARPTable()
+	for i := range entries {
+		if mac, ok := arp[entries[i].SrcIP]; ok {
+			entries[i].SrcMAC = mac
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(entries)
+}
+
+func (s *Server) handleFirewallLog(w http.ResponseWriter, r *http.Request) {
+	entries := parseFirewallLog()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(entries)
 }
@@ -308,6 +322,109 @@ func parseConntrack() []config.ConntrackEntry {
 		}
 	}
 
+	return entries
+}
+
+// parseARPTable läser /proc/net/arp och returnerar en karta IP -> MAC-adress
+// för enheter på de lokala (LAN/VLAN) näten. Används för att berika
+// conntrack-listan med MAC-adresser, som inte finns i /proc/net/nf_conntrack.
+func parseARPTable() map[string]string {
+	result := make(map[string]string)
+	file, err := os.Open("/proc/net/arp")
+	if err != nil {
+		return result
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	first := true
+	for scanner.Scan() {
+		if first {
+			first = false // hoppa över kolumnrubriker
+			continue
+		}
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 4 {
+			continue
+		}
+		ip := fields[0]
+		mac := fields[3]
+		if mac != "" && mac != "00:00:00:00:00:00" {
+			result[ip] = mac
+		}
+	}
+	return result
+}
+
+// firewallLogLineRe matchar kernelns netfilter-loggformat, t.ex.:
+// "...kernel: SH-DENY-INPUT: IN=ens18 OUT= MAC=... SRC=1.2.3.4 DST=10.0.0.163 ... PROTO=TCP SPT=51820 DPT=8443 ..."
+var firewallLogFieldRe = regexp.MustCompile(`(\w+)=([^\s]*)`)
+
+// parseFirewallLog läser de senaste blockerade paketen ur journalens
+// kärnlogg (nftables "log"-uttryck, se SH-DENY-*-prefixen i
+// pkg/adapter/nftables/adapter.go) och returnerar dem strukturerat.
+func parseFirewallLog() []config.FirewallLogEntry {
+	out, err := exec.Command("journalctl", "-k", "-n", "500", "--no-pager", "-o", "short-iso", "-g", "SH-DENY-").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return []config.FirewallLogEntry{}
+	}
+
+	var entries []config.FirewallLogEntry
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		var chain string
+		switch {
+		case strings.Contains(line, "SH-DENY-INPUT:"):
+			chain = "INPUT"
+		case strings.Contains(line, "SH-DENY-FWD:"):
+			chain = "FWD"
+		default:
+			continue
+		}
+
+		entry := config.FirewallLogEntry{Chain: chain}
+		// Tidsstämpeln är de första tre fälten i "short-iso"-format (t.ex. "2026-08-17T10:15:00+0200 host kernel:").
+		tsFields := strings.Fields(line)
+		if len(tsFields) > 0 {
+			entry.Timestamp = tsFields[0]
+		}
+
+		for _, m := range firewallLogFieldRe.FindAllStringSubmatch(line, -1) {
+			key, val := m[1], m[2]
+			switch key {
+			case "IN":
+				entry.InIface = val
+			case "OUT":
+				entry.OutIface = val
+			case "MAC":
+				// nftables loggar käll- och destinations-MAC hopslaget; de sex
+				// första oktetten hör till destinationen och nästa sex till
+				// källan för mottagen trafik. Vi tar de sista sex byten som en
+				// rimlig approximation av avsändarens MAC.
+				parts := strings.Split(val, ":")
+				if len(parts) >= 12 {
+					entry.SrcMAC = strings.Join(parts[6:12], ":")
+				}
+			case "SRC":
+				entry.SrcIP = val
+			case "DST":
+				entry.DstIP = val
+			case "PROTO":
+				entry.Protocol = val
+			case "SPT":
+				p, _ := strconv.Atoi(val)
+				entry.SrcPort = p
+			case "DPT":
+				p, _ := strconv.Atoi(val)
+				entry.DstPort = p
+			}
+		}
+
+		if entry.SrcIP != "" {
+			entries = append(entries, entry)
+		}
+	}
 	return entries
 }
 
