@@ -10,6 +10,7 @@ import (
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
+	"github.com/walker42195/security-harbor-agent/pkg/pki"
 )
 
 type AuditEntry struct {
@@ -207,6 +208,76 @@ func (s *Store) EnsureWireGuardServerKeys() (privateKey, publicKey string, err e
 	}
 
 	return priv, pub, nil
+}
+
+// pemKeyPair är den okrypterade formen som krypteras som en blob innan den
+// skrivs till disk (samma mönster som wgServerKeys ovan).
+type pemKeyPair struct {
+	CertPEM string `json:"cert_pem"`
+	KeyPEM  string `json:"key_pem"`
+	Serial  string `json:"serial"`
+}
+
+func (s *Store) loadOrCreateKeyPair(filename string, generate func() (*pki.KeyPair, error)) (*pki.KeyPair, error) {
+	path := filepath.Join(s.baseDir, filename)
+
+	if data, readErr := os.ReadFile(path); readErr == nil {
+		plain, decErr := s.crypto.Decrypt(data)
+		if decErr != nil {
+			return nil, fmt.Errorf("misslyckades dekryptera %s: %w", filename, decErr)
+		}
+		var kp pemKeyPair
+		if jsonErr := json.Unmarshal(plain, &kp); jsonErr != nil {
+			return nil, fmt.Errorf("korrupt nyckelfil %s: %w", filename, jsonErr)
+		}
+		return &pki.KeyPair{CertPEM: kp.CertPEM, KeyPEM: kp.KeyPEM, Serial: kp.Serial}, nil
+	}
+
+	kp, genErr := generate()
+	if genErr != nil {
+		return nil, genErr
+	}
+
+	plain, jsonErr := json.Marshal(pemKeyPair{CertPEM: kp.CertPEM, KeyPEM: kp.KeyPEM, Serial: kp.Serial})
+	if jsonErr != nil {
+		return nil, jsonErr
+	}
+	cipherBytes, encErr := s.crypto.Encrypt(plain)
+	if encErr != nil {
+		return nil, fmt.Errorf("misslyckades kryptera %s: %w", filename, encErr)
+	}
+	if writeErr := os.WriteFile(path, cipherBytes, 0600); writeErr != nil {
+		return nil, fmt.Errorf("misslyckades skriva %s: %w", path, writeErr)
+	}
+
+	return kp, nil
+}
+
+// EnsureOpenVPNCA returnerar brandväggens OpenVPN-CA (genererar+krypterar ett
+// nytt vid första anropet, Fas 4). CA-nyckeln lämnar aldrig disk okrypterad
+// och exponeras aldrig via Management-API:t — bara CACertPEM (publikt) gör det.
+func (s *Store) EnsureOpenVPNCA() (*pki.KeyPair, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadOrCreateKeyPair("openvpn_ca.key.enc", func() (*pki.KeyPair, error) {
+		return pki.GenerateCA("Security Harbor CA")
+	})
+}
+
+// EnsureOpenVPNServerCert returnerar brandväggens OpenVPN-servercertifikat,
+// signerat av CA:n från EnsureOpenVPNCA, och genererar+krypterar ett nytt
+// vid första anropet.
+func (s *Store) EnsureOpenVPNServerCert() (*pki.KeyPair, error) {
+	ca, err := s.EnsureOpenVPNCA()
+	if err != nil {
+		return nil, fmt.Errorf("openvpn: kunde inte hämta CA: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadOrCreateKeyPair("openvpn_server.key.enc", func() (*pki.KeyPair, error) {
+		return pki.IssueCert(ca.CertPEM, ca.KeyPEM, "security-harbor-server", true)
+	})
 }
 
 func (s *Store) LogAudit(user, action, details string) error {

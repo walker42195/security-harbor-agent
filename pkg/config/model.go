@@ -14,6 +14,7 @@ type Config struct {
 	Policies   []Policy         `json:"policies"`   // Brandväggs- och NAT-regler
 	Settings   Settings         `json:"settings"`   // System- och management-inställningar
 	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"` // VPN-serverkonfiguration (Fas 3)
+	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`   // VPN-serverkonfiguration (Fas 4)
 }
 
 // WireGuardConfig representerar server-sidans WireGuard-inställningar (wg0).
@@ -39,6 +40,35 @@ type WireGuardPeer struct {
 	PublicKey  string `json:"public_key"`
 	AllowedIPs string `json:"allowed_ips"` // t.ex. "10.66.66.2/32"
 	Enabled    bool   `json:"enabled"`
+}
+
+// OpenVPNConfig representerar server-sidans OpenVPN-inställningar (Fas 4).
+// CA:ns och serverns privata nycklar lagras ALDRIG i denna struct — de
+// hålls krypterade av Store (EnsureOpenVPNCA/EnsureOpenVPNServerCert) på
+// samma sätt som WireGuard-serverns nyckelpar (Fas 3). CACertPEM är
+// public och skickas till klienter/GUI utan risk.
+type OpenVPNConfig struct {
+	Enabled    bool            `json:"enabled"`
+	ListenPort int             `json:"listen_port"` // t.ex. 1194
+	Protocol   string          `json:"protocol"`     // "udp" eller "tcp"
+	Address    string          `json:"address"`      // VPN-subnät, t.ex. "10.77.77.0/24"
+	Endpoint   string          `json:"endpoint"`      // Publik host/IP klienter ansluter mot
+	CACertPEM  string          `json:"ca_cert_pem,omitempty"` // Fylls i dynamiskt av agenten, aldrig skriven av klienten
+	Clients    []OpenVPNClient `json:"clients"`
+}
+
+// OpenVPNClient representerar en utfärdad klientprofil. Klientens privata
+// nyckel visas en gång vid utfärdande (se /api/v1/vpn/openvpn/generate-client)
+// och sparas aldrig på brandväggen — bara det publika certifikatet/serienumret
+// (för spårbarhet och spärrning via CRL) lagras här.
+type OpenVPNClient struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Enabled    bool   `json:"enabled"`
+	Revoked    bool   `json:"revoked"`
+	CertSerial string `json:"cert_serial,omitempty"`
+	CertPEM    string `json:"cert_pem,omitempty"`
+	IssuedAt   string `json:"issued_at,omitempty"`
 }
 
 // Interface representerar ett nätverksgränssnitt eller VLAN.

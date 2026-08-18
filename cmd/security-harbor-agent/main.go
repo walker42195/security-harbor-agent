@@ -12,6 +12,7 @@ import (
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/api"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
@@ -42,7 +43,8 @@ func main() {
 	nftAdapter := nftables.NewAdapter()
 	dhcpAdapter := dhcp.NewAdapter("")
 	wgAdapter := wireguard.NewAdapter("")
-	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter)
+	ovpnAdapter := openvpn.NewAdapter("")
+	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter)
 	auth := api.NewAuthManager()
 
 	// Applicera initial konfiguration vid start (om ej dry-run)

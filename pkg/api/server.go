@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
@@ -52,6 +53,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
 	mux.HandleFunc("/api/v1/vpn/wireguard/server-info", s.authMiddleware(s.handleWireGuardServerInfo))
 	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddleware(s.handleWireGuardGeneratePeerKeys))
+	mux.HandleFunc("/api/v1/vpn/openvpn/ca-info", s.authMiddleware(s.handleOpenVPNCAInfo))
+	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddleware(s.handleOpenVPNGenerateClient))
 
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig))
@@ -241,6 +244,75 @@ func (s *Server) handleWireGuardGeneratePeerKeys(w http.ResponseWriter, r *http.
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"private_key": priv, "public_key": pub})
+}
+
+// handleOpenVPNCAInfo returnerar brandväggens publika OpenVPN-CA-certifikat
+// (aldrig CA-nyckeln), så att GUI:t kan visa/verifiera det utan att behöva
+// generera en klient först.
+func (s *Server) handleOpenVPNCAInfo(w http.ResponseWriter, r *http.Request) {
+	caCertPEM, err := s.engine.GetOpenVPNCACertPEM()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"ca_cert_pem": caCertPEM})
+}
+
+// handleOpenVPNGenerateClient signerar ett nytt klientcertifikat med
+// brandväggens CA och returnerar en färdig, självständig .ovpn-fil. Klientens
+// privata nyckel returneras EN gång till den inloggade admin-klienten och
+// sparas aldrig på brandväggen — GUI:t ansvarar för att spara cert_pem/serial
+// (inte private_key) i candidate-konfigurationens OpenVPN.Clients-lista.
+func (s *Server) handleOpenVPNGenerateClient(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		http.Error(w, "Namn saknas", http.StatusBadRequest)
+		return
+	}
+
+	certPEM, keyPEM, serial, err := s.engine.IssueOpenVPNClient(req.Name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	cfg := s.engine.GetCandidateConfig()
+	if cfg == nil {
+		cfg = s.engine.GetRunningConfig()
+	}
+	if cfg == nil || cfg.OpenVPN == nil {
+		http.Error(w, "OpenVPN är inte konfigurerat", http.StatusBadRequest)
+		return
+	}
+	caCertPEM, err := s.engine.GetOpenVPNCACertPEM()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	cfgCopy := *cfg
+	ovpnCopy := *cfg.OpenVPN
+	ovpnCopy.CACertPEM = caCertPEM
+	cfgCopy.OpenVPN = &ovpnCopy
+
+	ovpnFile, err := openvpn.GenerateClientConfig(&cfgCopy, certPEM, keyPEM)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"cert_pem":    certPEM,
+		"serial":      serial,
+		"ovpn_config": ovpnFile,
+	})
 }
 
 func (s *Server) handleGetRunningConfig(w http.ResponseWriter, r *http.Request) {
