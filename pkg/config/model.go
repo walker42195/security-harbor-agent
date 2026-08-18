@@ -308,19 +308,24 @@ type ConntrackEntry struct {
 	DstMAC string `json:"dst_mac,omitempty"`
 }
 
-// FirewallLogEntry representerar en nekad/blockerad paket-händelse, läst ur
-// kärnans logg (kernel/journald) för nftables "log"-regler (se
-// pkg/adapter/nftables SH-DENY-*-prefixen).
+// FirewallLogEntry representerar EN loggad paket-händelse (både tillåten
+// OCH nekad — se Action) läst ur kärnans logg (kernel/journald) för
+// nftables "log"-regler (se pkg/adapter/nftables SH-ACCEPT-/SH-DENY-*-
+// prefixen). Namnet på den policy som fattade beslutet ingår i själva
+// log-prefixet och plockas ut här (PolicyName) — så GUI:t kan visa VILKEN
+// regel som tillät/nekade trafiken, inte bara att den gjorde det.
 type FirewallLogEntry struct {
-	Timestamp string `json:"timestamp"`
-	Chain     string `json:"chain"` // "INPUT" eller "FWD"
-	InIface   string `json:"in_iface,omitempty"`
-	OutIface  string `json:"out_iface,omitempty"`
-	SrcMAC    string `json:"src_mac,omitempty"`
-	DstMAC    string `json:"dst_mac,omitempty"`
-	SrcIP     string `json:"src_ip"`
-	DstIP     string `json:"dst_ip"`
-	Protocol  string `json:"protocol"`
-	SrcPort   int    `json:"src_port,omitempty"`
-	DstPort   int    `json:"dst_port,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	Action     string `json:"action"` // "accept" eller "deny"
+	Chain      string `json:"chain"`  // "INPUT" eller "FWD"
+	PolicyName string `json:"policy_name,omitempty"`
+	InIface    string `json:"in_iface,omitempty"`
+	OutIface   string `json:"out_iface,omitempty"`
+	SrcMAC     string `json:"src_mac,omitempty"`
+	DstMAC     string `json:"dst_mac,omitempty"`
+	SrcIP      string `json:"src_ip"`
+	DstIP      string `json:"dst_ip"`
+	Protocol   string `json:"protocol"`
+	SrcPort    int    `json:"src_port,omitempty"`
+	DstPort    int    `json:"dst_port,omitempty"`
 }

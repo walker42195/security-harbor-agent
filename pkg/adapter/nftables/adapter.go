@@ -12,6 +12,16 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
+// logSlug gör ett policy-namn säkert att stoppa in i ett nftables
+// `log prefix`-fält. Kärnans log-prefix parsas av
+// pkg/api/server.go:parseFirewallLog via ett "SH-ACTION-CHAIN-NAMN: "-
+// mönster — ett ":" i namnet skulle göra den gränsen tvetydig, så det är
+// det enda tecknet som behöver bytas ut. Mellanslag är OK och behålls för
+// läsbarhetens skull (namnet visas som det är i GUI:t).
+func logSlug(name string) string {
+	return strings.ReplaceAll(name, ":", "-")
+}
+
 // serviceMatchExpr bygger nftables match-uttryck för en Service-sträng, t.ex.
 // "ANY", "ICMP", "22", "UDP:53". Delas mellan FORWARD-kedjans policies och
 // INPUT-kedjans lokala åtkomstpolicies för att undvika dubblerad parsning.
@@ -290,15 +300,15 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	// Input 1: Loopback accept
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
-			Family: a.family,
-			Table:  a.tableName,
-			Chain:  "input",
+			Family:  a.family,
+			Table:   a.tableName,
+			Chain:   "input",
 			Comment: "Allow loopback interface",
 			Expr: []interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
-						"op": "==",
-						"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+						"op":    "==",
+						"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
 						"right": "lo",
 					},
 				},
@@ -310,15 +320,15 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	// Input 2: Established / Related accept (Stateful)
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
-			Family: a.family,
-			Table:  a.tableName,
-			Chain:  "input",
+			Family:  a.family,
+			Table:   a.tableName,
+			Chain:   "input",
 			Comment: "Allow established/related connections",
 			Expr: []interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
-						"op": "in",
-						"left": map[string]interface{}{"ct": map[string]interface{}{"key": "state"}},
+						"op":    "in",
+						"left":  map[string]interface{}{"ct": map[string]interface{}{"key": "state"}},
 						"right": []string{"established", "related"},
 					},
 				},
@@ -399,15 +409,15 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	for _, wanDev := range wanDevices {
 		root.Nftables = append(root.Nftables, NFTElement{
 			Rule: &Rule{
-				Family: a.family,
-				Table:  a.tableName,
-				Chain:  "input",
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "input",
 				Comment: fmt.Sprintf("HARD WAN DROP ALL INCOMING on %s", wanDev),
 				Expr: []interface{}{
 					map[string]interface{}{
 						"match": map[string]interface{}{
-							"op": "==",
-							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"op":    "==",
+							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
 							"right": wanDev,
 						},
 					},
@@ -445,6 +455,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
 				rule.Expr = append(rule.Expr, svcExpr...)
 				rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
+				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-ACCEPT-INPUT-%s: ", logSlug(pol.Name))}})
 				rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
 				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			}
@@ -458,22 +469,22 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	for _, lanDev := range lanDevices {
 		root.Nftables = append(root.Nftables, NFTElement{
 			Rule: &Rule{
-				Family: a.family,
-				Table:  a.tableName,
-				Chain:  "input",
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "input",
 				Comment: fmt.Sprintf("Allow Management API on LAN %s", lanDev),
 				Expr: []interface{}{
 					map[string]interface{}{
 						"match": map[string]interface{}{
-							"op": "==",
-							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"op":    "==",
+							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
 							"right": lanDev,
 						},
 					},
 					map[string]interface{}{
 						"match": map[string]interface{}{
-							"op": "==",
-							"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
 							"right": cfg.Settings.APIPort,
 						},
 					},
@@ -531,7 +542,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			Chain:   "input",
 			Comment: "Log & deny all other input",
 			Expr: []interface{}{
-				map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-INPUT: "}},
+				map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-INPUT-DefaultDeny: "}},
 				map[string]interface{}{"drop": nil},
 			},
 		},
@@ -540,15 +551,15 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	// 3. FORWARDING CHAIN (Stateful & Inter-VLAN Policies)
 	root.Nftables = append(root.Nftables, NFTElement{
 		Rule: &Rule{
-			Family: a.family,
-			Table:  a.tableName,
-			Chain:  "forward",
+			Family:  a.family,
+			Table:   a.tableName,
+			Chain:   "forward",
 			Comment: "Allow established/related forwarding",
 			Expr: []interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
-						"op": "in",
-						"left": map[string]interface{}{"ct": map[string]interface{}{"key": "state"}},
+						"op":    "in",
+						"left":  map[string]interface{}{"ct": map[string]interface{}{"key": "state"}},
 						"right": []string{"established", "related"},
 					},
 				},
@@ -568,15 +579,15 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			// Tillåt forwarding till den interna IP-adressen vid DNAT
 			root.Nftables = append(root.Nftables, NFTElement{
 				Rule: &Rule{
-					Family: a.family,
-					Table:  a.tableName,
-					Chain:  "forward",
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "forward",
 					Comment: fmt.Sprintf("Allow DNAT forwarding for %s", pol.Name),
 					Expr: []interface{}{
 						map[string]interface{}{
 							"match": map[string]interface{}{
-								"op": "==",
-								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+								"op":    "==",
+								"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
 								"right": pol.NAT.InternalIP,
 							},
 						},
@@ -617,10 +628,11 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
 
 			if pol.Action == config.ActionAccept {
+				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-ACCEPT-FWD-%s: ", logSlug(pol.Name))}})
 				rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
 				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			} else if pol.Action == config.ActionDrop {
-				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD: "}})
+				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-DENY-FWD-%s: ", logSlug(pol.Name))}})
 				rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
 				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			}
@@ -637,7 +649,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			Chain:   "forward",
 			Comment: "Log & deny all other forwarding",
 			Expr: []interface{}{
-				map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD: "}},
+				map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD-DefaultDeny: "}},
 				map[string]interface{}{"drop": nil},
 			},
 		},
@@ -722,15 +734,15 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	for _, wanDev := range wanDevices {
 		root.Nftables = append(root.Nftables, NFTElement{
 			Rule: &Rule{
-				Family: a.family,
-				Table:  a.tableName,
-				Chain:  "postrouting",
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "postrouting",
 				Comment: fmt.Sprintf("Outbound NAT Masquerade on %s", wanDev),
 				Expr: []interface{}{
 					map[string]interface{}{
 						"match": map[string]interface{}{
-							"op": "==",
-							"left": map[string]interface{}{"meta": map[string]interface{}{"key": "oifname"}},
+							"op":    "==",
+							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "oifname"}},
 							"right": wanDev,
 						},
 					},

@@ -327,6 +327,52 @@ func TestRenderJSONPolicySchedule(t *testing.T) {
 	}
 }
 
+// TestRenderJSONLogPrefixesCarryPolicyName skyddar attributionen i
+// loggningsvyn (GUI:t ska kunna visa VILKEN regel som tillät/nekade
+// trafiken, inte bara att den gjorde det) — verifierar att både
+// accept- och drop-policies får ett unikt, policynamn-bärande
+// `log prefix`, att default-deny-fallbacken har ett fast namn, och att
+// ett ":" i policynamnet saneras bort (annars blir log-prefixets
+// "SH-ACTION-CHAIN-NAMN:"-gräns tvetydig för parseFirewallLog).
+func TestRenderJSONLogPrefixesCarryPolicyName(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Policies: []config.Policy{
+			{ID: "pol-allow", Name: "Kontor: Internet", Enabled: true, SourceObj: "ANY", DestObj: "ANY", Service: "ANY", Action: config.ActionAccept},
+			{ID: "pol-deny", Name: "Block IoT", Enabled: true, SourceObj: "ANY", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop},
+			{ID: "pol-ssh", Name: "SSH Admin", Enabled: true, Local: true, Service: "22"},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	s := string(data)
+
+	if !strings.Contains(s, `SH-ACCEPT-FWD-Kontor- Internet: `) {
+		t.Errorf("förväntade ett SH-ACCEPT-FWD-prefix med policynamnet (\":\" saneras till \"-\"), men saknas: %s", s)
+	}
+	if !strings.Contains(s, `SH-DENY-FWD-Block IoT: `) {
+		t.Errorf("förväntade ett SH-DENY-FWD-prefix med policynamnet, men saknas: %s", s)
+	}
+	if !strings.Contains(s, `SH-ACCEPT-INPUT-SSH Admin: `) {
+		t.Errorf("förväntade ett SH-ACCEPT-INPUT-prefix för den lokala SSH-policyn, men saknas: %s", s)
+	}
+	if !strings.Contains(s, `SH-DENY-FWD-DefaultDeny: `) {
+		t.Errorf("förväntade ett fast namngivet default-deny-prefix i forward-kedjan, men saknas: %s", s)
+	}
+	if !strings.Contains(s, `SH-DENY-INPUT-DefaultDeny: `) {
+		t.Errorf("förväntade ett fast namngivet default-deny-prefix i input-kedjan, men saknas: %s", s)
+	}
+}
+
 // TestRenderJSONServiceGroupExpandsToMultipleRules verifierar att en
 // Policy vars Service pekar på en Service Group (Fas 7) genererar EN
 // regel PER medlem (nftables kan inte uttrycka "ELLER" mellan orelaterade

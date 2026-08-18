@@ -1039,15 +1039,24 @@ func parseARPTable() map[string]string {
 	return result
 }
 
-// firewallLogLineRe matchar kernelns netfilter-loggformat, t.ex.:
-// "...kernel: SH-DENY-INPUT: IN=ens18 OUT= MAC=... SRC=1.2.3.4 DST=10.0.0.163 ... PROTO=TCP SPT=51820 DPT=8443 ..."
+// firewallLogFieldRe matchar kernelns netfilter-loggformat, t.ex.:
+// "...kernel: SH-ACCEPT-FWD-Kontor mot Internet: IN=ens18 OUT=ens19 MAC=... SRC=... DST=... ... PROTO=TCP SPT=51820 DPT=8443 ..."
 var firewallLogFieldRe = regexp.MustCompile(`(\w+)=([^\s]*)`)
 
-// parseFirewallLog läser de senaste blockerade paketen ur journalens
-// kärnlogg (nftables "log"-uttryck, se SH-DENY-*-prefixen i
-// pkg/adapter/nftables/adapter.go) och returnerar dem strukturerat.
+// firewallLogHeaderRe plockar ut åtgärd/kedja/policynamn ur log-prefixet
+// (satt av pkg/adapter/nftables — SH-ACCEPT-*/SH-DENY-*-prefixen, se
+// logSlug där). Policynamnet får innehålla mellanslag, men inte ":"
+// (redan sanerat bort vid generering), så matchningen kan gå fram till
+// första ":" efter prefixet.
+var firewallLogHeaderRe = regexp.MustCompile(`SH-(ACCEPT|DENY)-(INPUT|FWD)-(.+?):`)
+
+// parseFirewallLog läser de senaste loggade paket-händelserna (BÅDE
+// tillåtna och nekade) ur journalens kärnlogg (nftables "log"-uttryck, se
+// SH-ACCEPT-*/SH-DENY-*-prefixen i pkg/adapter/nftables/adapter.go) och
+// returnerar dem strukturerat, inklusive vilken policy som fattade
+// beslutet (PolicyName).
 func parseFirewallLog() []config.FirewallLogEntry {
-	out, err := exec.Command("journalctl", "-k", "-n", "500", "--no-pager", "-o", "short-iso", "-g", "SH-DENY-").CombinedOutput()
+	out, err := exec.Command("journalctl", "-k", "-n", "500", "--no-pager", "-o", "short-iso", "-g", "SH-(ACCEPT|DENY)-").CombinedOutput()
 	if err != nil && len(out) == 0 {
 		return []config.FirewallLogEntry{}
 	}
@@ -1056,17 +1065,16 @@ func parseFirewallLog() []config.FirewallLogEntry {
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
 		line := scanner.Text()
-		var chain string
-		switch {
-		case strings.Contains(line, "SH-DENY-INPUT:"):
-			chain = "INPUT"
-		case strings.Contains(line, "SH-DENY-FWD:"):
-			chain = "FWD"
-		default:
+		header := firewallLogHeaderRe.FindStringSubmatch(line)
+		if header == nil {
 			continue
 		}
 
-		entry := config.FirewallLogEntry{Chain: chain}
+		entry := config.FirewallLogEntry{
+			Action:     strings.ToLower(header[1]),
+			Chain:      header[2],
+			PolicyName: header[3],
+		}
 		// Tidsstämpeln är de första tre fälten i "short-iso"-format (t.ex. "2026-08-17T10:15:00+0200 host kernel:").
 		tsFields := strings.Fields(line)
 		if len(tsFields) > 0 {
