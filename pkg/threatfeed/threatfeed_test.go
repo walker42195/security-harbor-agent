@@ -41,6 +41,7 @@ func TestParseTorExitList(t *testing.T) {
 
 func TestParseHostsFileDomains(t *testing.T) {
 	input := `# Title: StevenBlack hosts
+0.0.0.0 0.0.0.0
 127.0.0.1 localhost
 127.0.0.1 localhost.localdomain
 ::1 ip6-localhost

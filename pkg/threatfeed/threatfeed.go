@@ -95,7 +95,10 @@ func parseHostsFileDomains(scanner *bufio.Scanner) []string {
 			continue
 		}
 		domain := strings.ToLower(fields[1])
-		if skip[domain] || !strings.Contains(domain, ".") {
+		// Vissa hosts-filer (StevenBlack inkluderat) har en självrefererande
+		// header-rad som "0.0.0.0 0.0.0.0" — hoppa över när "domänen" bara är
+		// samma IP-adress som fältet före den.
+		if skip[domain] || domain == fields[0] || !strings.Contains(domain, ".") {
 			continue
 		}
 		out = append(out, domain)
