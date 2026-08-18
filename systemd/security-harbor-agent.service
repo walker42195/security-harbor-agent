@@ -7,6 +7,11 @@ Requires=security-harbor-failsafe.service
 Type=simple
 User=security-harbor
 Group=security-harbor
+# _kea: krävs för att läsa Kea:s lease-databas (/var/lib/kea/kea-leases4.csv,
+# rw-r----- ägd av _kea:_kea) — används för DNS.DHCPHostnameRegistration.
+# Utan den här gruppen misslyckas läsningen tyst med "permission denied" så
+# fort funktionen slås på, även om resten av agenten fungerar normalt.
+SupplementaryGroups=_kea
 ExecStart=/usr/local/bin/security-harbor-agent --data-dir /var/lib/security-harbor
 Restart=always
 RestartSec=5s
