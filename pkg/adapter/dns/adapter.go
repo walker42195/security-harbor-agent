@@ -47,18 +47,38 @@ func GenerateServerConfig(cfg *config.Config, blocklistPath string) (string, err
 	d := cfg.DNS
 
 	var lanNetworks []string
+	var lanIPs []string
+	seenNet, seenIP := map[string]bool{}, map[string]bool{}
 	for _, iface := range cfg.Interfaces {
 		if !iface.Enabled || iface.Zone == "WAN" || iface.IPv4 == "" {
 			continue
 		}
-		if _, ipNet, err := net.ParseCIDR(iface.IPv4); err == nil {
-			lanNetworks = append(lanNetworks, ipNet.String())
+		ip, ipNet, err := net.ParseCIDR(iface.IPv4)
+		if err != nil {
+			continue
+		}
+		if netStr := ipNet.String(); !seenNet[netStr] {
+			seenNet[netStr] = true
+			lanNetworks = append(lanNetworks, netStr)
+		}
+		if ipStr := ip.String(); !seenIP[ipStr] {
+			seenIP[ipStr] = true
+			lanIPs = append(lanIPs, ipStr)
 		}
 	}
 
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "server:\n")
-	fmt.Fprintf(&b, "    interface: 0.0.0.0\n")
+	// Bind ENDAST till LAN-interfacens specifika IP:n, INTE 0.0.0.0.
+	// systemd-resolved (Ubuntu/Debian) äger redan loopback-stubben
+	// (127.0.0.53/.54:53), och en wildcard-bind kolliderar med den
+	// ("Address already in use") — upptäckt vid skarp testning mot
+	// 10.0.0.163 2026-08-18. Att bara binda LAN-IP:er är dessutom
+	// arkitekturellt rätt: en brandväggs DNS-resolver ska svara på
+	// LAN-sidan, inte på loopback eller WAN.
+	for _, ip := range lanIPs {
+		fmt.Fprintf(&b, "    interface: %s\n", ip)
+	}
 	fmt.Fprintf(&b, "    port: 53\n")
 	fmt.Fprintf(&b, "    do-ip4: yes\n")
 	fmt.Fprintf(&b, "    do-udp: yes\n")
@@ -72,6 +92,15 @@ func GenerateServerConfig(cfg *config.Config, blocklistPath string) (string, err
 	fmt.Fprintf(&b, "    access-control: 0.0.0.0/0 refuse\n")
 	if d.BlocklistEnabled && blocklistPath != "" {
 		fmt.Fprintf(&b, "    include: \"%s\"\n", blocklistPath)
+	}
+	// tls-cert-bundle (server:-klausul-option) måste anges explicit — utan
+	// den har Unbound inga tillförlitliga CA-ankare alls och avvisar VARJE
+	// upstream-certifikat (loggat missvisande som "self-signed certificate
+	// in certificate chain" även för ett helt legitimt Cloudflare/Quad9-
+	// cert). Upptäckt vid skarp testning mot 10.0.0.163 2026-08-18
+	// (Debian/Ubuntu-sökväg).
+	if d.DoTEnabled {
+		fmt.Fprintf(&b, "    tls-cert-bundle: \"/etc/ssl/certs/ca-certificates.crt\"\n")
 	}
 	fmt.Fprintf(&b, "\n")
 
@@ -118,19 +147,25 @@ func GenerateBlocklistConfig(domains []string, cfg *config.Config) string {
 		delete(blocked, normalizeDomain(d))
 	}
 
+	// `local-zone:` är en server:-klausul-option — en inkluderad fil med
+	// bara bara-local-zone-rader (utan ett eget `server:`-huvud) avvisas
+	// av Unbound med "syntax error, is there no section start after an
+	// include-toplevel directive perhaps" (upptäckt vid skarp testning
+	// mot 10.0.0.163 2026-08-18).
 	var b bytes.Buffer
+	fmt.Fprintf(&b, "server:\n")
 	for domain := range blocked {
 		if domain == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "local-zone: \"%s.\" always_nxdomain\n", domain)
+		fmt.Fprintf(&b, "    local-zone: \"%s.\" always_nxdomain\n", domain)
 	}
 	for _, d := range cfg.DNS.CustomAllowedDomains {
 		domain := normalizeDomain(d)
 		if domain == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "local-zone: \"%s.\" transparent\n", domain)
+		fmt.Fprintf(&b, "    local-zone: \"%s.\" transparent\n", domain)
 	}
 	return b.String()
 }

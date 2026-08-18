@@ -30,8 +30,41 @@ func TestGenerateServerConfigDoT(t *testing.T) {
 	if !strings.Contains(conf, "1.1.1.1@853#cloudflare-dns.com") {
 		t.Errorf("förväntade DoT-formaterad forward-addr, men saknas: %s", conf)
 	}
+	if !strings.Contains(conf, `tls-cert-bundle: "/etc/ssl/certs/ca-certificates.crt"`) {
+		t.Errorf("förväntade tls-cert-bundle när DoT är aktiverat (utan den avvisas ALLA upstream-cert, se skarp testning 2026-08-18), men saknas: %s", conf)
+	}
 	if !strings.Contains(conf, "access-control: 10.0.0.0/24 allow") {
 		t.Errorf("förväntade access-control för LAN-nätet, men saknas: %s", conf)
+	}
+}
+
+// TestGenerateServerConfigBindsOnlyLANIPsNotWildcard skyddar mot en
+// regression upptäckt vid skarp testning mot 10.0.0.163 2026-08-18:
+// `interface: 0.0.0.0` kolliderar med systemd-resolved (Ubuntu/Debian),
+// som redan äger loopback-DNS-stubben (127.0.0.53/.54:53) — Unbound
+// vägrade starta med "Address already in use for 0.0.0.0 port 53". Ska
+// bara binda till LAN-interfacens specifika IP:er.
+func TestGenerateServerConfigBindsOnlyLANIPsNotWildcard(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, IPv4: "203.0.113.1/24"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, IPv4: "10.0.0.163/24"},
+			{ID: "vlan10", Device: "ens19.10", Zone: "SERVERS", Enabled: true, IPv4: "192.168.10.1/24"},
+		},
+		DNS: &config.DNSConfig{Enabled: true, UpstreamServers: []string{"1.1.1.1"}},
+	}
+	conf, err := GenerateServerConfig(cfg, "")
+	if err != nil {
+		t.Fatalf("GenerateServerConfig misslyckades: %v", err)
+	}
+	if strings.Contains(conf, "interface: 0.0.0.0") {
+		t.Errorf("ska inte binda till 0.0.0.0 (wildcard) — kolliderar med systemd-resolved: %s", conf)
+	}
+	if !strings.Contains(conf, "interface: 10.0.0.163") {
+		t.Errorf("förväntade en interface-rad för LAN-IP:n 10.0.0.163: %s", conf)
+	}
+	if strings.Contains(conf, "203.0.113.1") {
+		t.Errorf("ska inte binda till WAN-IP:n: %s", conf)
 	}
 }
 
@@ -48,6 +81,20 @@ func TestGenerateServerConfigPlainDNS(t *testing.T) {
 	}
 	if !strings.Contains(conf, "forward-addr: 9.9.9.9\n") {
 		t.Errorf("förväntade en vanlig (icke-DoT) forward-addr, men saknas: %s", conf)
+	}
+}
+
+// TestGenerateBlocklistConfigHasServerHeader skyddar mot en regression
+// upptäckt vid skarp testning mot 10.0.0.163 2026-08-18: `local-zone:` är
+// en server:-klausul-option. Utan ett eget `server:`-huvud i den
+// inkluderade filen avvisade Unbound hela konfigurationen med "syntax
+// error, is there no section start after an include-toplevel directive
+// perhaps" och startade aldrig.
+func TestGenerateBlocklistConfigHasServerHeader(t *testing.T) {
+	cfg := &config.Config{DNS: &config.DNSConfig{Enabled: true}}
+	conf := GenerateBlocklistConfig([]string{"malware.example.com"}, cfg)
+	if !strings.HasPrefix(strings.TrimSpace(conf), "server:") {
+		t.Fatalf("blocklist.conf måste börja med ett server:-huvud, fick: %q", conf)
 	}
 }
 
