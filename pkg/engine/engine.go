@@ -480,3 +480,45 @@ func (e *Engine) GetState() State {
 	defer e.mu.Unlock()
 	return e.state
 }
+
+// --- Fas 8: Flera administrationsanvändare & roller ---
+// Tunna passthrough-metoder till store.Users, för att hålla samma
+// lagerarkitektur (API -> Engine -> Store) som resten av agenten.
+
+func (e *Engine) VerifyUserCredentials(username, password string) (*store.PublicUser, error) {
+	return e.store.Users.VerifyCredentials(username, password)
+}
+
+func (e *Engine) ListUsers() []store.PublicUser {
+	return e.store.Users.ListUsers()
+}
+
+func (e *Engine) CreateUser(username, password string, role store.Role) (*store.PublicUser, error) {
+	return e.store.Users.CreateUser(username, password, role)
+}
+
+func (e *Engine) DeleteUser(id string) error {
+	return e.store.Users.DeleteUser(id)
+}
+
+// ChangeOwnPassword byter en användares lösenord, men kräver att det
+// NUVARANDE lösenordet anges och stämmer — så en inloggad session inte kan
+// byta lösenord utan att faktiskt känna till det befintliga (t.ex. om
+// någon lämnar en session olåst).
+func (e *Engine) ChangeOwnPassword(userID, currentPassword, newPassword string) error {
+	if err := e.store.Users.VerifyPasswordByID(userID, currentPassword); err != nil {
+		return err
+	}
+	return e.store.Users.ChangePassword(userID, newPassword)
+}
+
+// AdminResetPassword sätter ett nytt lösenord för en ANNAN användare utan
+// att känna till dennes nuvarande lösenord — bara admin-roller kan nå
+// denna via API:t (se authMiddlewareAdmin).
+func (e *Engine) AdminResetPassword(userID, newPassword string) error {
+	return e.store.Users.ChangePassword(userID, newPassword)
+}
+
+func (e *Engine) FindUserByUsername(username string) (*store.PublicUser, error) {
+	return e.store.Users.FindByUsername(username)
+}

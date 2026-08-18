@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
+	"github.com/walker42195/security-harbor-agent/pkg/store"
 )
 
 type Server struct {
@@ -43,28 +46,40 @@ func (s *Server) Start() error {
 	// Öppna endpoints
 	mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
 
-	// Skyddade endpoints
+	// Skyddade endpoints — läsande, tillgängliga för både admin och viewer
+	// (Fas 8). En "viewer" ska vara strikt skrivskyddad.
 	mux.HandleFunc("/api/v1/system", s.authMiddleware(s.handleSystemStatus))
 	mux.HandleFunc("/api/v1/interfaces/discover", s.authMiddleware(s.handleDiscoverInterfaces))
 	mux.HandleFunc("/api/v1/diagnostics/conntrack", s.authMiddleware(s.handleConntrack))
 	mux.HandleFunc("/api/v1/diagnostics/firewall-log", s.authMiddleware(s.handleFirewallLog))
-	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddleware(s.handlePing))
-	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddleware(s.handleTraceroute))
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
 	mux.HandleFunc("/api/v1/vpn/wireguard/server-info", s.authMiddleware(s.handleWireGuardServerInfo))
-	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddleware(s.handleWireGuardGeneratePeerKeys))
 	mux.HandleFunc("/api/v1/vpn/openvpn/ca-info", s.authMiddleware(s.handleOpenVPNCAInfo))
-	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddleware(s.handleOpenVPNGenerateClient))
-	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddleware(s.handleRefreshObjectSource))
 	mux.HandleFunc("/api/v1/policies/hit-counts", s.authMiddleware(s.handleHitCounts))
-	mux.HandleFunc("/api/v1/dns/refresh-blocklist", s.authMiddleware(s.handleRefreshDNSBlocklist))
 	mux.HandleFunc("/api/v1/dns/blocklist-domains", s.authMiddleware(s.handleGetDNSBlocklistDomains))
-
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
-	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig))
-	mux.HandleFunc("/api/v1/config/apply", s.authMiddleware(s.handleApplyConfig))
-	mux.HandleFunc("/api/v1/config/confirm", s.authMiddleware(s.handleConfirmConfig))
-	mux.HandleFunc("/api/v1/config/rollback", s.authMiddleware(s.handleRollbackConfig))
+	mux.HandleFunc("/api/v1/auth/change-password", s.authMiddleware(s.handleChangePassword))
+
+	// Skyddade endpoints — kräver admin-roll: allt som ändrar konfig,
+	// exekverar kommandon (ping/traceroute kan användas för intern
+	// nätverksrekognosering från brandväggen) eller genererar/roterar
+	// hemligheter.
+	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddlewareAdmin(s.handlePing))
+	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddlewareAdmin(s.handleTraceroute))
+	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddlewareAdmin(s.handleWireGuardGeneratePeerKeys))
+	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddlewareAdmin(s.handleOpenVPNGenerateClient))
+	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddlewareAdmin(s.handleRefreshObjectSource))
+	mux.HandleFunc("/api/v1/dns/refresh-blocklist", s.authMiddlewareAdmin(s.handleRefreshDNSBlocklist))
+	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig)) // GET=alla, POST/PUT kräver admin internt (se handlern)
+	mux.HandleFunc("/api/v1/config/apply", s.authMiddlewareAdmin(s.handleApplyConfig))
+	mux.HandleFunc("/api/v1/config/confirm", s.authMiddlewareAdmin(s.handleConfirmConfig))
+	mux.HandleFunc("/api/v1/config/rollback", s.authMiddlewareAdmin(s.handleRollbackConfig))
+
+	// Användarhantering (Fas 8) — enbart admin.
+	mux.HandleFunc("/api/v1/auth/users", s.authMiddlewareAdmin(s.handleListUsers))
+	mux.HandleFunc("/api/v1/auth/users/create", s.authMiddlewareAdmin(s.handleCreateUser))
+	mux.HandleFunc("/api/v1/auth/users/delete", s.authMiddlewareAdmin(s.handleDeleteUser))
+	mux.HandleFunc("/api/v1/auth/users/reset-password", s.authMiddlewareAdmin(s.handleResetUserPassword))
 
 	handler := s.wanBlockMiddleware(mux)
 
@@ -96,6 +111,16 @@ func (s *Server) wanBlockMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+type ctxKey string
+
+const (
+	ctxKeyUsername ctxKey = "sh_username"
+	ctxKeyRole     ctxKey = "sh_role"
+)
+
+// authMiddleware kräver en giltig session, oavsett roll (admin ELLER
+// viewer). Lägger in användarnamn/roll i request-context så handlers kan
+// läsa vem som anropar (se ctxKeyUsername/ctxKeyRole).
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -104,12 +129,30 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if _, err := s.auth.ValidateToken(token); err != nil {
+		username, role, err := s.auth.ValidateToken(token)
+		if err != nil {
 			http.Error(w, "Unauthorized or expired token", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), ctxKeyUsername, username)
+		ctx = context.WithValue(ctx, ctxKeyRole, role)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	}
+}
+
+// authMiddlewareAdmin kräver en giltig session MED admin-roll (Fas 8 —
+// flera användare/roller). En "viewer" får 403 Forbidden. Används för
+// alla endpoints som ändrar något (config apply/confirm/rollback,
+// nyckelgenerering, uppdatera hot-listor/blocklistor, användarhantering
+// m.m.) — en viewer ska vara strikt läsande.
+func (s *Server) authMiddlewareAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if role, _ := r.Context().Value(ctxKeyRole).(string); role != string(store.RoleAdmin) {
+			http.Error(w, "Forbidden: kräver admin-roll", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -132,14 +175,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if creds.Username == "admin" && creds.Password == "SecurityHarbor2026!" {
-		token, err := s.auth.CreateSession(creds.Username, 24*time.Hour)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+	user, err := s.engine.VerifyUserCredentials(creds.Username, creds.Password)
+	if err == nil {
+		token, tokenErr := s.auth.CreateSession(user.Username, string(user.Role), 24*time.Hour)
+		if tokenErr != nil {
+			http.Error(w, tokenErr.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"token": token, "user": creds.Username})
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": token, "user": user.Username, "role": string(user.Role)})
 		return
 	}
 
@@ -147,10 +191,247 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Felaktigt användarnamn eller lösenord", http.StatusUnauthorized)
 }
 
+// handleChangePassword byter LOSENORDET FÖR DEN INLOGGADE ANVÄNDAREN
+// SJÄLV — kräver att nuvarande lösenord anges (se Engine.ChangeOwnPassword).
+// Tillgänglig för alla roller (både admin och viewer får byta sitt eget
+// lösenord).
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	username, _ := r.Context().Value(ctxKeyUsername).(string)
+	user, err := s.engine.FindUserByUsername(username)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.engine.ChangeOwnPassword(user.ID, req.CurrentPassword, req.NewPassword); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// handleListUsers/handleCreateUser/handleDeleteUser: admin-only
+// användarhantering (Fas 8).
+func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.engine.ListUsers())
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	user, err := s.engine.CreateUser(req.Username, req.Password, store.Role(req.Role))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(user)
+}
+
+func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, "id saknas", http.StatusBadRequest)
+		return
+	}
+	if err := s.engine.DeleteUser(req.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// handleResetUserPassword: admin sätter ett nytt lösenord för en ANNAN
+// användare, utan att behöva känna till dennes nuvarande lösenord.
+func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID          string `json:"id"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, "id saknas", http.StatusBadRequest)
+		return
+	}
+	if err := s.engine.AdminResetPassword(req.ID, req.NewPassword); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	st := string(s.engine.GetState())
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "security-harbor"
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"hostname": "security-harbor", "state": st, "version": "0.7.0-fas7"})
+	memTotalGB, memFreePercent := readMemoryTotals()
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"hostname":        hostname,
+		"state":           st,
+		"version":         "0.7.0-fas7",
+		"uptime":          readUptime(),
+		"cpu":             readCPUPercent(),
+		"cpu_cores":       runtime.NumCPU(),
+		"memory":          readMemoryPercent(),
+		"memory_total_gb": memTotalGB,
+		"memory_free_pct": memFreePercent,
+	})
+}
+
+// readUptime läser systemets faktiska drifttid ur /proc/uptime (sekunder
+// sedan start) och formaterar den som "XhYm" — ersätter den tidigare
+// hårdkodade platshållaren "1h 42m" som visades i GUI:t oavsett verklig
+// drifttid.
+func readUptime() string {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return ""
+	}
+	seconds, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return ""
+	}
+	d := time.Duration(seconds) * time.Second
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh %dm", hours, minutes)
+}
+
+// readCPUPercent tar ett kort (100ms) sample av /proc/stat före/efter för
+// att räkna ut aktuell total CPU-belastning i procent — ersätter den
+// tidigare hårdkodade platshållaren "14.5" som visades oavsett verklig
+// belastning.
+func readCPUPercent() float64 {
+	sample := func() (idle, total uint64, ok bool) {
+		data, err := os.ReadFile("/proc/stat")
+		if err != nil {
+			return 0, 0, false
+		}
+		line := strings.SplitN(string(data), "\n", 2)[0]
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] != "cpu" {
+			return 0, 0, false
+		}
+		for i := 1; i < len(fields); i++ {
+			v, err := strconv.ParseUint(fields[i], 10, 64)
+			if err != nil {
+				continue
+			}
+			total += v
+			if i == 4 { // "idle"-fältet
+				idle = v
+			}
+		}
+		return idle, total, true
+	}
+
+	idle1, total1, ok := sample()
+	if !ok {
+		return 0
+	}
+	time.Sleep(100 * time.Millisecond)
+	idle2, total2, ok := sample()
+	if !ok || total2 <= total1 {
+		return 0
+	}
+
+	idleDelta := float64(idle2 - idle1)
+	totalDelta := float64(total2 - total1)
+	usage := (1.0 - idleDelta/totalDelta) * 100
+	return math.Round(usage*10) / 10
+}
+
+// readMemInfoKB läser MemTotal/MemAvailable ur /proc/meminfo (i kB).
+func readMemInfoKB() (total, available uint64) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch fields[0] {
+		case "MemTotal:":
+			total = v
+		case "MemAvailable:":
+			available = v
+		}
+	}
+	return total, available
+}
+
+// readMemoryPercent räknar ut använt minne i procent (MemTotal -
+// MemAvailable) — ersätter den tidigare hårdkodade platshållaren "38.2"
+// som visades oavsett verklig minnesanvändning.
+func readMemoryPercent() float64 {
+	total, available := readMemInfoKB()
+	if total == 0 {
+		return 0
+	}
+	usage := (1.0 - float64(available)/float64(total)) * 100
+	return math.Round(usage*10) / 10
+}
+
+// readMemoryTotals returnerar totalt RAM i GB samt ledigt minne i procent
+// — ersätter det tidigare hårdkodade "RAM: 8 GB (LEDIGT 62%)" som visades
+// oavsett verklig maskinvara.
+func readMemoryTotals() (totalGB float64, freePercent float64) {
+	total, available := readMemInfoKB()
+	if total == 0 {
+		return 0, 0
+	}
+	totalGB = math.Round(float64(total)/1024/1024*10) / 10
+	freePercent = math.Round(float64(available)/float64(total)*1000) / 10
+	return totalGB, freePercent
 }
 
 func (s *Server) handleDiscoverInterfaces(w http.ResponseWriter, r *http.Request) {
@@ -374,6 +655,13 @@ func (s *Server) handleCandidateConfig(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(cfg)
 	case http.MethodPost, http.MethodPut:
+		// Denna route registreras med authMiddleware (alla roller) eftersom
+		// GET-fallet ovan ska vara läsbart för viewer — POST/PUT (en
+		// konfigurationsändring) kräver admin, kontrollerat här internt.
+		if role, _ := r.Context().Value(ctxKeyRole).(string); role != string(store.RoleAdmin) {
+			http.Error(w, "Forbidden: kräver admin-roll", http.StatusForbidden)
+			return
+		}
 		var newCfg config.Config
 		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
 			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
@@ -395,7 +683,7 @@ func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.engine.ApplyCandidate(r.Context(), "admin"); err != nil {
+	if err := s.engine.ApplyCandidate(r.Context(), "master"); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -408,7 +696,7 @@ func (s *Server) handleConfirmConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.engine.ConfirmConfig(r.Context(), "admin"); err != nil {
+	if err := s.engine.ConfirmConfig(r.Context(), "master"); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -421,7 +709,7 @@ func (s *Server) handleRollbackConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.engine.RollbackConfig(r.Context(), "admin"); err != nil {
+	if err := s.engine.RollbackConfig(r.Context(), "master"); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

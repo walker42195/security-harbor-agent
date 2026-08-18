@@ -11,6 +11,7 @@ import (
 type TokenSession struct {
 	Token     string
 	User      string
+	Role      string // "admin" eller "viewer" (Fas 8 — flera användare/roller)
 	ExpiresAt time.Time
 }
 
@@ -54,7 +55,7 @@ func (a *AuthManager) RecordFailedAttempt(ip string) {
 	}
 }
 
-func (a *AuthManager) CreateSession(user string, duration time.Duration) (string, error) {
+func (a *AuthManager) CreateSession(user, role string, duration time.Duration) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -67,24 +68,26 @@ func (a *AuthManager) CreateSession(user string, duration time.Duration) (string
 	a.sessions[token] = TokenSession{
 		Token:     token,
 		User:      user,
+		Role:      role,
 		ExpiresAt: time.Now().Add(duration),
 	}
 
 	return token, nil
 }
 
-func (a *AuthManager) ValidateToken(token string) (string, error) {
+// ValidateToken returnerar (användarnamn, roll, fel).
+func (a *AuthManager) ValidateToken(token string) (string, string, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
 	session, ok := a.sessions[token]
 	if !ok {
-		return "", fmt.Errorf("ogiltig token")
+		return "", "", fmt.Errorf("ogiltig token")
 	}
 
 	if time.Now().After(session.ExpiresAt) {
-		return "", fmt.Errorf("token har gått ut")
+		return "", "", fmt.Errorf("token har gått ut")
 	}
 
-	return session.User, nil
+	return session.User, session.Role, nil
 }

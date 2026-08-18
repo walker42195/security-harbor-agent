@@ -27,6 +27,7 @@ type Store struct {
 	runningCfg   *config.Config
 	candidateCfg *config.Config
 	crypto       *CryptoHandler
+	Users        *UserStore
 }
 
 func NewStore(baseDir string, masterKey []byte) (*Store, error) {
@@ -48,6 +49,12 @@ func NewStore(baseDir string, masterKey []byte) (*Store, error) {
 	if err := s.loadOrInit(); err != nil {
 		return nil, err
 	}
+
+	users, err := newUserStore(baseDir, crypto)
+	if err != nil {
+		return nil, fmt.Errorf("misslyckades initiera användarlagring: %w", err)
+	}
+	s.Users = users
 
 	return s, nil
 }
