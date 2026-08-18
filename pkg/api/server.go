@@ -150,7 +150,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	st := string(s.engine.GetState())
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"hostname": "security-harbor", "state": st, "version": "0.2.0-fas2"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"hostname": "security-harbor", "state": st, "version": "0.7.0-fas7"})
 }
 
 func (s *Server) handleDiscoverInterfaces(w http.ResponseWriter, r *http.Request) {
