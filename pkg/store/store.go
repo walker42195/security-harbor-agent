@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -413,6 +414,19 @@ func (s *Store) loadOrCreateKeyPair(filename string, generate func() (*pki.KeyPa
 	}
 
 	return kp, nil
+}
+
+// EnsureManagementTLSCert returnerar (och genererar+krypterar vid första
+// anropet) certifikatet för Management-API:ets HTTPS-lyssnare. Följer
+// exakt samma "generera vid första anropet, ladda från disk sedan"-mönster
+// som EnsureOpenVPNCA nedan — en nyinstallerad brandvägg får alltså ett
+// TLS-certifikat helt automatiskt vid första uppstart, inget manuellt steg.
+func (s *Store) EnsureManagementTLSCert(ips []net.IP, dnsNames []string) (*pki.KeyPair, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadOrCreateKeyPair("management_tls.key.enc", func() (*pki.KeyPair, error) {
+		return pki.GenerateSelfSignedServerCert("security-harbor", ips, dnsNames)
+	})
 }
 
 // EnsureOpenVPNCA returnerar brandväggens OpenVPN-CA (genererar+krypterar ett

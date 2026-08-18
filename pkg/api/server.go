@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -20,6 +21,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
+	"github.com/walker42195/security-harbor-agent/pkg/pki"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
 )
 
@@ -29,14 +31,18 @@ type Server struct {
 	auth     *AuthManager
 	srv      *http.Server
 	netAdapt *network.Adapter
+	tlsCert  *pki.KeyPair
+	webUIDir string
 }
 
-func NewServer(bindAddr string, eng *engine.Engine, auth *AuthManager) *Server {
+func NewServer(bindAddr string, eng *engine.Engine, auth *AuthManager, tlsCert *pki.KeyPair, webUIDir string) *Server {
 	return &Server{
 		bindAddr: bindAddr,
 		engine:   eng,
 		auth:     auth,
 		netAdapt: network.NewAdapter(),
+		tlsCert:  tlsCert,
+		webUIDir: webUIDir,
 	}
 }
 
@@ -82,6 +88,15 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/auth/users/delete", s.authMiddlewareAdmin(s.handleDeleteUser))
 	mux.HandleFunc("/api/v1/auth/users/reset-password", s.authMiddlewareAdmin(s.handleResetUserPassword))
 
+	// Web-UI (Fas 8+) — statiska filer (flutter build web), t.ex. driftsatta
+	// via rsync till --webui-dir. Registreras SIST men ServeMux matchar
+	// alltid det mest specifika mönstret oavsett ordning, så /api/v1/*
+	// påverkas inte. Om katalogen saknas/är tom svarar "/" bara 404 — bryter
+	// inget om web-UI:t inte är driftsatt.
+	mux.Handle("/", http.FileServer(http.Dir(s.webUIDir)))
+
+	// wanBlockMiddleware omsluter HELA mux:en, så web-UI:t blockeras på WAN
+	// precis som Management-API:t.
 	handler := s.wanBlockMiddleware(mux)
 
 	s.srv = &http.Server{
@@ -89,6 +104,18 @@ func (s *Server) Start() error {
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
+	}
+
+	if s.tlsCert != nil {
+		cert, err := tls.X509KeyPair([]byte(s.tlsCert.CertPEM), []byte(s.tlsCert.KeyPEM))
+		if err != nil {
+			return fmt.Errorf("misslyckades tolka TLS-certifikat: %w", err)
+		}
+		s.srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		// Tomma sökvägar = använd TLSConfig.Certificates istället för att
+		// läsa cert/nyckel från disk igen (de finns redan bara i minnet,
+		// dekrypterade av Store).
+		return s.srv.ListenAndServeTLS("", "")
 	}
 
 	return s.srv.ListenAndServe()

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -22,7 +23,8 @@ import (
 
 func main() {
 	configDir := flag.String("data-dir", "/var/lib/security-harbor", "Sökväg till datakatalog")
-	bindAddr := flag.String("bind", "10.0.0.163:8443", "IP/Port för Management API")
+	bindAddr := flag.String("bind", "10.0.0.163:8443", "IP/Port för Management API (HTTPS)")
+	webUIDir := flag.String("webui-dir", "/var/lib/security-harbor/webui", "Sökväg till statiska filer för web-UI (flutter build web)")
 	dryRun := flag.Bool("dry-run", false, "Starta i dry-run läge utan att ändra nftables i kärnan")
 	flag.Parse()
 
@@ -62,7 +64,26 @@ func main() {
 		}
 	}
 
-	server := api.NewServer(*bindAddr, eng, auth)
+	// Self-signat TLS-certifikat för Management-API:et — genereras
+	// automatiskt vid FÖRSTA uppstarten på en ny installation (samma
+	// "generera vid behov, ladda från disk sedan"-mönster som OpenVPN-CA:n),
+	// inget manuellt steg krävs. Om LAN-IP:t (bindHost) någon gång ändras
+	// måste certifikatet regenereras manuellt (radera
+	// management_tls.key.enc + starta om agenten).
+	bindHost, _, err := net.SplitHostPort(*bindAddr)
+	if err != nil {
+		log.Fatalf("Ogiltig --bind-adress %q: %v", *bindAddr, err)
+	}
+	tlsIPs := []net.IP{net.ParseIP("127.0.0.1")}
+	if ip := net.ParseIP(bindHost); ip != nil {
+		tlsIPs = append(tlsIPs, ip)
+	}
+	tlsCert, err := st.EnsureManagementTLSCert(tlsIPs, []string{"localhost"})
+	if err != nil {
+		log.Fatalf("Kunde inte skapa/läsa TLS-certifikat för Management-API: %v", err)
+	}
+
+	server := api.NewServer(*bindAddr, eng, auth, tlsCert, *webUIDir)
 
 	// Fas 5: periodisk uppdatering av hot-listor/GeoIP-objekt (Spamhaus,
 	// Tor-exit-noder, anpassade URL:er, landsblock). Körs var 15:e minut;

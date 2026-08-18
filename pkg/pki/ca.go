@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"time"
 )
 
@@ -97,6 +98,48 @@ func IssueCert(caCertPEM, caKeyPEM, commonName string, serverAuth bool) (*KeyPai
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
 	if err != nil {
 		return nil, fmt.Errorf("misslyckades signera certifikat för %q: %w", commonName, err)
+	}
+
+	return &KeyPair{
+		CertPEM: encodeCert(der),
+		KeyPEM:  encodeKey(key),
+		Serial:  serial.String(),
+	}, nil
+}
+
+// GenerateSelfSignedServerCert skapar ett fristående (icke CA-signerat)
+// server-leaf-certifikat med SAN-fält (IP/DNS), avsett för Management-
+// API:ets HTTPS-lyssnare (Fas 8+). En enda LAN-appliance behöver ingen
+// egen CA att signera mot — ett självsignerat leaf-certifikat räcker och
+// ger en kortare (1 länk) kedja, vilket GUI:ts trust-on-first-use-
+// fingeravtrycksjämförelse tjänar på. Utan DNSNames/IPAddresses ignorerar
+// moderna webbläsare/Go:s TLS-klient CommonName helt (sedan Go 1.15) och
+// skulle avvisa certifikatet oavsett tillit.
+func GenerateSelfSignedServerCert(commonName string, ips []net.IP, dnsNames []string) (*KeyPair, error) {
+	key, err := rsa.GenerateKey(rand.Reader, keyBits)
+	if err != nil {
+		return nil, fmt.Errorf("misslyckades generera nyckel: %w", err)
+	}
+
+	serial, err := randomSerial()
+	if err != nil {
+		return nil, err
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: commonName, Organization: []string{"Security Harbor"}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  ips,
+		DNSNames:     dnsNames,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, fmt.Errorf("misslyckades självsignera servercertifikat: %w", err)
 	}
 
 	return &KeyPair{
