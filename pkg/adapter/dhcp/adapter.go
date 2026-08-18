@@ -12,14 +12,24 @@ import (
 )
 
 type Adapter struct {
-	configPath string
+	configPath  string
+	leaseDBPath string
 }
+
+const defaultLeaseDBPath = "/var/lib/kea/kea-leases4.csv"
 
 func NewAdapter(configPath string) *Adapter {
 	if configPath == "" {
 		configPath = "/etc/kea/kea-dhcp4.conf"
 	}
-	return &Adapter{configPath: configPath}
+	return &Adapter{configPath: configPath, leaseDBPath: defaultLeaseDBPath}
+}
+
+// LeaseDatabasePath returnerar sökvägen till Kea:s lease-memfile, som
+// pkg/adapter/dns läser (via ParseLeaseFile) för att registrera
+// DHCP-tilldelade värdnamn i den lokala DNS-zonen.
+func (a *Adapter) LeaseDatabasePath() string {
+	return a.leaseDBPath
 }
 
 type KeaConfig struct {
@@ -37,9 +47,9 @@ type InterfacesConfig struct {
 }
 
 type LeaseDatabase struct {
-	Type     string `json:"type"`
-	Name     string `json:"name"`
-	Persist  bool   `json:"persist"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Persist bool   `json:"persist"`
 }
 
 type Subnet4 struct {
@@ -115,7 +125,7 @@ func (a *Adapter) GenerateKeaConfig(cfg *config.Config) ([]byte, error) {
 			InterfacesConfig: InterfacesConfig{Interfaces: listeningIfaces},
 			LeaseDatabase: LeaseDatabase{
 				Type:    "memfile",
-				Name:    "/var/lib/kea/kea-leases4.csv",
+				Name:    a.leaseDBPath,
 				Persist: true,
 			},
 			Subnet4: subnets,

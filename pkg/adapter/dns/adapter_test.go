@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
@@ -20,7 +21,7 @@ func TestGenerateServerConfigDoT(t *testing.T) {
 		},
 	}
 
-	conf, err := GenerateServerConfig(cfg, "/etc/unbound/unbound.conf.d/blocklist.conf")
+	conf, err := GenerateServerConfig(cfg, "/etc/unbound/unbound.conf.d/blocklist.conf", "")
 	if err != nil {
 		t.Fatalf("GenerateServerConfig misslyckades: %v", err)
 	}
@@ -35,6 +36,82 @@ func TestGenerateServerConfigDoT(t *testing.T) {
 	}
 	if !strings.Contains(conf, "access-control: 10.0.0.0/24 allow") {
 		t.Errorf("förväntade access-control för LAN-nätet, men saknas: %s", conf)
+	}
+}
+
+// TestGenerateServerConfigRecursiveSkipsForwardZone skyddar det nya
+// rekursiva läget: när Recursive är satt ska INGEN forward-zone skrivas
+// alls, även om UpstreamServers råkar vara ifyllda (t.ex. kvarlämnat från
+// ett tidigare läge) — annars slår Unbound av misstag mot upstreams ändå.
+func TestGenerateServerConfigRecursiveSkipsForwardZone(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: []config.Interface{
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, IPv4: "10.0.0.163/24"},
+		},
+		DNS: &config.DNSConfig{
+			Enabled:         true,
+			Recursive:       true,
+			UpstreamServers: []string{"1.1.1.1"},
+		},
+	}
+
+	conf, err := GenerateServerConfig(cfg, "", "")
+	if err != nil {
+		t.Fatalf("GenerateServerConfig misslyckades: %v", err)
+	}
+	if strings.Contains(conf, "forward-zone:") {
+		t.Errorf("förväntade INGEN forward-zone i rekursivt läge, men fick: %s", conf)
+	}
+}
+
+func TestGenerateHostsConfigStaticRecords(t *testing.T) {
+	cfg := &config.Config{
+		DNS: &config.DNSConfig{
+			Enabled:     true,
+			LocalDomain: "lan",
+			StaticRecords: []config.DNSStaticRecord{
+				{Hostname: "server1", IP: "10.0.0.50"},
+			},
+		},
+	}
+
+	conf := GenerateHostsConfig(nil, cfg)
+	if !strings.Contains(conf, `local-data: "server1.lan. IN A 10.0.0.50"`) {
+		t.Errorf("förväntade A-post för server1.lan, men saknas: %s", conf)
+	}
+	if !strings.Contains(conf, `local-data-ptr: "10.0.0.50 server1.lan."`) {
+		t.Errorf("förväntade PTR-post, men saknas: %s", conf)
+	}
+}
+
+// TestGenerateHostsConfigDHCPRegistrationAndStaticOverride verifierar att
+// DHCP-tilldelade värdnamn registreras när DHCPHostnameRegistration är på,
+// och att en manuell StaticRecord för SAMMA värdnamn skrivs efteråt (vinner
+// i Unbound, som använder den senaste local-data-definitionen).
+func TestGenerateHostsConfigDHCPRegistrationAndStaticOverride(t *testing.T) {
+	cfg := &config.Config{
+		DNS: &config.DNSConfig{
+			Enabled:                  true,
+			LocalDomain:              "lan",
+			DHCPHostnameRegistration: true,
+			StaticRecords: []config.DNSStaticRecord{
+				{Hostname: "laptop", IP: "10.0.0.99"},
+			},
+		},
+	}
+	leases := []dhcp.Lease{
+		{IP: "10.0.0.42", Hostname: "laptop"},
+		{IP: "10.0.0.43", Hostname: "phone"},
+	}
+
+	conf := GenerateHostsConfig(leases, cfg)
+	if !strings.Contains(conf, `local-data: "phone.lan. IN A 10.0.0.43"`) {
+		t.Errorf("förväntade DHCP-registrerad post för phone.lan, men saknas: %s", conf)
+	}
+	dhcpIdx := strings.Index(conf, "10.0.0.42")
+	staticIdx := strings.Index(conf, "10.0.0.99")
+	if dhcpIdx == -1 || staticIdx == -1 || staticIdx < dhcpIdx {
+		t.Errorf("förväntade att den manuella posten för laptop.lan (10.0.0.99) skrivs EFTER DHCP-posten (10.0.0.42) så den vinner: %s", conf)
 	}
 }
 
@@ -53,7 +130,7 @@ func TestGenerateServerConfigBindsOnlyLANIPsNotWildcard(t *testing.T) {
 		},
 		DNS: &config.DNSConfig{Enabled: true, UpstreamServers: []string{"1.1.1.1"}},
 	}
-	conf, err := GenerateServerConfig(cfg, "")
+	conf, err := GenerateServerConfig(cfg, "", "")
 	if err != nil {
 		t.Fatalf("GenerateServerConfig misslyckades: %v", err)
 	}
@@ -72,7 +149,7 @@ func TestGenerateServerConfigPlainDNS(t *testing.T) {
 	cfg := &config.Config{
 		DNS: &config.DNSConfig{Enabled: true, UpstreamServers: []string{"9.9.9.9"}, DoTEnabled: false},
 	}
-	conf, err := GenerateServerConfig(cfg, "")
+	conf, err := GenerateServerConfig(cfg, "", "")
 	if err != nil {
 		t.Fatalf("GenerateServerConfig misslyckades: %v", err)
 	}

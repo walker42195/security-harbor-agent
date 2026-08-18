@@ -4,15 +4,15 @@ import "time"
 
 // Config representerar hela brandväggens deklarativa tillstånd.
 type Config struct {
-	Version    int              `json:"version"`    // Konfigurationsversion
-	Revision   int64            `json:"revision"`   // Inkrementeras vid varje commit
-	UpdatedAt  time.Time        `json:"updated_at"` // Tidstämpel för senaste ändring
-	Interfaces []Interface      `json:"interfaces"` // Fysiska nätverkskort & VLANs
-	Zones      []Zone           `json:"zones"`      // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
-	Objects    []Object         `json:"objects"`    // Objekt (Hosts, Subnets, IP-listor, GeoIP)
-	Services   []Service        `json:"services"`   // Tjänster (HTTP, HTTPS, SSH, Custom ports)
-	Policies   []Policy         `json:"policies"`   // Brandväggs- och NAT-regler
-	Settings   Settings         `json:"settings"`   // System- och management-inställningar
+	Version    int              `json:"version"`             // Konfigurationsversion
+	Revision   int64            `json:"revision"`            // Inkrementeras vid varje commit
+	UpdatedAt  time.Time        `json:"updated_at"`          // Tidstämpel för senaste ändring
+	Interfaces []Interface      `json:"interfaces"`          // Fysiska nätverkskort & VLANs
+	Zones      []Zone           `json:"zones"`               // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
+	Objects    []Object         `json:"objects"`             // Objekt (Hosts, Subnets, IP-listor, GeoIP)
+	Services   []Service        `json:"services"`            // Tjänster (HTTP, HTTPS, SSH, Custom ports)
+	Policies   []Policy         `json:"policies"`            // Brandväggs- och NAT-regler
+	Settings   Settings         `json:"settings"`            // System- och management-inställningar
 	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"` // VPN-serverkonfiguration (Fas 3)
 	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`   // VPN-serverkonfiguration (Fas 4)
 	DNS        *DNSConfig       `json:"dns,omitempty"`       // DNS-resolver & domänfiltrering (Fas 6)
@@ -27,8 +27,14 @@ type Config struct {
 type DNSConfig struct {
 	Enabled         bool     `json:"enabled"`
 	UpstreamServers []string `json:"upstream_servers"` // t.ex. ["1.1.1.1", "1.0.0.1"]
-	DoTEnabled      bool     `json:"dot_enabled"`       // DNS-over-TLS mot upstream-servrarna
-	DoTHostname     string   `json:"dot_hostname"`      // TLS-hostnamn för DoT-verifiering, t.ex. "cloudflare-dns.com"
+	DoTEnabled      bool     `json:"dot_enabled"`      // DNS-over-TLS mot upstream-servrarna
+	DoTHostname     string   `json:"dot_hostname"`     // TLS-hostnamn för DoT-verifiering, t.ex. "cloudflare-dns.com"
+
+	// Recursive: om sant görs INGEN forward-zone alls — Unbound slår då
+	// själv mot rot-servrarna (fullständig rekursiv upplösning) istället
+	// för att vidarebefordra till UpstreamServers. UpstreamServers/DoT-
+	// fälten ignoreras i så fall.
+	Recursive bool `json:"recursive"`
 
 	// Blocklists tillåter FLERA samtidigt aktiva domänblocklistor (t.ex.
 	// StevenBlack hosts + en egen anpassad URL parallellt) — se
@@ -37,6 +43,26 @@ type DNSConfig struct {
 
 	CustomBlockedDomains []string `json:"custom_blocked_domains,omitempty"` // Manuellt inmatade, alltid blockerade
 	CustomAllowedDomains []string `json:"custom_allowed_domains,omitempty"` // Undantag från blocklistan (allowlist)
+
+	// StaticRecords är manuellt inmatade DNS-poster (A-poster) i den
+	// lokala zonen, t.ex. en server med fast IP som ska nås via namn.
+	StaticRecords []DNSStaticRecord `json:"static_records,omitempty"`
+
+	// LocalDomain är suffixet DHCP-tilldelade värdnamn registreras under,
+	// t.ex. "lan" ger "skrivare.lan". Töm/"" stänger inte av registrering,
+	// men ger namn utan suffix.
+	LocalDomain string `json:"local_domain,omitempty"`
+
+	// DHCPHostnameRegistration styr om enheter som får en DHCP-lease
+	// (och skickade ett värdnamn i sin DHCP-förfrågan) automatiskt
+	// registreras i den lokala DNS-zonen. Se pkg/adapter/dhcp.ParseLeases.
+	DHCPHostnameRegistration bool `json:"dhcp_hostname_registration"`
+}
+
+// DNSStaticRecord är en manuellt inmatad A-post i den lokala DNS-zonen.
+type DNSStaticRecord struct {
+	Hostname string `json:"hostname"` // t.ex. "server1" eller "server1.lan"
+	IP       string `json:"ip"`
 }
 
 // DNSBlocklistSource beskriver EN automatiskt uppdaterad domänblocklista
@@ -61,12 +87,12 @@ type DNSBlocklistSource struct {
 // Store.EnsureWireGuardServerKeys — den skickas ALDRIG över API:t eller
 // sparas i denna struct). Endast klienternas publika nycklar lagras här.
 type WireGuardConfig struct {
-	Enabled         bool             `json:"enabled"`
-	ListenPort      int              `json:"listen_port"`               // t.ex. 51820
-	Address         string           `json:"address"`                   // Serverns IP i VPN-nätet, t.ex. "10.66.66.1/24"
-	Endpoint        string           `json:"endpoint"`                  // Publik host/IP klienter ansluter mot, t.ex. "vpn.example.se"
-	ServerPublicKey string           `json:"server_public_key,omitempty"` // Fylls i dynamiskt av agenten vid läsning, aldrig skriven av klienten
-	Peers           []WireGuardPeer  `json:"peers"`
+	Enabled         bool            `json:"enabled"`
+	ListenPort      int             `json:"listen_port"`                 // t.ex. 51820
+	Address         string          `json:"address"`                     // Serverns IP i VPN-nätet, t.ex. "10.66.66.1/24"
+	Endpoint        string          `json:"endpoint"`                    // Publik host/IP klienter ansluter mot, t.ex. "vpn.example.se"
+	ServerPublicKey string          `json:"server_public_key,omitempty"` // Fylls i dynamiskt av agenten vid läsning, aldrig skriven av klienten
+	Peers           []WireGuardPeer `json:"peers"`
 }
 
 // WireGuardPeer representerar en tillåten VPN-klient. Endast den publika
@@ -88,10 +114,10 @@ type WireGuardPeer struct {
 // public och skickas till klienter/GUI utan risk.
 type OpenVPNConfig struct {
 	Enabled    bool            `json:"enabled"`
-	ListenPort int             `json:"listen_port"` // t.ex. 1194
-	Protocol   string          `json:"protocol"`     // "udp" eller "tcp"
-	Address    string          `json:"address"`      // VPN-subnät, t.ex. "10.77.77.0/24"
-	Endpoint   string          `json:"endpoint"`      // Publik host/IP klienter ansluter mot
+	ListenPort int             `json:"listen_port"`           // t.ex. 1194
+	Protocol   string          `json:"protocol"`              // "udp" eller "tcp"
+	Address    string          `json:"address"`               // VPN-subnät, t.ex. "10.77.77.0/24"
+	Endpoint   string          `json:"endpoint"`              // Publik host/IP klienter ansluter mot
 	CACertPEM  string          `json:"ca_cert_pem,omitempty"` // Fylls i dynamiskt av agenten, aldrig skriven av klienten
 	Clients    []OpenVPNClient `json:"clients"`
 }
@@ -112,29 +138,29 @@ type OpenVPNClient struct {
 
 // Interface representerar ett nätverksgränssnitt eller VLAN.
 type Interface struct {
-	ID          string      `json:"id"`           // t.ex. "eth0", "eth1", "vlan10"
-	Device      string      `json:"device"`       // Linux device name, t.ex. "eth0", "eth1.10"
-	Parent      string      `json:"parent"`       // För VLAN: föräldra-interface, t.ex. "eth1"
-	VLANID      int         `json:"vlan_id"`      // 0 för fysiska, 1-4094 för VLAN
-	Zone        string      `json:"zone"`         // Kopplad zon: "WAN", "LAN", "SERVERS", etc.
-	Enabled     bool        `json:"enabled"`      // Om gränssnittet är aktivt
-	AddressType string      `json:"address_type"` // "static", "dhcp"
-	IPv4        string      `json:"ipv4"`         // IP/CIDR t.ex. "192.168.10.1/24"
-	Gateway     string      `json:"gateway"`      // Default gateway (främst WAN)
-	DNSServers  []string    `json:"dns_servers"`  // Statiska DNS-servrar för gränssnittet, t.ex. ["1.1.1.1", "8.8.8.8"]
-	MTU         int         `json:"mtu"`          // MTU (standard 1500)
-	DHCP        *DHCPConfig `json:"dhcp,omitempty"`// DHCP Server inställningar för detta interface/VLAN
+	ID          string      `json:"id"`             // t.ex. "eth0", "eth1", "vlan10"
+	Device      string      `json:"device"`         // Linux device name, t.ex. "eth0", "eth1.10"
+	Parent      string      `json:"parent"`         // För VLAN: föräldra-interface, t.ex. "eth1"
+	VLANID      int         `json:"vlan_id"`        // 0 för fysiska, 1-4094 för VLAN
+	Zone        string      `json:"zone"`           // Kopplad zon: "WAN", "LAN", "SERVERS", etc.
+	Enabled     bool        `json:"enabled"`        // Om gränssnittet är aktivt
+	AddressType string      `json:"address_type"`   // "static", "dhcp"
+	IPv4        string      `json:"ipv4"`           // IP/CIDR t.ex. "192.168.10.1/24"
+	Gateway     string      `json:"gateway"`        // Default gateway (främst WAN)
+	DNSServers  []string    `json:"dns_servers"`    // Statiska DNS-servrar för gränssnittet, t.ex. ["1.1.1.1", "8.8.8.8"]
+	MTU         int         `json:"mtu"`            // MTU (standard 1500)
+	DHCP        *DHCPConfig `json:"dhcp,omitempty"` // DHCP Server inställningar för detta interface/VLAN
 }
 
 // DHCPConfig innehåller DHCP-serverkonfiguration för ett gränssnitt/VLAN.
 type DHCPConfig struct {
 	Enabled      bool              `json:"enabled"`
-	RangeStart   string            `json:"range_start"`  // t.ex. "192.168.10.100"
-	RangeEnd     string            `json:"range_end"`    // t.ex. "192.168.10.250"
-	Gateway      string            `json:"gateway"`      // t.ex. "192.168.10.1"
-	DNSServers   []string          `json:"dns_servers"`  // t.ex. ["192.168.10.1", "1.1.1.1"]
+	RangeStart   string            `json:"range_start"`    // t.ex. "192.168.10.100"
+	RangeEnd     string            `json:"range_end"`      // t.ex. "192.168.10.250"
+	Gateway      string            `json:"gateway"`        // t.ex. "192.168.10.1"
+	DNSServers   []string          `json:"dns_servers"`    // t.ex. ["192.168.10.1", "1.1.1.1"]
 	LeaseTimeSec int               `json:"lease_time_sec"` // t.ex. 86400 (24h)
-	Reservations []DHCPReservation `json:"reservations"` // Statiska MAC -> IP reservationer
+	Reservations []DHCPReservation `json:"reservations"`   // Statiska MAC -> IP reservationer
 }
 
 // DHCPReservation representerar en reserverad IP för en viss MAC-adress.
@@ -166,7 +192,7 @@ type Object struct {
 	ID          string        `json:"id"`
 	Name        string        `json:"name"`
 	Type        ObjectType    `json:"type"`
-	Values      []string      `json:"values"`      // IP-adresser, CIDR, eller medlems-IDn vid group
+	Values      []string      `json:"values"` // IP-adresser, CIDR, eller medlems-IDn vid group
 	Description string        `json:"description"`
 	Source      *ObjectSource `json:"source,omitempty"` // Fas 5: gör Values automatiskt uppdaterade från en extern källa
 }
@@ -180,7 +206,7 @@ type ObjectSource struct {
 	Kind         string `json:"kind"`                   // "spamhaus_drop", "spamhaus_edrop", "tor_exit_nodes", "custom_url", "geoip_country"
 	URL          string `json:"url,omitempty"`          // Endast för kind="custom_url"
 	CountryCode  string `json:"country_code,omitempty"` // Endast för kind="geoip_country", ISO 3166-1 alpha-2 (t.ex. "RU")
-	RefreshHours int    `json:"refresh_hours"`           // Hur ofta listan uppdateras, standard 24
+	RefreshHours int    `json:"refresh_hours"`          // Hur ofta listan uppdateras, standard 24
 	LastUpdated  string `json:"last_updated,omitempty"`
 	LastError    string `json:"last_error,omitempty"`
 	EntryCount   int    `json:"entry_count,omitempty"`
@@ -241,8 +267,8 @@ type Policy struct {
 type PolicySchedule struct {
 	Enabled   bool     `json:"enabled"`
 	Days      []string `json:"days,omitempty"` // t.ex. ["Monday","Tuesday","Wednesday","Thursday","Friday"]
-	StartTime string   `json:"start_time"`      // "HH:MM", t.ex. "08:00"
-	EndTime   string   `json:"end_time"`        // "HH:MM", t.ex. "17:00"
+	StartTime string   `json:"start_time"`     // "HH:MM", t.ex. "08:00"
+	EndTime   string   `json:"end_time"`       // "HH:MM", t.ex. "17:00"
 }
 
 // NATConfig innehåller parametrar för Port Forwarding, 1:1 NAT eller SNAT.

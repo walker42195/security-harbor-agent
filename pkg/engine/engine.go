@@ -106,14 +106,31 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 		if err != nil {
 			return fmt.Errorf("dns: kunde inte läsa cachade blocklistor: %w", err)
 		}
-		if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, dryRun); err != nil {
+		if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, e.loadDHCPLeases(cfg), dryRun); err != nil {
 			return fmt.Errorf("dns: %w", err)
 		}
-	} else if err := e.dnsAdapter.ApplyConfig(ctx, cfg, nil, dryRun); err != nil {
+	} else if err := e.dnsAdapter.ApplyConfig(ctx, cfg, nil, nil, dryRun); err != nil {
 		return fmt.Errorf("dns: %w", err)
 	}
 
 	return nil
+}
+
+// loadDHCPLeases läser Kea:s lease-databas för att registrera
+// DHCP-tilldelade värdnamn i den lokala DNS-zonen (se DNSConfig.
+// DHCPHostnameRegistration). Ett fel här (t.ex. filen finns inte än
+// eftersom DHCP-servern precis startats) ska aldrig blockera hela
+// Apply-flödet — loggas bara och behandlas som "inga leases ännu".
+func (e *Engine) loadDHCPLeases(cfg *config.Config) []dhcp.Lease {
+	if cfg.DNS == nil || !cfg.DNS.DHCPHostnameRegistration {
+		return nil
+	}
+	leases, err := dhcp.ParseLeaseFile(e.dhcpAdapter.LeaseDatabasePath())
+	if err != nil {
+		log.Printf("[DNS] Kunde inte läsa DHCP-leases för DNS-registrering: %v", err)
+		return nil
+	}
+	return leases
 }
 
 // ApplyRunningConfigAtBoot laddar den senast committade konfigurationen i
@@ -429,7 +446,7 @@ func (e *Engine) ReapplyDNSOnly(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dns: kunde inte läsa cachade blocklistor: %w", err)
 	}
-	if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, false); err != nil {
+	if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, e.loadDHCPLeases(cfg), false); err != nil {
 		return fmt.Errorf("dns: %w", err)
 	}
 	return nil

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
@@ -40,7 +41,7 @@ func NewAdapter(dir string) *Adapter {
 // Domänerna som ska blockeras skrivs INTE här, utan i en separat include-fil
 // (blocklistPath, se blocklistFilename) för att hålla huvudfilen läsbar och
 // snabb att skriva om vid varje Apply oavsett blocklistans storlek.
-func GenerateServerConfig(cfg *config.Config, blocklistPath string) (string, error) {
+func GenerateServerConfig(cfg *config.Config, blocklistPath string, hostsPath string) (string, error) {
 	if cfg.DNS == nil || !cfg.DNS.Enabled {
 		return "", nil
 	}
@@ -93,6 +94,9 @@ func GenerateServerConfig(cfg *config.Config, blocklistPath string) (string, err
 	if hasAnyBlocklistSource(d) && blocklistPath != "" {
 		fmt.Fprintf(&b, "    include: \"%s\"\n", blocklistPath)
 	}
+	if hostsPath != "" && (d.DHCPHostnameRegistration || len(d.StaticRecords) > 0) {
+		fmt.Fprintf(&b, "    include: \"%s\"\n", hostsPath)
+	}
 	// tls-cert-bundle (server:-klausul-option) måste anges explicit — utan
 	// den har Unbound inga tillförlitliga CA-ankare alls och avvisar VARJE
 	// upstream-certifikat (loggat missvisande som "self-signed certificate
@@ -104,7 +108,10 @@ func GenerateServerConfig(cfg *config.Config, blocklistPath string) (string, err
 	}
 	fmt.Fprintf(&b, "\n")
 
-	if len(d.UpstreamServers) > 0 {
+	// Recursive: Unbound gör full rekursiv upplösning mot rot-servrarna
+	// (dess inbyggda default utan forward-zone) — ingen forward-zone
+	// skrivs alls, UpstreamServers/DoT ignoreras helt.
+	if !d.Recursive && len(d.UpstreamServers) > 0 {
 		fmt.Fprintf(&b, "forward-zone:\n")
 		fmt.Fprintf(&b, "    name: \".\"\n")
 		if d.DoTEnabled {
@@ -170,6 +177,50 @@ func GenerateBlocklistConfig(domains []string, cfg *config.Config) string {
 	return b.String()
 }
 
+const hostsFilename = "hosts.conf"
+
+// GenerateHostsConfig bygger include-filen med `local-data`-A-poster för
+// dels manuellt inmatade StaticRecords, dels (om DHCPHostnameRegistration
+// är på) värdnamn som DHCP-klienter skickat med i sin lease (Fas 6+).
+// StaticRecords skrivs EFTER DHCP-posterna så att en manuell post alltid
+// vinner om samma värdnamn råkar krocka (Unbound använder senaste
+// definitionen för local-data på samma namn).
+func GenerateHostsConfig(leases []dhcp.Lease, cfg *config.Config) string {
+	if cfg.DNS == nil {
+		return ""
+	}
+	d := cfg.DNS
+	suffix := strings.Trim(d.LocalDomain, ".")
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "server:\n")
+
+	writeRecord := func(hostname, ip string) {
+		hostname = strings.ToLower(strings.TrimSpace(hostname))
+		ip = strings.TrimSpace(ip)
+		if hostname == "" || ip == "" {
+			return
+		}
+		fqdn := hostname
+		if suffix != "" && !strings.HasSuffix(hostname, "."+suffix) && hostname != suffix {
+			fqdn = hostname + "." + suffix
+		}
+		fmt.Fprintf(&b, "    local-data: \"%s. IN A %s\"\n", fqdn, ip)
+		fmt.Fprintf(&b, "    local-data-ptr: \"%s %s.\"\n", ip, fqdn)
+	}
+
+	if d.DHCPHostnameRegistration {
+		for _, l := range leases {
+			writeRecord(l.Hostname, l.IP)
+		}
+	}
+	for _, rec := range d.StaticRecords {
+		writeRecord(rec.Hostname, rec.IP)
+	}
+
+	return b.String()
+}
+
 func normalizeDomain(d string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
 }
@@ -192,8 +243,9 @@ func hasAnyBlocklistSource(d *config.DNSConfig) bool {
 // ApplyConfig skriver unbound.conf.d/*.conf och startar/stoppar/
 // restartar unbound.service. domains är den cachade domänblocklistan (från
 // pkg/threatfeed, hämtad separat — se Engine.applyBackends), inte något
-// som lagras i config.Config.
-func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, domains []string, dryRun bool) error {
+// som lagras i config.Config. leases är de just nu aktiva DHCP-utlåningarna
+// (från pkg/adapter/dhcp.ParseLeaseFile), använda för DHCPHostnameRegistration.
+func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, domains []string, leases []dhcp.Lease, dryRun bool) error {
 	unit := "unbound.service"
 
 	if cfg.DNS == nil || !cfg.DNS.Enabled {
@@ -205,7 +257,8 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, domains [
 	}
 
 	blocklistPath := filepath.Join(a.dir, blocklistFilename)
-	serverConf, err := GenerateServerConfig(cfg, blocklistPath)
+	hostsPath := filepath.Join(a.dir, hostsFilename)
+	serverConf, err := GenerateServerConfig(cfg, blocklistPath, hostsPath)
 	if err != nil {
 		return fmt.Errorf("misslyckades generera Unbound-konfiguration: %w", err)
 	}
@@ -224,6 +277,12 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, domains [
 		blocklistConf := GenerateBlocklistConfig(domains, cfg)
 		if err := os.WriteFile(filepath.Join(a.dir, blocklistFilename), []byte(blocklistConf), 0644); err != nil {
 			return fmt.Errorf("misslyckades skriva %s: %w", blocklistFilename, err)
+		}
+	}
+	if cfg.DNS.DHCPHostnameRegistration || len(cfg.DNS.StaticRecords) > 0 {
+		hostsConf := GenerateHostsConfig(leases, cfg)
+		if err := os.WriteFile(hostsPath, []byte(hostsConf), 0644); err != nil {
+			return fmt.Errorf("misslyckades skriva %s: %w", hostsFilename, err)
 		}
 	}
 

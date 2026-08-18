@@ -66,6 +66,7 @@ func (s *Server) Start() error {
 	// hemligheter.
 	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddlewareAdmin(s.handlePing))
 	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddlewareAdmin(s.handleTraceroute))
+	mux.HandleFunc("/api/v1/diagnostics/nmap", s.authMiddlewareAdmin(s.handleNmap))
 	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddlewareAdmin(s.handleWireGuardGeneratePeerKeys))
 	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddlewareAdmin(s.handleOpenVPNGenerateClient))
 	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddlewareAdmin(s.handleRefreshObjectSource))
@@ -486,6 +487,62 @@ func (s *Server) handleTraceroute(w http.ResponseWriter, r *http.Request) {
 	out, _ := exec.Command("traceroute", "-n", "-w", "1", "-m", "15", req.Host).CombinedOutput()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
+}
+
+// handleNmap kör nmap mot ett angivet mål med valfri kombination av
+// skanningstyper (kryssrutor i GUI:t). Endast admin, eftersom en portscan
+// kan generera avsevärd trafik och bör vara en medveten handling — se
+// авsnitt 5.2 i genomförandeplanen där samma nmap-kommandon redan körs
+// manuellt från master-harbor-desktop.
+func (s *Server) handleNmap(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Host     string `json:"host"`
+		SYNScan  bool   `json:"syn_scan"`  // -sS
+		FullTCP  bool   `json:"full_tcp"`  // -p- -sV
+		UDPScan  bool   `json:"udp_scan"`  // -sU
+		OSDetect bool   `json:"os_detect"` // -O
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Host == "" {
+		http.Error(w, "Host saknas", http.StatusBadRequest)
+		return
+	}
+	// nmap-argument skickas ALDRIG via ett skal (exec.Command anropar
+	// execve direkt) så klassisk shell-injektion är inte möjlig — men ett
+	// host-värde som börjar med "-" skulle annars tolkas som en egen
+	// nmap-flagga. Avvisa det explicit.
+	if strings.HasPrefix(req.Host, "-") {
+		http.Error(w, "Ogiltigt värde för host", http.StatusBadRequest)
+		return
+	}
+	if !req.SYNScan && !req.FullTCP && !req.UDPScan && !req.OSDetect {
+		http.Error(w, "Minst en skanningstyp måste väljas", http.StatusBadRequest)
+		return
+	}
+
+	args := []string{"-n"}
+	if req.SYNScan {
+		args = append(args, "-sS")
+	}
+	if req.FullTCP {
+		args = append(args, "-p-", "-sV")
+	}
+	if req.UDPScan {
+		args = append(args, "-sU")
+	}
+	if req.OSDetect {
+		args = append(args, "-O")
+	}
+	args = append(args, req.Host)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "nmap", args...).CombinedOutput()
+	result := string(out)
+	if err != nil && result == "" {
+		result = fmt.Sprintf("nmap misslyckades: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"output": result})
 }
 
 // handleWireGuardServerInfo returnerar brandväggens publika WireGuard-nyckel
