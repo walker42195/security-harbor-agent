@@ -254,6 +254,188 @@ func TestRenderJSONPolicyObjectMatching(t *testing.T) {
 	})
 }
 
+// TestRenderJSONPolicySchedule verifierar att en tidsstyrd policy (Fas 7)
+// genererar `meta day`/`meta hour`-matchningar, med samma JSON-form som
+// verifierades manuellt mot skarp `nft -c -j` 2026-08-18 (meta day kräver
+// en mängd av veckodagsnamn, inte en bar array/bitmask).
+// TestRenderJSONDNSAllowOnLAN verifierar att DNS (UDP+TCP 53) tillåts till
+// brandväggen själv från LAN när DNS.Enabled är satt (Fas 6), och att den
+// INTE finns med när DNS är avstängt.
+func TestRenderJSONDNSAllowOnLAN(t *testing.T) {
+	adapter := NewAdapter()
+	baseCfg := func(dnsEnabled bool) *config.Config {
+		var d *config.DNSConfig
+		if dnsEnabled {
+			d = &config.DNSConfig{Enabled: true, UpstreamServers: []string{"1.1.1.1"}}
+		}
+		return &config.Config{
+			Version: 1,
+			Interfaces: []config.Interface{
+				{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+				{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+			},
+			DNS:      d,
+			Settings: config.Settings{APIPort: 8443},
+		}
+	}
+
+	data, err := adapter.RenderJSON(baseCfg(true))
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	if !strings.Contains(string(data), "Allow DNS (UDP 53) on LAN ens19") || !strings.Contains(string(data), "Allow DNS (TCP 53) on LAN ens19") {
+		t.Errorf("förväntade DNS-allow-regler för både UDP och TCP på LAN, men saknas: %s", string(data))
+	}
+
+	data2, err := adapter.RenderJSON(baseCfg(false))
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	if strings.Contains(string(data2), "Allow DNS") {
+		t.Errorf("DNS-allow-regler ska inte finnas när DNS.Enabled är false: %s", string(data2))
+	}
+}
+
+func TestRenderJSONPolicySchedule(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-schedule", Name: "Office Hours Only", Enabled: true,
+				SourceObj: "ANY", DestObj: "ANY", Service: "ANY", Action: config.ActionAccept,
+				Schedule: &config.PolicySchedule{Enabled: true, Days: []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"}, StartTime: "08:00", EndTime: "17:00"},
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `"key": "day"`) || !strings.Contains(s, `"Monday"`) {
+		t.Errorf("förväntade en meta-day-matchning med veckodagar, men saknas: %s", s)
+	}
+	if !strings.Contains(s, `"key": "hour"`) || !strings.Contains(s, `"08:00"`) || !strings.Contains(s, `"17:00"`) {
+		t.Errorf("förväntade en meta-hour-range-matchning, men saknas: %s", s)
+	}
+}
+
+// TestRenderJSONServiceGroupExpandsToMultipleRules verifierar att en
+// Policy vars Service pekar på en Service Group (Fas 7) genererar EN
+// regel PER medlem (nftables kan inte uttrycka "ELLER" mellan orelaterade
+// match-satser i en enda regel).
+func TestRenderJSONServiceGroupExpandsToMultipleRules(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Services: []config.Service{
+			{ID: "svc-http", Name: "HTTP", Protocol: "tcp", Ports: []string{"80"}},
+			{ID: "svc-https", Name: "HTTPS", Protocol: "tcp", Ports: []string{"443"}},
+			{ID: "svc-web", Name: "Web", Protocol: "group", Members: []string{"svc-http", "svc-https"}},
+		},
+		Policies: []config.Policy{
+			{ID: "pol-web", Name: "Allow Web", Enabled: true, SourceObj: "ANY", DestObj: "ANY", Service: "svc-web", Action: config.ActionAccept},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var root JSONRoot
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("Ogiltig JSON: %v", err)
+	}
+
+	found80, found443 := false, false
+	for _, el := range root.Nftables {
+		if el.Rule == nil || el.Rule.Chain != "forward" || el.Rule.Comment != "Allow Web (svc-web)" {
+			continue
+		}
+		s, _ := json.Marshal(el.Rule.Expr)
+		if strings.Contains(string(s), "80") {
+			found80 = true
+		}
+		if strings.Contains(string(s), "443") {
+			found443 = true
+		}
+	}
+	if !found80 || !found443 {
+		t.Errorf("förväntade separata regler för både port 80 och 443 (gruppens medlemmar), fick found80=%v found443=%v", found80, found443)
+	}
+}
+
+// TestRenderJSONSNATOverrideBeforeMasquerade verifierar att en Fas 7
+// SNAT-override-policy renderas FÖRE den generella masquerade-regeln i
+// postrouting-kedjan — nftables nat-kedjor applicerar bara EN nat-åtgärd
+// per anslutning (första matchande regeln), så ordningen är avgörande.
+func TestRenderJSONSNATOverrideBeforeMasquerade(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Objects: []config.Object{
+			{ID: "obj-server", Name: "Special Server", Type: config.ObjectTypeHost, Values: []string{"192.168.10.50/32"}},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-snat", Name: "Custom Egress IP", Enabled: true, Action: config.ActionSNAT,
+				SourceObj: "obj-server", DestObj: "ANY",
+				NAT: &config.NATConfig{ExternalIP: "203.0.113.9"},
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var root JSONRoot
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("Ogiltig JSON: %v", err)
+	}
+
+	snatIdx, masqIdx := -1, -1
+	for i, el := range root.Nftables {
+		if el.Rule == nil || el.Rule.Chain != "postrouting" {
+			continue
+		}
+		if strings.Contains(el.Rule.Comment, "SNAT override") {
+			snatIdx = i
+		}
+		if strings.Contains(el.Rule.Comment, "Masquerade") {
+			masqIdx = i
+		}
+	}
+	if snatIdx == -1 {
+		t.Fatalf("hittade ingen SNAT-override-regel i postrouting")
+	}
+	if masqIdx == -1 {
+		t.Fatalf("hittade ingen masquerade-regel i postrouting")
+	}
+	if snatIdx > masqIdx {
+		t.Errorf("SNAT-override måste komma FÖRE masquerade-regeln (index %d > %d), annars vinner masquerade alltid", snatIdx, masqIdx)
+	}
+}
+
 func TestRenderJSONOpenVPNWANAllow(t *testing.T) {
 	adapter := NewAdapter()
 

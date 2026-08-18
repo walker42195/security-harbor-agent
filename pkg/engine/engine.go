@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
@@ -31,18 +32,20 @@ type Engine struct {
 	dhcpAdapter    *dhcp.Adapter
 	wgAdapter      *wireguard.Adapter
 	ovpnAdapter    *openvpn.Adapter
+	dnsAdapter     *dns.Adapter
 	state          State
 	confirmTimer   *time.Timer
 	unconfirmedCfg *config.Config
 }
 
-func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter) *Engine {
+func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter) *Engine {
 	return &Engine{
 		store:       st,
 		nftAdapter:  nftAdapter,
 		dhcpAdapter: dhcpAdapter,
 		wgAdapter:   wgAdapter,
 		ovpnAdapter: ovpnAdapter,
+		dnsAdapter:  dnsAdapter,
 		state:       StateIdle,
 	}
 }
@@ -96,6 +99,18 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 		}
 	} else if err := e.ovpnAdapter.ApplyConfig(ctx, cfg, "", "", "", "", dryRun); err != nil {
 		return fmt.Errorf("openvpn: %w", err)
+	}
+
+	if cfg.DNS != nil && cfg.DNS.Enabled {
+		domains, err := e.store.LoadDNSBlocklistDomains()
+		if err != nil {
+			return fmt.Errorf("dns: kunde inte läsa cachad blocklista: %w", err)
+		}
+		if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, dryRun); err != nil {
+			return fmt.Errorf("dns: %w", err)
+		}
+	} else if err := e.dnsAdapter.ApplyConfig(ctx, cfg, nil, dryRun); err != nil {
+		return fmt.Errorf("dns: %w", err)
 	}
 
 	return nil
@@ -315,6 +330,87 @@ func (e *Engine) RefreshDueObjectSources(ctx context.Context) int {
 		refreshed++
 	}
 	return refreshed
+}
+
+// RefreshDNSBlocklist hämtar om DNS-domänblocklistan (Fas 6) via
+// pkg/threatfeed, cachar den till disk (Store.SaveDNSBlocklistDomains —
+// ALDRIG i running/candidate.json, se den funktionens kommentar) och
+// applicerar om Unbound (ReapplyDNSOnly) så att ändringen slår igenom
+// direkt. Söker candidate FÖRE running av samma anledning som
+// RefreshObjectSource (Fas 5) — en nyss aktiverad blocklista ska kunna
+// förhandsvisas innan den är applicerad.
+func (e *Engine) RefreshDNSBlocklist(ctx context.Context) error {
+	var d *config.DNSConfig
+	for _, cfg := range []*config.Config{e.store.GetCandidateConfig(), e.store.GetRunningConfig()} {
+		if cfg != nil && cfg.DNS != nil {
+			d = cfg.DNS
+			break
+		}
+	}
+	if d == nil || !d.BlocklistEnabled {
+		return fmt.Errorf("DNS-blocklista är inte aktiverad")
+	}
+
+	domains, fetchErr := threatfeed.FetchDomains(d.BlocklistKind, d.BlocklistURL)
+	if fetchErr == nil {
+		if err := e.store.SaveDNSBlocklistDomains(domains); err != nil {
+			return err
+		}
+	}
+	if err := e.store.UpdateDNSBlocklistStatus(len(domains), fetchErr); err != nil {
+		return err
+	}
+	if fetchErr != nil {
+		return fetchErr
+	}
+	return e.ReapplyDNSOnly(ctx)
+}
+
+// RefreshDNSBlocklistIfDue anropar RefreshDNSBlocklist bara om
+// BlocklistRefreshHours har passerat sedan BlocklistLastUpdated (eller om
+// den aldrig hämtats än). Kallas periodiskt från main.go, samma mönster
+// som RefreshDueObjectSources.
+func (e *Engine) RefreshDNSBlocklistIfDue(ctx context.Context) bool {
+	cfg := e.store.GetRunningConfig()
+	if cfg == nil || cfg.DNS == nil || !cfg.DNS.BlocklistEnabled {
+		return false
+	}
+	hours := cfg.DNS.BlocklistRefreshHours
+	if hours <= 0 {
+		hours = 24
+	}
+	due := true
+	if cfg.DNS.BlocklistLastUpdated != "" {
+		if t, err := time.Parse(time.RFC3339, cfg.DNS.BlocklistLastUpdated); err == nil {
+			due = time.Since(t) >= time.Duration(hours)*time.Hour
+		}
+	}
+	if !due {
+		return false
+	}
+	if err := e.RefreshDNSBlocklist(ctx); err != nil {
+		log.Printf("[THREATFEED] misslyckades uppdatera DNS-blocklistan (%s): %v", cfg.DNS.BlocklistKind, err)
+		return false
+	}
+	return true
+}
+
+// ReapplyDNSOnly appliceras efter en bakgrundsuppdatering av DNS-
+// blocklistan — medvetet begränsat till DNS-adaptern (inte hela
+// applyBackends) av samma anledning som ReapplyNftablesOnly.
+func (e *Engine) ReapplyDNSOnly(ctx context.Context) error {
+	cfg := e.store.GetRunningConfig()
+	if cfg.DNS == nil || !cfg.DNS.Enabled {
+		return nil
+	}
+	domains, err := e.store.LoadDNSBlocklistDomains()
+	if err != nil {
+		return fmt.Errorf("dns: kunde inte läsa cachad blocklista: %w", err)
+	}
+	if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, false); err != nil {
+		return fmt.Errorf("dns: %w", err)
+	}
+	return nil
 }
 
 // ReapplyNftablesOnly appliceras efter en bakgrundsuppdatering av en

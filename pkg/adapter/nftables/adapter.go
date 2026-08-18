@@ -72,6 +72,87 @@ func serviceMatchExpr(service string) []interface{} {
 	return nil
 }
 
+// scheduleMatchExpr bygger ett nftables match-uttryck som begränsar en
+// policy till ett givet veckodags-/klockslagsintervall (Fas 7 — Schema/
+// tidsbaserade regler). Verifierat mot skarp `nft -c -j` 2026-08-18:
+// `meta day` kräver en mängd ("set") av engelska veckodagsnamn (inte en
+// bitmask/array), och `meta hour` matchas med en "range" av "HH:MM"-
+// strängar. Returnerar nil om schemat är ospecificerat/inaktiverat
+// (policyn gäller då alltid, som tidigare).
+func scheduleMatchExpr(sched *config.PolicySchedule) []interface{} {
+	if sched == nil || !sched.Enabled {
+		return nil
+	}
+	var expr []interface{}
+	if len(sched.Days) > 0 {
+		expr = append(expr, map[string]interface{}{
+			"match": map[string]interface{}{
+				"op":    "==",
+				"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "day"}},
+				"right": map[string]interface{}{"set": sched.Days},
+			},
+		})
+	}
+	if sched.StartTime != "" && sched.EndTime != "" {
+		expr = append(expr, map[string]interface{}{
+			"match": map[string]interface{}{
+				"op":    "==",
+				"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "hour"}},
+				"right": map[string]interface{}{"range": []string{sched.StartTime, sched.EndTime}},
+			},
+		})
+	}
+	return expr
+}
+
+// resolveServiceMatchExprSets slår upp en Policy.Service-referens och
+// returnerar en eller flera möjliga match-uttryckslistor (Fas 7 — Service
+// Groups). Flera set uppstår bara för en Service med Protocol=="group":
+// eftersom nftables inte har ett direkt sätt att uttrycka "ELLER" mellan
+// obesläktade match-satser i en och samma regel, genererar anroparen
+// istället EN regel per set (alla med samma action/kommentar) — samma
+// mönster som redan används för IP-objekt (se objectMatchExpr).
+// visited förhindrar en oändlig loop om grupper råkar peka på varandra.
+func resolveServiceMatchExprSets(cfg *config.Config, serviceRef string, visited map[string]bool) [][]interface{} {
+	trimmed := strings.TrimSpace(serviceRef)
+	if trimmed == "" || strings.EqualFold(trimmed, "ANY") {
+		return [][]interface{}{nil}
+	}
+	if visited[trimmed] {
+		return nil
+	}
+	visited[trimmed] = true
+
+	for _, svc := range cfg.Services {
+		if svc.ID != trimmed {
+			continue
+		}
+		if svc.Protocol == "group" {
+			var sets [][]interface{}
+			for _, memberID := range svc.Members {
+				sets = append(sets, resolveServiceMatchExprSets(cfg, memberID, visited)...)
+			}
+			return sets
+		}
+		if len(svc.Ports) == 0 {
+			return [][]interface{}{serviceMatchExpr(svc.Protocol)}
+		}
+		var sets [][]interface{}
+		for _, port := range svc.Ports {
+			ref := port
+			if svc.Protocol != "" && !strings.EqualFold(svc.Protocol, "any") {
+				ref = strings.ToUpper(svc.Protocol) + ":" + port
+			}
+			sets = append(sets, serviceMatchExpr(ref))
+		}
+		return sets
+	}
+
+	// Inget Service-ID matchade -> tolka som en preset-sträng direkt
+	// (bakåtkompatibelt med hur GUI:t sparade Policy.Service innan Fas 7).
+	return [][]interface{}{serviceMatchExpr(trimmed)}
+}
+
 // resolveObjectCIDRs slår upp ett Object-ID mot cfg.Objects och returnerar
 // dess konkreta IP/CIDR-lista. "group"-objekt kan innehålla andra objekt-ID:n
 // i Values (se kommentaren på config.Object) och löses upp en nivå rekursivt
@@ -345,24 +426,28 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			continue
 		}
 		for _, lanDev := range lanDevices {
-			rule := &Rule{
-				Family:  a.family,
-				Table:   a.tableName,
-				Chain:   "input",
-				Comment: fmt.Sprintf("%s on LAN %s", pol.Name, lanDev),
-				Expr: []interface{}{
-					map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
-							"right": lanDev,
+			for _, svcExpr := range resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{}) {
+				rule := &Rule{
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "input",
+					Comment: fmt.Sprintf("%s on LAN %s", pol.Name, lanDev),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": lanDev,
+							},
 						},
 					},
-				},
+				}
+				rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
+				rule.Expr = append(rule.Expr, svcExpr...)
+				rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
+				rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
+				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			}
-			rule.Expr = append(rule.Expr, serviceMatchExpr(pol.Service)...)
-			rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
-			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 		}
 	}
 
@@ -396,6 +481,43 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				},
 			},
 		})
+	}
+
+	// Input 4b: Tillåt DNS (UDP+TCP 53) till brandväggen själv från LAN/VLAN
+	// när den lokala resolvern är aktiverad (Fas 6). Precis som Management
+	// API ovan är detta INTE en konfigurerbar policy — den följer bara
+	// DNS.Enabled automatiskt, samma mönster som WAN-allow-reglerna för
+	// WireGuard/OpenVPN (Fas 3/4) följer sina respektive Enabled-flaggor.
+	if cfg.DNS != nil && cfg.DNS.Enabled {
+		for _, lanDev := range lanDevices {
+			for _, proto := range []string{"udp", "tcp"} {
+				root.Nftables = append(root.Nftables, NFTElement{
+					Rule: &Rule{
+						Family:  a.family,
+						Table:   a.tableName,
+						Chain:   "input",
+						Comment: fmt.Sprintf("Allow DNS (%s 53) on LAN %s", strings.ToUpper(proto), lanDev),
+						Expr: []interface{}{
+							map[string]interface{}{
+								"match": map[string]interface{}{
+									"op":    "==",
+									"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+									"right": lanDev,
+								},
+							},
+							map[string]interface{}{
+								"match": map[string]interface{}{
+									"op":    "==",
+									"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
+									"right": 53,
+								},
+							},
+							map[string]interface{}{"accept": nil},
+						},
+					},
+				})
+			}
+		}
 	}
 
 	// Input 5: Logga och neka allt annat inkommande (synliggör blockerad
@@ -480,24 +602,28 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			continue
 		}
 
-		rule := &Rule{
-			Family:  a.family,
-			Table:   a.tableName,
-			Chain:   "forward",
-			Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
-		}
+		for _, svcExpr := range resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{}) {
+			rule := &Rule{
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "forward",
+				Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
+			}
 
-		rule.Expr = append(rule.Expr, srcExpr...)
-		rule.Expr = append(rule.Expr, dstExpr...)
-		rule.Expr = append(rule.Expr, serviceMatchExpr(pol.Service)...)
+			rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
+			rule.Expr = append(rule.Expr, srcExpr...)
+			rule.Expr = append(rule.Expr, dstExpr...)
+			rule.Expr = append(rule.Expr, svcExpr...)
+			rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
 
-		if pol.Action == config.ActionAccept {
-			rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
-			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
-		} else if pol.Action == config.ActionDrop {
-			rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD: "}})
-			rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
-			root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
+			if pol.Action == config.ActionAccept {
+				rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
+				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
+			} else if pol.Action == config.ActionDrop {
+				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD: "}})
+				rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
+				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
+			}
 		}
 	}
 
@@ -517,38 +643,79 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
-	// 4. NAT PREROUTING CHAIN (Port Forwarding / DNAT)
+	// 4. NAT PREROUTING CHAIN (Port Forwarding / DNAT, samt 1:1 NAT — Fas 7)
 	for _, pol := range cfg.Policies {
 		if pol.Enabled && pol.Action == config.ActionDNAT && pol.NAT != nil {
 			proto := "tcp"
 			if pol.NAT.Protocol != "" {
 				proto = pol.NAT.Protocol
 			}
+			expr := []interface{}{}
+			// 1:1 NAT (statisk NAT, Fas 7): om NAT.ExternalIP är satt gäller
+			// vidarebefordringen bara den specifika WAN-IP:n, inte alla
+			// IP:er på WAN-interfacet.
+			if pol.NAT.ExternalIP != "" {
+				expr = append(expr, map[string]interface{}{
+					"match": map[string]interface{}{
+						"op":    "==",
+						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+						"right": pol.NAT.ExternalIP,
+					},
+				})
+			}
+			expr = append(expr,
+				map[string]interface{}{
+					"match": map[string]interface{}{
+						"op":    "==",
+						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
+						"right": pol.NAT.ExternalPort,
+					},
+				},
+				map[string]interface{}{
+					"dnat": map[string]interface{}{
+						"family": "ip",
+						"addr":   pol.NAT.InternalIP,
+						"port":   pol.NAT.InternalPort,
+					},
+				},
+			)
 			root.Nftables = append(root.Nftables, NFTElement{
 				Rule: &Rule{
-					Family: a.family,
-					Table:  a.tableName,
-					Chain:  "prerouting",
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "prerouting",
 					Comment: fmt.Sprintf("Port Forwarding (DNAT): %s", pol.Name),
-					Expr: []interface{}{
-						map[string]interface{}{
-							"match": map[string]interface{}{
-								"op": "==",
-								"left": map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
-								"right": pol.NAT.ExternalPort,
-							},
-						},
-						map[string]interface{}{
-							"dnat": map[string]interface{}{
-								"family": "ip",
-								"addr":   pol.NAT.InternalIP,
-								"port":   pol.NAT.InternalPort,
-							},
-						},
-					},
+					Expr:    expr,
 				},
 			})
 		}
+	}
+
+	// 4b. NAT POSTROUTING: SNAT-overrides (Fas 7 — Avancerad NAT). Måste
+	// ligga FÖRE den generella masquerade-loopen nedan: nftables nat-
+	// kedjor applicerar bara EN nat-åtgärd per anslutning, så den första
+	// matchande regeln (i regelordning) avgör — en specifik SNAT-override
+	// måste alltså komma före den generella masquerade-regeln för att
+	// någonsin få effekt.
+	for _, pol := range cfg.Policies {
+		if !pol.Enabled || pol.Action != config.ActionSNAT || pol.NAT == nil || pol.NAT.ExternalIP == "" {
+			continue
+		}
+		srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+		if !srcIsAny && srcExpr == nil {
+			continue
+		}
+		expr := append([]interface{}{}, srcExpr...)
+		expr = append(expr, map[string]interface{}{"snat": map[string]interface{}{"addr": pol.NAT.ExternalIP}})
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "postrouting",
+				Comment: fmt.Sprintf("SNAT override: %s", pol.Name),
+				Expr:    expr,
+			},
+		})
 	}
 
 	// 5. NAT POSTROUTING CHAIN (Outbound Masquerade för alla interna nät mot WAN)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
@@ -44,7 +45,8 @@ func main() {
 	dhcpAdapter := dhcp.NewAdapter("")
 	wgAdapter := wireguard.NewAdapter("")
 	ovpnAdapter := openvpn.NewAdapter("")
-	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter)
+	dnsAdapter := dns.NewAdapter("")
+	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter)
 	auth := api.NewAuthManager()
 
 	// Applicera initial konfiguration vid start (om ej dry-run)
@@ -78,6 +80,9 @@ func main() {
 				defer cancel()
 				if n := eng.RefreshDueObjectSources(ctx); n > 0 {
 					fmt.Printf("[THREATFEED] Uppdaterade %d hot-lista/GeoIP-objekt\n", n)
+				}
+				if eng.RefreshDNSBlocklistIfDue(ctx) {
+					fmt.Println("[THREATFEED] Uppdaterade DNS-domänblocklistan")
 				}
 			}
 			refresh()

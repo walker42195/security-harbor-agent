@@ -19,6 +19,10 @@ const (
 	KindTorExitNodes  = "tor_exit_nodes"
 	KindCustomURL     = "custom_url"
 	KindGeoIPCountry  = "geoip_country"
+
+	// DNS-domänblocklistor (Fas 6)
+	KindStevenBlackHosts = "stevenblack_hosts"
+	KindCustomDomainURL  = "custom_domain_url"
 )
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -47,6 +51,69 @@ func Fetch(kind, url, countryCode string) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("okänd hot-listekälla: %q", kind)
 	}
+}
+
+// FetchDomains hämtar och tolkar en DNS-domänblocklista (Fas 6) till en
+// lista av domännamn (utan protokoll/sökväg). Separat funktion från Fetch
+// eftersom källformaten skiljer sig helt (hosts-fil-format kontra CIDR-
+// listor) och det inte finns någon anledning att blanda IP- och domän-
+// blocklistor i samma typ.
+func FetchDomains(kind, url string) ([]string, error) {
+	switch kind {
+	case KindStevenBlackHosts:
+		return fetchLines("https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", parseHostsFileDomains)
+	case KindCustomDomainURL:
+		if url == "" {
+			return nil, fmt.Errorf("custom_domain_url kräver en URL")
+		}
+		return fetchLines(url, parseGenericDomainList)
+	default:
+		return nil, fmt.Errorf("okänd domän-blocklistekälla: %q", kind)
+	}
+}
+
+// parseHostsFileDomains tolkar det klassiska "hosts"-filformatet
+// ("0.0.0.0 exempel.se" eller "127.0.0.1 exempel.se") och drar ut bara
+// domännamnet. Hoppar över loopback-poster (localhost m.fl.) som ingår i
+// de flesta publicerade hosts-blocklistor av tekniska skäl men inte ska
+// tolkas som blockerade domäner.
+func parseHostsFileDomains(scanner *bufio.Scanner) []string {
+	skip := map[string]bool{
+		"localhost": true, "localhost.localdomain": true, "local": true,
+		"broadcasthost": true, "ip6-localhost": true, "ip6-loopback": true,
+		"ip6-localnet": true, "ip6-mcastprefix": true, "ip6-allnodes": true,
+		"ip6-allrouters": true, "ip6-allhosts": true,
+	}
+	var out []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		domain := strings.ToLower(fields[1])
+		if skip[domain] || !strings.Contains(domain, ".") {
+			continue
+		}
+		out = append(out, domain)
+	}
+	return out
+}
+
+// parseGenericDomainList tolkar en enkel textfil med en domän per rad.
+func parseGenericDomainList(scanner *bufio.Scanner) []string {
+	var out []string
+	for scanner.Scan() {
+		line := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 func fetchLines(url string, parse func(*bufio.Scanner) []string) ([]string, error) {

@@ -15,6 +15,31 @@ type Config struct {
 	Settings   Settings         `json:"settings"`   // System- och management-inställningar
 	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"` // VPN-serverkonfiguration (Fas 3)
 	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`   // VPN-serverkonfiguration (Fas 4)
+	DNS        *DNSConfig       `json:"dns,omitempty"`       // DNS-resolver & domänfiltrering (Fas 6)
+}
+
+// DNSConfig styr brandväggens lokala DNS-resolver (Fas 6). Den faktiska
+// blocklistan med domäner lagras ALDRIG i denna struct/JSON-configen (en
+// domänblocklista kan innehålla hundratusentals poster) — bara käll-
+// metadata. Agenten (pkg/threatfeed) cachar den nedladdade domänlistan
+// till en egen fil på disk (se pkg/adapter/dns), som Unbound sedan
+// inkluderar direkt.
+type DNSConfig struct {
+	Enabled         bool     `json:"enabled"`
+	UpstreamServers []string `json:"upstream_servers"` // t.ex. ["1.1.1.1", "1.0.0.1"]
+	DoTEnabled      bool     `json:"dot_enabled"`       // DNS-over-TLS mot upstream-servrarna
+	DoTHostname     string   `json:"dot_hostname"`      // TLS-hostnamn för DoT-verifiering, t.ex. "cloudflare-dns.com"
+
+	BlocklistEnabled      bool   `json:"blocklist_enabled"`
+	BlocklistKind         string `json:"blocklist_kind"`          // "stevenblack_hosts", "custom_url"
+	BlocklistURL          string `json:"blocklist_url,omitempty"` // Endast för kind="custom_url"
+	BlocklistRefreshHours int    `json:"blocklist_refresh_hours"`
+	BlocklistLastUpdated  string `json:"blocklist_last_updated,omitempty"`
+	BlocklistLastError    string `json:"blocklist_last_error,omitempty"`
+	BlocklistEntryCount   int    `json:"blocklist_entry_count,omitempty"`
+
+	CustomBlockedDomains []string `json:"custom_blocked_domains,omitempty"` // Manuellt inmatade, alltid blockerade
+	CustomAllowedDomains []string `json:"custom_allowed_domains,omitempty"` // Undantag från blocklistan (allowlist)
 }
 
 // WireGuardConfig representerar server-sidans WireGuard-inställningar (wg0).
@@ -151,9 +176,14 @@ type ObjectSource struct {
 type Service struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
-	Protocol    string   `json:"protocol"` // "tcp", "udp", "icmp", "any"
+	Protocol    string   `json:"protocol"` // "tcp", "udp", "icmp", "any", eller "group"
 	Ports       []string `json:"ports"`    // t.ex. ["80", "443"], ["53"]
 	Description string   `json:"description"`
+	// Members innehåller andra Service-ID:n och används bara när
+	// Protocol == "group" (Fas 7 — Service Groups). En Policy som
+	// refererar till en grupp matchar unionen av alla medlemmarnas
+	// protokoll/portar.
+	Members []string `json:"members,omitempty"`
 }
 
 // PolicyAction anger vad brandväggen gör med matchad trafik.
@@ -163,8 +193,9 @@ const (
 	ActionAccept     PolicyAction = "accept"
 	ActionDrop       PolicyAction = "drop"
 	ActionReject     PolicyAction = "reject"
-	ActionDNAT       PolicyAction = "dnat"       // Port forwarding
+	ActionDNAT       PolicyAction = "dnat"       // Port forwarding (eller 1:1 NAT om NAT.ExternalIP är satt)
 	ActionMasquerade PolicyAction = "masquerade" // Outbound NAT
+	ActionSNAT       PolicyAction = "snat"       // Fas 7: Avancerad NAT — SNAT-override istället för default masquerade
 )
 
 // Policy representerar en brandväggs- eller NAT-regel.
@@ -184,14 +215,34 @@ type Policy struct {
 	Description string       `json:"description"`
 	Local       bool         `json:"local,omitempty"`    // Om true gäller policyn åtkomst till brandväggen själv (INPUT-kedjan, t.ex. SSH/Management API) istället för vidarebefordrad trafik (FORWARD-kedjan).
 	Critical    bool         `json:"critical,omitempty"` // Om true måste GUI:t be om en uttrycklig bekräftelse innan policyn inaktiveras eller tas bort, eftersom den styr åtkomst som kan behövas för att administrera brandväggen.
+	// Schedule gör policyn tidsstyrd (Fas 7 — Schema/tidsbaserade regler).
+	// nil/Enabled=false betyder att policyn gäller alltid, som tidigare.
+	Schedule *PolicySchedule `json:"schedule,omitempty"`
 }
 
-// NATConfig innehåller parametrar för Port Forwarding eller SNAT.
+// PolicySchedule begränsar när en Policy är aktiv, matchat i nftables via
+// `meta day`/`meta hour` (Fas 7). Days är en lista av engelska veckodags-
+// namn ("Monday".."Sunday", som nftables kräver) — tom lista betyder alla
+// dagar. StartTime/EndTime är "HH:MM" i brandväggens lokala tid.
+type PolicySchedule struct {
+	Enabled   bool     `json:"enabled"`
+	Days      []string `json:"days,omitempty"` // t.ex. ["Monday","Tuesday","Wednesday","Thursday","Friday"]
+	StartTime string   `json:"start_time"`      // "HH:MM", t.ex. "08:00"
+	EndTime   string   `json:"end_time"`        // "HH:MM", t.ex. "17:00"
+}
+
+// NATConfig innehåller parametrar för Port Forwarding, 1:1 NAT eller SNAT.
 type NATConfig struct {
 	ExternalPort int    `json:"external_port,omitempty"` // Port på WAN-sida vid DNAT (t.ex. 443)
 	InternalIP   string `json:"internal_ip,omitempty"`   // Mål-IP på insidan vid DNAT (t.ex. 192.168.20.10)
 	InternalPort int    `json:"internal_port,omitempty"` // Målport på insidan vid DNAT (t.ex. 443)
 	Protocol     string `json:"protocol,omitempty"`      // "tcp" eller "udp"
+	// ExternalIP (Fas 7 — Avancerad NAT):
+	//  - Vid Action=dnat: om satt görs 1:1 NAT (statisk NAT) mot just
+	//    denna WAN-IP istället för att matcha alla WAN-interfacets IP:n.
+	//  - Vid Action=snat: den IP-adress utgående trafik ska SNAT:as till,
+	//    istället för standard-masquerade (t.ex. en sekundär WAN-IP).
+	ExternalIP string `json:"external_ip,omitempty"`
 }
 
 // Settings innehåller globala management-inställningar.

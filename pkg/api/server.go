@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -56,6 +56,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/vpn/openvpn/ca-info", s.authMiddleware(s.handleOpenVPNCAInfo))
 	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddleware(s.handleOpenVPNGenerateClient))
 	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddleware(s.handleRefreshObjectSource))
+	mux.HandleFunc("/api/v1/policies/hit-counts", s.authMiddleware(s.handleHitCounts))
+	mux.HandleFunc("/api/v1/dns/refresh-blocklist", s.authMiddleware(s.handleRefreshDNSBlocklist))
 
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig))
@@ -419,6 +421,87 @@ func (s *Server) handleRollbackConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.engine.RollbackConfig(r.Context(), "admin"); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// handleHitCounts läser de faktiska paket-/bytesräknarna för brandväggens
+// regler (Fas 7 — Hit counters) direkt ur den skarpa nftables-ruleseten
+// (`nft -j list table inet security_harbor`), och slår ihop dem per
+// Policy-namn (en Policy kan generera flera regler, t.ex. en Service
+// Group eller flera WAN-interface — se resolveServiceMatchExprSets i
+// nftables-adaptern). Detta är alltså LIVE-data ur kärnan, inte något
+// agenten själv räknar eller lagrar.
+func (s *Server) handleHitCounts(w http.ResponseWriter, r *http.Request) {
+	counts, err := readNftHitCounts()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(counts)
+}
+
+func readNftHitCounts() (map[string]map[string]int64, error) {
+	out, err := exec.Command("nft", "-j", "list", "table", "inet", "security_harbor").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("nft list table misslyckades: %w - %s", err, string(out))
+	}
+
+	var raw struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("ogiltig JSON från nft: %w", err)
+	}
+
+	counts := make(map[string]map[string]int64)
+	for _, el := range raw.Nftables {
+		ruleRaw, ok := el["rule"]
+		if !ok {
+			continue
+		}
+		var rule struct {
+			Comment string            `json:"comment"`
+			Expr    []json.RawMessage `json:"expr"`
+		}
+		if err := json.Unmarshal(ruleRaw, &rule); err != nil || rule.Comment == "" {
+			continue
+		}
+		for _, exprEl := range rule.Expr {
+			var counter struct {
+				Counter *struct {
+					Packets int64 `json:"packets"`
+					Bytes   int64 `json:"bytes"`
+				} `json:"counter"`
+			}
+			if err := json.Unmarshal(exprEl, &counter); err != nil || counter.Counter == nil {
+				continue
+			}
+			if counts[rule.Comment] == nil {
+				counts[rule.Comment] = map[string]int64{"packets": 0, "bytes": 0}
+			}
+			counts[rule.Comment]["packets"] += counter.Counter.Packets
+			counts[rule.Comment]["bytes"] += counter.Counter.Bytes
+		}
+	}
+	return counts, nil
+}
+
+// handleRefreshDNSBlocklist triggar en omedelbar hämtning av DNS-
+// domänblocklistan (Fas 6), t.ex. via "Uppdatera nu" i GUI:t.
+func (s *Server) handleRefreshDNSBlocklist(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	if err := s.engine.RefreshDNSBlocklist(ctx); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

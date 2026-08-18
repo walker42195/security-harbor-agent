@@ -39,6 +39,27 @@ func TestParseTorExitList(t *testing.T) {
 	}
 }
 
+func TestParseHostsFileDomains(t *testing.T) {
+	input := `# Title: StevenBlack hosts
+127.0.0.1 localhost
+127.0.0.1 localhost.localdomain
+::1 ip6-localhost
+0.0.0.0 malware.example.com
+0.0.0.0 tracker.example.net
+127.0.0.1 ads.example.org
+`
+	got := parseHostsFileDomains(bufio.NewScanner(strings.NewReader(input)))
+	want := []string{"malware.example.com", "tracker.example.net", "ads.example.org"}
+	if len(got) != len(want) {
+		t.Fatalf("fel antal domäner (loopback-poster ska hoppas över): fick %v, ville ha %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("post %d: fick %q, ville ha %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestParseGenericCIDRList(t *testing.T) {
 	input := "# comment\n10.0.0.0/8\n; also comment\n192.168.1.0/24\ninvalid-line\n"
 	got := parseGenericCIDRList(bufio.NewScanner(strings.NewReader(input)))

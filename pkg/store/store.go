@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -189,6 +190,78 @@ func (s *Store) UpdateObjectValues(objID string, values []string, fetchErr error
 
 	if !found {
 		return fmt.Errorf("objekt %q med automatisk källa hittades inte", objID)
+	}
+
+	if err := s.saveConfigLocked(filepath.Join(s.baseDir, "running.json"), s.runningCfg); err != nil {
+		return err
+	}
+	if s.candidateCfg != nil {
+		if err := s.saveConfigLocked(filepath.Join(s.baseDir, "candidate.json"), s.candidateCfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SaveDNSBlocklistDomains cachar den hämtade DNS-domänblocklistan (Fas 6)
+// till en egen fil på disk — ALDRIG i running/candidate.json, eftersom en
+// domänblocklista (t.ex. StevenBlack hosts) kan innehålla hundratusentals
+// poster.
+func (s *Store) SaveDNSBlocklistDomains(domains []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.baseDir, "dns_blocklist.txt")
+	return os.WriteFile(path, []byte(strings.Join(domains, "\n")), 0644)
+}
+
+// LoadDNSBlocklistDomains läser den cachade DNS-domänblocklistan. Returnerar
+// en tom lista (inte fel) om ingen hämtning ännu skett.
+func (s *Store) LoadDNSBlocklistDomains() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	path := filepath.Join(s.baseDir, "dns_blocklist.txt")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return nil, nil
+	}
+	return strings.Split(trimmed, "\n"), nil
+}
+
+// UpdateDNSBlocklistStatus skriver om DNS.Blocklist-statusfälten (senast
+// uppdaterad/fel/antal poster) i BÅDE running och candidate, utanför Safe
+// Apply/candidate-bekräftelse — samma resonemang som UpdateObjectValues
+// (Fas 5): en bakgrundsuppdatering av listinnehåll är inte en
+// användarändring som ska kräva manuell commit.
+func (s *Store) UpdateDNSBlocklistStatus(entryCount int, fetchErr error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	apply := func(cfg *config.Config) {
+		if cfg == nil || cfg.DNS == nil {
+			return
+		}
+		found = true
+		if fetchErr != nil {
+			cfg.DNS.BlocklistLastError = fetchErr.Error()
+			return
+		}
+		cfg.DNS.BlocklistEntryCount = entryCount
+		cfg.DNS.BlocklistLastUpdated = time.Now().Format(time.RFC3339)
+		cfg.DNS.BlocklistLastError = ""
+	}
+	apply(s.runningCfg)
+	apply(s.candidateCfg)
+
+	if !found {
+		return fmt.Errorf("DNS är inte konfigurerat")
 	}
 
 	if err := s.saveConfigLocked(filepath.Join(s.baseDir, "running.json"), s.runningCfg); err != nil {

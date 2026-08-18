@@ -1,0 +1,185 @@
+// Package dns genererar Unbound-konfiguration för brandväggens lokala
+// DNS-resolver och domänfiltrering (Fas 6). Domänblocklistan (som kan
+// innehålla hundratusentals poster, t.ex. StevenBlack hosts) hålls ALDRIG
+// i den deklarativa JSON-configen — den skrivs till en egen include-fil
+// som Unbound läser direkt, se ApplyConfig.
+package dns
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/walker42195/security-harbor-agent/pkg/config"
+)
+
+type Adapter struct {
+	// dir är katalogen där unbound.conf.d-filerna skrivs, normalt
+	// /etc/unbound/security-harbor.d.
+	dir string
+}
+
+// Arch/de flesta distros default-installerar unbound.conf med
+// `include: "/etc/unbound/unbound.conf.d/*.conf"` redan från paketet, så
+// att skriva hit kräver ingen ändring av systemets bas-unbound.conf.
+const defaultDir = "/etc/unbound/unbound.conf.d"
+
+func NewAdapter(dir string) *Adapter {
+	if dir == "" {
+		dir = defaultDir
+	}
+	return &Adapter{dir: dir}
+}
+
+// GenerateServerConfig renderar huvudkonfigurationen (server: + forward-zone:).
+// Domänerna som ska blockeras skrivs INTE här, utan i en separat include-fil
+// (blocklistPath, se blocklistFilename) för att hålla huvudfilen läsbar och
+// snabb att skriva om vid varje Apply oavsett blocklistans storlek.
+func GenerateServerConfig(cfg *config.Config, blocklistPath string) (string, error) {
+	if cfg.DNS == nil || !cfg.DNS.Enabled {
+		return "", nil
+	}
+	d := cfg.DNS
+
+	var lanNetworks []string
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled || iface.Zone == "WAN" || iface.IPv4 == "" {
+			continue
+		}
+		if _, ipNet, err := net.ParseCIDR(iface.IPv4); err == nil {
+			lanNetworks = append(lanNetworks, ipNet.String())
+		}
+	}
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "server:\n")
+	fmt.Fprintf(&b, "    interface: 0.0.0.0\n")
+	fmt.Fprintf(&b, "    port: 53\n")
+	fmt.Fprintf(&b, "    do-ip4: yes\n")
+	fmt.Fprintf(&b, "    do-udp: yes\n")
+	fmt.Fprintf(&b, "    do-tcp: yes\n")
+	fmt.Fprintf(&b, "    hide-identity: yes\n")
+	fmt.Fprintf(&b, "    hide-version: yes\n")
+	fmt.Fprintf(&b, "    access-control: 127.0.0.0/8 allow\n")
+	for _, net := range lanNetworks {
+		fmt.Fprintf(&b, "    access-control: %s allow\n", net)
+	}
+	fmt.Fprintf(&b, "    access-control: 0.0.0.0/0 refuse\n")
+	if d.BlocklistEnabled && blocklistPath != "" {
+		fmt.Fprintf(&b, "    include: \"%s\"\n", blocklistPath)
+	}
+	fmt.Fprintf(&b, "\n")
+
+	if len(d.UpstreamServers) > 0 {
+		fmt.Fprintf(&b, "forward-zone:\n")
+		fmt.Fprintf(&b, "    name: \".\"\n")
+		if d.DoTEnabled {
+			fmt.Fprintf(&b, "    forward-tls-upstream: yes\n")
+			for _, up := range d.UpstreamServers {
+				host := d.DoTHostname
+				if host == "" {
+					host = up
+				}
+				fmt.Fprintf(&b, "    forward-addr: %s@853#%s\n", up, host)
+			}
+		} else {
+			for _, up := range d.UpstreamServers {
+				fmt.Fprintf(&b, "    forward-addr: %s\n", up)
+			}
+		}
+	}
+
+	return b.String(), nil
+}
+
+const blocklistFilename = "blocklist.conf"
+
+// GenerateBlocklistConfig bygger include-filen med `local-zone`-direktiv
+// för varje blockerad domän. CustomAllowedDomains (allowlist) skrivs EFTER
+// blocklistan med `transparent`, vilket i Unbound gör att den mer
+// specifika/senare posten vinner för exakt den domänen.
+func GenerateBlocklistConfig(domains []string, cfg *config.Config) string {
+	if cfg.DNS == nil {
+		return ""
+	}
+	blocked := make(map[string]bool, len(domains)+len(cfg.DNS.CustomBlockedDomains))
+	for _, d := range domains {
+		blocked[normalizeDomain(d)] = true
+	}
+	for _, d := range cfg.DNS.CustomBlockedDomains {
+		blocked[normalizeDomain(d)] = true
+	}
+	for _, d := range cfg.DNS.CustomAllowedDomains {
+		delete(blocked, normalizeDomain(d))
+	}
+
+	var b bytes.Buffer
+	for domain := range blocked {
+		if domain == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "local-zone: \"%s.\" always_nxdomain\n", domain)
+	}
+	for _, d := range cfg.DNS.CustomAllowedDomains {
+		domain := normalizeDomain(d)
+		if domain == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "local-zone: \"%s.\" transparent\n", domain)
+	}
+	return b.String()
+}
+
+func normalizeDomain(d string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
+}
+
+// ApplyConfig skriver unbound.conf.d/*.conf och startar/stoppar/
+// restartar unbound.service. domains är den cachade domänblocklistan (från
+// pkg/threatfeed, hämtad separat — se Engine.applyBackends), inte något
+// som lagras i config.Config.
+func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, domains []string, dryRun bool) error {
+	unit := "unbound.service"
+
+	if cfg.DNS == nil || !cfg.DNS.Enabled {
+		if dryRun {
+			return nil
+		}
+		_ = exec.CommandContext(ctx, "systemctl", "stop", unit).Run()
+		return nil
+	}
+
+	blocklistPath := filepath.Join(a.dir, blocklistFilename)
+	serverConf, err := GenerateServerConfig(cfg, blocklistPath)
+	if err != nil {
+		return fmt.Errorf("misslyckades generera Unbound-konfiguration: %w", err)
+	}
+
+	if dryRun {
+		return nil
+	}
+
+	if err := os.MkdirAll(a.dir, 0755); err != nil {
+		return fmt.Errorf("misslyckades skapa katalog %s: %w", a.dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(a.dir, "security-harbor.conf"), []byte(serverConf), 0644); err != nil {
+		return fmt.Errorf("misslyckades skriva security-harbor.conf: %w", err)
+	}
+	if cfg.DNS.BlocklistEnabled {
+		blocklistConf := GenerateBlocklistConfig(domains, cfg)
+		if err := os.WriteFile(filepath.Join(a.dir, blocklistFilename), []byte(blocklistConf), 0644); err != nil {
+			return fmt.Errorf("misslyckades skriva %s: %w", blocklistFilename, err)
+		}
+	}
+
+	if out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart %s misslyckades: %w - output: %s", unit, err, string(out))
+	}
+
+	return nil
+}
