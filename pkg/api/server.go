@@ -452,6 +452,9 @@ func (s *Server) handleConntrack(w http.ResponseWriter, r *http.Request) {
 		if mac, ok := arp[entries[i].SrcIP]; ok {
 			entries[i].SrcMAC = mac
 		}
+		if mac, ok := arp[entries[i].DstIP]; ok {
+			entries[i].DstMAC = mac
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(entries)
@@ -536,7 +539,13 @@ func (s *Server) handleNmap(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "nmap", args...).CombinedOutput()
+	// SYN/UDP/OS-detektion kräver riktig root (Ubuntu-paketets nmap är
+	// byggt utan libcap-ng, så filkapabiliteter via setcap räcker inte —
+	// verifierat på 10.0.0.163 2026-08-18). Agentens tjänstekonto
+	// (security-harbor) har en snävt avgränsad sudoers-regel som ENDAST
+	// tillåter /usr/bin/nmap som root, inget annat.
+	sudoArgs := append([]string{"-n", "nmap"}, args...)
+	out, err := exec.CommandContext(ctx, "sudo", sudoArgs...).CombinedOutput()
 	result := string(out)
 	if err != nil && result == "" {
 		result = fmt.Sprintf("nmap misslyckades: %v", err)
@@ -1008,11 +1017,11 @@ func parseFirewallLog() []config.FirewallLogEntry {
 				entry.OutIface = val
 			case "MAC":
 				// nftables loggar käll- och destinations-MAC hopslaget; de sex
-				// första oktetten hör till destinationen och nästa sex till
-				// källan för mottagen trafik. Vi tar de sista sex byten som en
-				// rimlig approximation av avsändarens MAC.
+				// första oktetterna hör till destinationen och nästa sex till
+				// källan för mottagen trafik.
 				parts := strings.Split(val, ":")
 				if len(parts) >= 12 {
+					entry.DstMAC = strings.Join(parts[0:6], ":")
 					entry.SrcMAC = strings.Join(parts[6:12], ":")
 				}
 			case "SRC":

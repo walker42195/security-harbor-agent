@@ -302,6 +302,10 @@ type ConntrackEntry struct {
 	DstPort  int    `json:"dst_port"`
 	State    string `json:"state"`
 	SrcMAC   string `json:"src_mac,omitempty"` // Slås upp via ARP-tabellen, LAN-sidan
+	// DstMAC slås upp på samma sätt som SrcMAC (via ARP-tabellen) och är
+	// bara tillgänglig när målet är en direktansluten LAN-enhet — för
+	// WAN-mål finns ingen lokal ARP-post och fältet blir tomt.
+	DstMAC string `json:"dst_mac,omitempty"`
 }
 
 // FirewallLogEntry representerar en nekad/blockerad paket-händelse, läst ur
@@ -313,6 +317,7 @@ type FirewallLogEntry struct {
 	InIface   string `json:"in_iface,omitempty"`
 	OutIface  string `json:"out_iface,omitempty"`
 	SrcMAC    string `json:"src_mac,omitempty"`
+	DstMAC    string `json:"dst_mac,omitempty"`
 	SrcIP     string `json:"src_ip"`
 	DstIP     string `json:"dst_ip"`
 	Protocol  string `json:"protocol"`
