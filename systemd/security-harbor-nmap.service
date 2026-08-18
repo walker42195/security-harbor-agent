@@ -1,0 +1,13 @@
+[Unit]
+Description=Security Harbor nmap-skanning (privilegierad hjälptjänst)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/security-harbor-nmap-runner
+# Ingen härdning här avsiktligt — körs redan som root (systemd default),
+# vilket är exakt den privilegienivå SYN/UDP/OS-detektion i nmap alltid
+# har krävt. Den härdade daemon-processen (security-harbor-agent.service,
+# NoNewPrivileges=true m.m.) triggar den här tjänsten via
+# `systemctl start --wait` istället för att köra nmap själv, så
+# privilegiehöjningen är isolerad till denna minimala, syftesbyggda
+# engångskörning i stället för att försvaga huvuddaemonens sandbox.

@@ -566,19 +566,57 @@ func (s *Server) handleNmap(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
+
 	// SYN/UDP/OS-detektion kräver riktig root (Ubuntu-paketets nmap är
-	// byggt utan libcap-ng, så filkapabiliteter via setcap räcker inte —
-	// verifierat på 10.0.0.163 2026-08-18). Agentens tjänstekonto
-	// (security-harbor) har en snävt avgränsad sudoers-regel som ENDAST
-	// tillåter /usr/bin/nmap som root, inget annat.
-	sudoArgs := append([]string{"-n", "nmap"}, args...)
-	out, err := exec.CommandContext(ctx, "sudo", sudoArgs...).CombinedOutput()
-	result := string(out)
-	if err != nil && result == "" {
+	// byggt utan libcap-ng, så filkapabiliteter räcker inte — verifierat på
+	// 10.0.0.163 2026-08-18). Agentens EGEN process kör med
+	// NoNewPrivileges=true (systemd/security-harbor-agent.service), vilket
+	// kategoriskt blockerar sudo oavsett sudoers-regler. Istället triggas
+	// en helt separat, ohärdad engångstjänst (security-harbor-nmap.service,
+	// cmd/security-harbor-nmap-runner) via `systemctl start --wait` — det
+	// isolerar privilegiehöjningen till en minimal komponent istället för
+	// att försvaga hela agentens sandbox.
+	result, err := runNmapViaHelperService(ctx, args)
+	if err != nil {
 		result = fmt.Sprintf("nmap misslyckades: %v", err)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"output": result})
+}
+
+const (
+	nmapRequestPath = "/run/security-harbor/nmap-request.json"
+	nmapResultPath  = "/run/security-harbor/nmap-result.json"
+)
+
+func runNmapViaHelperService(ctx context.Context, args []string) (string, error) {
+	// Rensa ett ev. gammalt resultat FÖRST, så ett tyst misslyckande i
+	// hjälptjänsten inte råkar returnera en tidigare skannings utdata.
+	_ = os.Remove(nmapResultPath)
+
+	reqData, err := json.Marshal(map[string][]string{"args": args})
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(nmapRequestPath, reqData, 0600); err != nil {
+		return "", fmt.Errorf("kunde inte skriva request-fil: %w", err)
+	}
+
+	if out, err := exec.CommandContext(ctx, "systemctl", "start", "--wait", "security-harbor-nmap.service").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("kunde inte starta security-harbor-nmap.service: %w — %s", err, strings.TrimSpace(string(out)))
+	}
+
+	resultData, err := os.ReadFile(nmapResultPath)
+	if err != nil {
+		return "", fmt.Errorf("hjälptjänsten skrev inget resultat: %w", err)
+	}
+	var result struct {
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		return "", fmt.Errorf("ogiltigt resultat från hjälptjänsten: %w", err)
+	}
+	return result.Output, nil
 }
 
 // handleWireGuardServerInfo returnerar brandväggens publika WireGuard-nyckel
