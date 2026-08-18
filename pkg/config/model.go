@@ -30,16 +30,30 @@ type DNSConfig struct {
 	DoTEnabled      bool     `json:"dot_enabled"`       // DNS-over-TLS mot upstream-servrarna
 	DoTHostname     string   `json:"dot_hostname"`      // TLS-hostnamn för DoT-verifiering, t.ex. "cloudflare-dns.com"
 
-	BlocklistEnabled      bool   `json:"blocklist_enabled"`
-	BlocklistKind         string `json:"blocklist_kind"`          // "stevenblack_hosts", "custom_url"
-	BlocklistURL          string `json:"blocklist_url,omitempty"` // Endast för kind="custom_url"
-	BlocklistRefreshHours int    `json:"blocklist_refresh_hours"`
-	BlocklistLastUpdated  string `json:"blocklist_last_updated,omitempty"`
-	BlocklistLastError    string `json:"blocklist_last_error,omitempty"`
-	BlocklistEntryCount   int    `json:"blocklist_entry_count,omitempty"`
+	// Blocklists tillåter FLERA samtidigt aktiva domänblocklistor (t.ex.
+	// StevenBlack hosts + en egen anpassad URL parallellt) — se
+	// pkg/adapter/dns.GenerateBlocklistConfig som slår ihop dem alla.
+	Blocklists []DNSBlocklistSource `json:"blocklists,omitempty"`
 
 	CustomBlockedDomains []string `json:"custom_blocked_domains,omitempty"` // Manuellt inmatade, alltid blockerade
 	CustomAllowedDomains []string `json:"custom_allowed_domains,omitempty"` // Undantag från blocklistan (allowlist)
+}
+
+// DNSBlocklistSource beskriver EN automatiskt uppdaterad domänblocklista
+// (Fas 6). Precis som ObjectSource (Fas 5) lagras den faktiska domänlistan
+// ALDRIG i denna struct — bara källmetadata/status. Agenten cachar den
+// nedladdade listan till en egen fil på disk, nyckad på ID (se
+// Store.SaveDNSBlocklistDomains).
+type DNSBlocklistSource struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Enabled      bool   `json:"enabled"`
+	Kind         string `json:"kind"`          // "stevenblack_hosts", "custom_domain_url"
+	URL          string `json:"url,omitempty"` // Endast för kind="custom_domain_url"
+	RefreshHours int    `json:"refresh_hours"`
+	LastUpdated  string `json:"last_updated,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
+	EntryCount   int    `json:"entry_count,omitempty"`
 }
 
 // WireGuardConfig representerar server-sidans WireGuard-inställningar (wg0).

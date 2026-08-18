@@ -81,8 +81,8 @@ func main() {
 				if n := eng.RefreshDueObjectSources(ctx); n > 0 {
 					fmt.Printf("[THREATFEED] Uppdaterade %d hot-lista/GeoIP-objekt\n", n)
 				}
-				if eng.RefreshDNSBlocklistIfDue(ctx) {
-					fmt.Println("[THREATFEED] Uppdaterade DNS-domänblocklistan")
+				if n := eng.RefreshDueDNSBlocklists(ctx); n > 0 {
+					fmt.Printf("[THREATFEED] Uppdaterade %d DNS-domänblocklista(or)\n", n)
 				}
 			}
 			refresh()

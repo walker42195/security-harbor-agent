@@ -58,6 +58,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddleware(s.handleRefreshObjectSource))
 	mux.HandleFunc("/api/v1/policies/hit-counts", s.authMiddleware(s.handleHitCounts))
 	mux.HandleFunc("/api/v1/dns/refresh-blocklist", s.authMiddleware(s.handleRefreshDNSBlocklist))
+	mux.HandleFunc("/api/v1/dns/blocklist-domains", s.authMiddleware(s.handleGetDNSBlocklistDomains))
 
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig))
@@ -491,22 +492,49 @@ func readNftHitCounts() (map[string]map[string]int64, error) {
 	return counts, nil
 }
 
-// handleRefreshDNSBlocklist triggar en omedelbar hämtning av DNS-
-// domänblocklistan (Fas 6), t.ex. via "Uppdatera nu" i GUI:t.
+// handleRefreshDNSBlocklist triggar en omedelbar hämtning av EN DNS-
+// domänblocklista (Fas 6, matchad på DNSBlocklistSource.ID — flera källor
+// kan vara aktiva samtidigt), t.ex. via "Uppdatera nu" i GUI:t.
 func (s *Server) handleRefreshDNSBlocklist(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var req struct {
+		BlocklistID string `json:"blocklist_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BlocklistID == "" {
+		http.Error(w, "blocklist_id saknas", http.StatusBadRequest)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	if err := s.engine.RefreshDNSBlocklist(ctx); err != nil {
+	if err := s.engine.RefreshDNSBlocklist(ctx, req.BlocklistID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// handleGetDNSBlocklistDomains returnerar den cachade domänlistan för EN
+// blocklist-källa (Fas 6) — så att GUI:t faktiskt kan visa vad som är
+// blockerat, inte bara antalet poster.
+func (s *Server) handleGetDNSBlocklistDomains(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "id saknas", http.StatusBadRequest)
+		return
+	}
+	domains, err := s.engine.GetDNSBlocklistDomains(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(domains)
 }
 
 // parseConntrack läser aktiva anslutningar via `conntrack -L`. Moderna

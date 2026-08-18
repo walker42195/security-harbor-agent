@@ -90,7 +90,7 @@ func GenerateServerConfig(cfg *config.Config, blocklistPath string) (string, err
 		fmt.Fprintf(&b, "    access-control: %s allow\n", net)
 	}
 	fmt.Fprintf(&b, "    access-control: 0.0.0.0/0 refuse\n")
-	if d.BlocklistEnabled && blocklistPath != "" {
+	if hasAnyBlocklistSource(d) && blocklistPath != "" {
 		fmt.Fprintf(&b, "    include: \"%s\"\n", blocklistPath)
 	}
 	// tls-cert-bundle (server:-klausul-option) måste anges explicit — utan
@@ -174,6 +174,21 @@ func normalizeDomain(d string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
 }
 
+// hasAnyBlocklistSource avgör om blocklist.conf ska skrivas/inkluderas
+// alls — antingen minst en aktiverad automatisk källa (Fas 6, kan vara
+// flera samtidigt) eller åtminstone en manuellt inmatad blockerad domän.
+func hasAnyBlocklistSource(d *config.DNSConfig) bool {
+	if len(d.CustomBlockedDomains) > 0 {
+		return true
+	}
+	for _, src := range d.Blocklists {
+		if src.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
 // ApplyConfig skriver unbound.conf.d/*.conf och startar/stoppar/
 // restartar unbound.service. domains är den cachade domänblocklistan (från
 // pkg/threatfeed, hämtad separat — se Engine.applyBackends), inte något
@@ -205,7 +220,7 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, domains [
 	if err := os.WriteFile(filepath.Join(a.dir, "security-harbor.conf"), []byte(serverConf), 0644); err != nil {
 		return fmt.Errorf("misslyckades skriva security-harbor.conf: %w", err)
 	}
-	if cfg.DNS.BlocklistEnabled {
+	if hasAnyBlocklistSource(cfg.DNS) {
 		blocklistConf := GenerateBlocklistConfig(domains, cfg)
 		if err := os.WriteFile(filepath.Join(a.dir, blocklistFilename), []byte(blocklistConf), 0644); err != nil {
 			return fmt.Errorf("misslyckades skriva %s: %w", blocklistFilename, err)

@@ -102,9 +102,9 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 	}
 
 	if cfg.DNS != nil && cfg.DNS.Enabled {
-		domains, err := e.store.LoadDNSBlocklistDomains()
+		domains, err := e.store.LoadAllEnabledDNSBlocklistDomains(cfg.DNS.Blocklists)
 		if err != nil {
-			return fmt.Errorf("dns: kunde inte läsa cachad blocklista: %w", err)
+			return fmt.Errorf("dns: kunde inte läsa cachade blocklistor: %w", err)
 		}
 		if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, dryRun); err != nil {
 			return fmt.Errorf("dns: %w", err)
@@ -332,32 +332,45 @@ func (e *Engine) RefreshDueObjectSources(ctx context.Context) int {
 	return refreshed
 }
 
-// RefreshDNSBlocklist hämtar om DNS-domänblocklistan (Fas 6) via
+// RefreshDNSBlocklist hämtar om EN DNS-domänblocklista (Fas 6, matchad på
+// DNSBlocklistSource.ID — flera källor kan vara aktiva samtidigt) via
 // pkg/threatfeed, cachar den till disk (Store.SaveDNSBlocklistDomains —
 // ALDRIG i running/candidate.json, se den funktionens kommentar) och
-// applicerar om Unbound (ReapplyDNSOnly) så att ändringen slår igenom
-// direkt. Söker candidate FÖRE running av samma anledning som
-// RefreshObjectSource (Fas 5) — en nyss aktiverad blocklista ska kunna
-// förhandsvisas innan den är applicerad.
-func (e *Engine) RefreshDNSBlocklist(ctx context.Context) error {
-	var d *config.DNSConfig
+// applicerar om Unbound (ReapplyDNSOnly, som slår ihop ALLA aktiverade
+// källor) så att ändringen slår igenom direkt. Söker candidate FÖRE
+// running av samma anledning som RefreshObjectSource (Fas 5) — en nyss
+// tillagd blocklista ska kunna förhandsvisas innan den är applicerad.
+// GetDNSBlocklistDomains returnerar den cachade domänlistan för EN
+// blocklist-källa, så att GUI:t kan visa (inte bara räkna) vad som
+// faktiskt är blockerat.
+func (e *Engine) GetDNSBlocklistDomains(blocklistID string) ([]string, error) {
+	return e.store.LoadDNSBlocklistDomains(blocklistID)
+}
+
+func (e *Engine) RefreshDNSBlocklist(ctx context.Context, blocklistID string) error {
+	var src *config.DNSBlocklistSource
 	for _, cfg := range []*config.Config{e.store.GetCandidateConfig(), e.store.GetRunningConfig()} {
-		if cfg != nil && cfg.DNS != nil {
-			d = cfg.DNS
-			break
+		if cfg == nil || cfg.DNS == nil || src != nil {
+			continue
+		}
+		for i := range cfg.DNS.Blocklists {
+			if cfg.DNS.Blocklists[i].ID == blocklistID {
+				src = &cfg.DNS.Blocklists[i]
+				break
+			}
 		}
 	}
-	if d == nil || !d.BlocklistEnabled {
-		return fmt.Errorf("DNS-blocklista är inte aktiverad")
+	if src == nil {
+		return fmt.Errorf("DNS-blocklista %q hittades inte", blocklistID)
 	}
 
-	domains, fetchErr := threatfeed.FetchDomains(d.BlocklistKind, d.BlocklistURL)
+	domains, fetchErr := threatfeed.FetchDomains(src.Kind, src.URL)
 	if fetchErr == nil {
-		if err := e.store.SaveDNSBlocklistDomains(domains); err != nil {
+		if err := e.store.SaveDNSBlocklistDomains(blocklistID, domains); err != nil {
 			return err
 		}
 	}
-	if err := e.store.UpdateDNSBlocklistStatus(len(domains), fetchErr); err != nil {
+	if err := e.store.UpdateDNSBlocklistStatus(blocklistID, len(domains), fetchErr); err != nil {
 		return err
 	}
 	if fetchErr != nil {
@@ -366,46 +379,55 @@ func (e *Engine) RefreshDNSBlocklist(ctx context.Context) error {
 	return e.ReapplyDNSOnly(ctx)
 }
 
-// RefreshDNSBlocklistIfDue anropar RefreshDNSBlocklist bara om
-// BlocklistRefreshHours har passerat sedan BlocklistLastUpdated (eller om
-// den aldrig hämtats än). Kallas periodiskt från main.go, samma mönster
-// som RefreshDueObjectSources.
-func (e *Engine) RefreshDNSBlocklistIfDue(ctx context.Context) bool {
+// RefreshDueDNSBlocklists går igenom alla DNS-blocklist-källor i running-
+// konfigurationen och uppdaterar dem vars RefreshHours har passerat sedan
+// LastUpdated (eller som aldrig hämtats än). Kallas periodiskt från
+// main.go, samma mönster som RefreshDueObjectSources (Fas 5). Returnerar
+// antalet källor som faktiskt uppdaterades.
+func (e *Engine) RefreshDueDNSBlocklists(ctx context.Context) int {
 	cfg := e.store.GetRunningConfig()
-	if cfg == nil || cfg.DNS == nil || !cfg.DNS.BlocklistEnabled {
-		return false
+	if cfg == nil || cfg.DNS == nil {
+		return 0
 	}
-	hours := cfg.DNS.BlocklistRefreshHours
-	if hours <= 0 {
-		hours = 24
-	}
-	due := true
-	if cfg.DNS.BlocklistLastUpdated != "" {
-		if t, err := time.Parse(time.RFC3339, cfg.DNS.BlocklistLastUpdated); err == nil {
-			due = time.Since(t) >= time.Duration(hours)*time.Hour
+
+	refreshed := 0
+	for _, src := range cfg.DNS.Blocklists {
+		if !src.Enabled {
+			continue
 		}
+		hours := src.RefreshHours
+		if hours <= 0 {
+			hours = 24
+		}
+		due := true
+		if src.LastUpdated != "" {
+			if t, err := time.Parse(time.RFC3339, src.LastUpdated); err == nil {
+				due = time.Since(t) >= time.Duration(hours)*time.Hour
+			}
+		}
+		if !due {
+			continue
+		}
+		if err := e.RefreshDNSBlocklist(ctx, src.ID); err != nil {
+			log.Printf("[THREATFEED] misslyckades uppdatera DNS-blocklistan %q (%s): %v", src.Name, src.Kind, err)
+			continue
+		}
+		refreshed++
 	}
-	if !due {
-		return false
-	}
-	if err := e.RefreshDNSBlocklist(ctx); err != nil {
-		log.Printf("[THREATFEED] misslyckades uppdatera DNS-blocklistan (%s): %v", cfg.DNS.BlocklistKind, err)
-		return false
-	}
-	return true
+	return refreshed
 }
 
-// ReapplyDNSOnly appliceras efter en bakgrundsuppdatering av DNS-
-// blocklistan — medvetet begränsat till DNS-adaptern (inte hela
+// ReapplyDNSOnly appliceras efter en bakgrundsuppdatering av en DNS-
+// blocklista — medvetet begränsat till DNS-adaptern (inte hela
 // applyBackends) av samma anledning som ReapplyNftablesOnly.
 func (e *Engine) ReapplyDNSOnly(ctx context.Context) error {
 	cfg := e.store.GetRunningConfig()
 	if cfg.DNS == nil || !cfg.DNS.Enabled {
 		return nil
 	}
-	domains, err := e.store.LoadDNSBlocklistDomains()
+	domains, err := e.store.LoadAllEnabledDNSBlocklistDomains(cfg.DNS.Blocklists)
 	if err != nil {
-		return fmt.Errorf("dns: kunde inte läsa cachad blocklista: %w", err)
+		return fmt.Errorf("dns: kunde inte läsa cachade blocklistor: %w", err)
 	}
 	if err := e.dnsAdapter.ApplyConfig(ctx, cfg, domains, false); err != nil {
 		return fmt.Errorf("dns: %w", err)
