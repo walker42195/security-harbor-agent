@@ -72,6 +72,62 @@ func serviceMatchExpr(service string) []interface{} {
 	return nil
 }
 
+// resolveObjectCIDRs slår upp ett Object-ID mot cfg.Objects och returnerar
+// dess konkreta IP/CIDR-lista. "group"-objekt kan innehålla andra objekt-ID:n
+// i Values (se kommentaren på config.Object) och löses upp en nivå rekursivt
+// — visited förhindrar en oändlig loop om två grupper råkar peka på varandra.
+// host/network/iplist/geoip har alla samma form: Values är redan konkreta
+// IP/CIDR-strängar (för iplist/geoip fyllda av pkg/threatfeed, Fas 5).
+func resolveObjectCIDRs(cfg *config.Config, objID string, visited map[string]bool) []string {
+	if objID == "" || strings.EqualFold(objID, "ANY") || visited[objID] {
+		return nil
+	}
+	visited[objID] = true
+
+	for _, obj := range cfg.Objects {
+		if obj.ID != objID {
+			continue
+		}
+		if obj.Type != config.ObjectTypeGroup {
+			return obj.Values
+		}
+		var out []string
+		for _, memberID := range obj.Values {
+			out = append(out, resolveObjectCIDRs(cfg, memberID, visited)...)
+		}
+		return out
+	}
+	return nil
+}
+
+// objectMatchExpr bygger ett nftables match-uttryck som begränsar en policy
+// till trafik vars käll- eller mål-IP finns i det angivna Object:ets
+// IP/CIDR-lista (via en anonym mängd, `ip saddr/daddr { ... }`). Returnerar
+// (nil, true) om objektet är "ANY" (ingen begränsning ska läggas till), och
+// (nil, false) om objektet är satt men löste upp till en TOM lista — det
+// senare måste anroparen hantera genom att INTE lägga till en tandlös regel
+// (annars matchar "match ingenting" == matcha allt i nftables semantik för
+// en tom uttryckslista, vilket är motsatsen till vad en tom hot-lista ska
+// betyda).
+func objectMatchExpr(cfg *config.Config, objID, field string) (expr []interface{}, isAny bool) {
+	if objID == "" || strings.EqualFold(objID, "ANY") {
+		return nil, true
+	}
+	cidrs := resolveObjectCIDRs(cfg, objID, map[string]bool{})
+	if len(cidrs) == 0 {
+		return nil, false
+	}
+	return []interface{}{
+		map[string]interface{}{
+			"match": map[string]interface{}{
+				"op":    "==",
+				"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": field}},
+				"right": map[string]interface{}{"set": cidrs},
+			},
+		},
+	}, false
+}
+
 type Adapter struct {
 	tableName string
 	family    string
@@ -382,6 +438,21 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			continue
 		}
 
+		// Käll-/mål-objekt (t.ex. GeoIP-landsblock eller en hot-lista från
+		// Spamhaus/Tor, Fas 5): en satt (icke-"ANY") SourceObj/DestObj som
+		// löser upp till en TOM lista (källan har inte hämtats än, eller
+		// misslyckades) hoppar över hela regeln — annars skulle en trasig
+		// hot-lista av misstag matcha ALL trafik (tom uttryckslista i
+		// nftables = "matcha allt"), vilket är motsatsen till avsikten.
+		srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+		if !srcIsAny && srcExpr == nil {
+			continue
+		}
+		dstExpr, dstIsAny := objectMatchExpr(cfg, pol.DestObj, "daddr")
+		if !dstIsAny && dstExpr == nil {
+			continue
+		}
+
 		rule := &Rule{
 			Family:  a.family,
 			Table:   a.tableName,
@@ -389,6 +460,8 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
 		}
 
+		rule.Expr = append(rule.Expr, srcExpr...)
+		rule.Expr = append(rule.Expr, dstExpr...)
 		rule.Expr = append(rule.Expr, serviceMatchExpr(pol.Service)...)
 
 		if pol.Action == config.ActionAccept {

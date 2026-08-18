@@ -55,6 +55,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddleware(s.handleWireGuardGeneratePeerKeys))
 	mux.HandleFunc("/api/v1/vpn/openvpn/ca-info", s.authMiddleware(s.handleOpenVPNCAInfo))
 	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddleware(s.handleOpenVPNGenerateClient))
+	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddleware(s.handleRefreshObjectSource))
 
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig))
@@ -313,6 +314,34 @@ func (s *Server) handleOpenVPNGenerateClient(w http.ResponseWriter, r *http.Requ
 		"serial":      serial,
 		"ovpn_config": ovpnFile,
 	})
+}
+
+// handleRefreshObjectSource triggar en omedelbar hämtning av ett Object med
+// automatisk källa (Fas 5 — hot-lista/GeoIP), t.ex. via "Uppdatera nu" i
+// GUI:t, istället för att vänta på nästa periodiska tillfälle.
+func (s *Server) handleRefreshObjectSource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ObjectID string `json:"object_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ObjectID == "" {
+		http.Error(w, "object_id saknas", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	if err := s.engine.RefreshObjectSource(ctx, req.ObjectID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 func (s *Server) handleGetRunningConfig(w http.ResponseWriter, r *http.Request) {

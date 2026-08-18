@@ -152,6 +152,56 @@ func (s *Store) SetCandidateConfig(cfg *config.Config) error {
 	return s.saveConfigLocked(candidatePath, cfg)
 }
 
+// UpdateObjectValues skriver om Values (och Source-statusfälten) för ett
+// Object med automatisk källa (Fas 5 — hot-listor/GeoIP, se pkg/threatfeed),
+// i BÅDE running och candidate om objektet finns i båda. Detta går INTE via
+// Safe Apply/candidate-bekräftelse — periodiska bakgrundsuppdateringar av en
+// hot-listas innehåll är inte en användarändring som ska kräva manuell
+// commit, till skillnad från redigeringar i GUI:t. Anroparen (pkg/threatfeed-
+// schemaläggaren i main.go) ansvarar för att sedan trigga en ny nftables-
+// applicering så att förändringen faktiskt slår igenom.
+func (s *Store) UpdateObjectValues(objID string, values []string, fetchErr error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	apply := func(cfg *config.Config) {
+		if cfg == nil {
+			return
+		}
+		for i := range cfg.Objects {
+			if cfg.Objects[i].ID != objID || cfg.Objects[i].Source == nil {
+				continue
+			}
+			found = true
+			if fetchErr != nil {
+				cfg.Objects[i].Source.LastError = fetchErr.Error()
+				continue
+			}
+			cfg.Objects[i].Values = values
+			cfg.Objects[i].Source.EntryCount = len(values)
+			cfg.Objects[i].Source.LastUpdated = time.Now().Format(time.RFC3339)
+			cfg.Objects[i].Source.LastError = ""
+		}
+	}
+	apply(s.runningCfg)
+	apply(s.candidateCfg)
+
+	if !found {
+		return fmt.Errorf("objekt %q med automatisk källa hittades inte", objID)
+	}
+
+	if err := s.saveConfigLocked(filepath.Join(s.baseDir, "running.json"), s.runningCfg); err != nil {
+		return err
+	}
+	if s.candidateCfg != nil {
+		if err := s.saveConfigLocked(filepath.Join(s.baseDir, "candidate.json"), s.candidateCfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) CommitCandidate() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

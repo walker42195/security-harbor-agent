@@ -186,6 +186,64 @@ func TestRenderJSONWireGuardWANAllow(t *testing.T) {
 	}
 }
 
+// TestRenderJSONPolicyObjectMatching skyddar mot en regression där
+// Policy.SourceObj/DestObj (t.ex. en GeoIP- eller hot-lista, Fas 5) tyst
+// ignorerades av nftables-adaptern — policyn genererade en regel som
+// matchade ALL trafik för tjänsten, oavsett vilket objekt som var valt i
+// GUI:t. Upptäckt vid kodgranskning 2026-08-18 (dokumenterat som öppet fynd
+// redan i Fas 3-rapporten). Testar både att en satt SourceObj faktiskt
+// begränsar regeln till dess IP-lista, och att en SourceObj som pekar på
+// ett objekt med en TOM Values-lista (t.ex. en hot-lista som ännu inte
+// hunnit hämtas) hoppar över regeln helt — annars skulle en tom
+// uttryckslista i nftables betyda "matcha allt", raka motsatsen till avsikt.
+func TestRenderJSONPolicyObjectMatching(t *testing.T) {
+	adapter := NewAdapter()
+
+	baseCfg := func(objects []config.Object) *config.Config {
+		return &config.Config{
+			Version: 1,
+			Interfaces: []config.Interface{
+				{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+				{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+			},
+			Objects: objects,
+			Policies: []config.Policy{
+				{
+					ID: "pol-block-hotlist", Name: "Block Spamhaus", Enabled: true,
+					SourceObj: "hotlist1", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop,
+				},
+			},
+			Settings: config.Settings{APIPort: 8443},
+		}
+	}
+
+	t.Run("SourceObj med värden begränsar regeln", func(t *testing.T) {
+		cfg := baseCfg([]config.Object{
+			{ID: "hotlist1", Name: "Spamhaus DROP", Type: config.ObjectTypeIPList, Values: []string{"1.2.3.0/24", "5.6.7.8/32"}},
+		})
+		data, err := adapter.RenderJSON(cfg)
+		if err != nil {
+			t.Fatalf("RenderJSON misslyckades: %v", err)
+		}
+		if !strings.Contains(string(data), "1.2.3.0/24") || !strings.Contains(string(data), "5.6.7.8/32") {
+			t.Errorf("förväntade hot-listans CIDR-block i den genererade JSON-regeln, men de saknas: %s", string(data))
+		}
+	})
+
+	t.Run("SourceObj med tom lista hoppar över regeln", func(t *testing.T) {
+		cfg := baseCfg([]config.Object{
+			{ID: "hotlist1", Name: "Spamhaus DROP", Type: config.ObjectTypeIPList, Values: []string{}},
+		})
+		data, err := adapter.RenderJSON(cfg)
+		if err != nil {
+			t.Fatalf("RenderJSON misslyckades: %v", err)
+		}
+		if strings.Contains(string(data), "Block Spamhaus") {
+			t.Errorf("en SourceObj som löser till en TOM lista fick ändå en genererad regel — det skulle matcha ALL trafik: %s", string(data))
+		}
+	})
+}
+
 func TestRenderJSONOpenVPNWANAllow(t *testing.T) {
 	adapter := NewAdapter()
 

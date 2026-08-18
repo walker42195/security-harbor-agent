@@ -62,6 +62,36 @@ func main() {
 
 	server := api.NewServer(*bindAddr, eng, auth)
 
+	// Fas 5: periodisk uppdatering av hot-listor/GeoIP-objekt (Spamhaus,
+	// Tor-exit-noder, anpassade URL:er, landsblock). Körs var 15:e minut;
+	// varje objekt uppdateras bara när dess egen RefreshHours har passerat
+	// (se Engine.RefreshDueObjectSources), så detta är inte en 15-minuters
+	// hämtningsfrekvens per lista.
+	if !*dryRun {
+		threatFeedCtx, cancelThreatFeed := context.WithCancel(context.Background())
+		defer cancelThreatFeed()
+		go func() {
+			ticker := time.NewTicker(15 * time.Minute)
+			defer ticker.Stop()
+			refresh := func() {
+				ctx, cancel := context.WithTimeout(threatFeedCtx, 2*time.Minute)
+				defer cancel()
+				if n := eng.RefreshDueObjectSources(ctx); n > 0 {
+					fmt.Printf("[THREATFEED] Uppdaterade %d hot-lista/GeoIP-objekt\n", n)
+				}
+			}
+			refresh()
+			for {
+				select {
+				case <-threatFeedCtx.Done():
+					return
+				case <-ticker.C:
+					refresh()
+				}
+			}
+		}()
+	}
+
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 

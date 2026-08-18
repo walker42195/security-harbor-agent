@@ -124,11 +124,27 @@ const (
 
 // Object representerar ett återanvändbart nätverks- eller host-objekt.
 type Object struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Type        ObjectType `json:"type"`
-	Values      []string   `json:"values"`      // IP-adresser, CIDR, eller medlems-IDn vid group
-	Description string     `json:"description"`
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Type        ObjectType    `json:"type"`
+	Values      []string      `json:"values"`      // IP-adresser, CIDR, eller medlems-IDn vid group
+	Description string        `json:"description"`
+	Source      *ObjectSource `json:"source,omitempty"` // Fas 5: gör Values automatiskt uppdaterade från en extern källa
+}
+
+// ObjectSource beskriver en extern, automatiskt uppdaterad källa för ett
+// iplist- eller geoip-objekts Values (Fas 5 — Hot-listor & GeoIP). Agenten
+// (pkg/threatfeed) hämtar och skriver om Values med jämna mellanrum; GUI:t
+// visar bara status (LastUpdated/LastError/EntryCount) och kan trigga en
+// omedelbar uppdatering.
+type ObjectSource struct {
+	Kind         string `json:"kind"`                   // "spamhaus_drop", "spamhaus_edrop", "tor_exit_nodes", "custom_url", "geoip_country"
+	URL          string `json:"url,omitempty"`          // Endast för kind="custom_url"
+	CountryCode  string `json:"country_code,omitempty"` // Endast för kind="geoip_country", ISO 3166-1 alpha-2 (t.ex. "RU")
+	RefreshHours int    `json:"refresh_hours"`           // Hur ofta listan uppdateras, standard 24
+	LastUpdated  string `json:"last_updated,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
+	EntryCount   int    `json:"entry_count,omitempty"`
 }
 
 // Service representerar en protokoll/port-definition.

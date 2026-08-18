@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
+	"github.com/walker42195/security-harbor-agent/pkg/threatfeed"
 )
 
 type State string
@@ -235,6 +237,87 @@ func (e *Engine) rollbackLocked(ctx context.Context, user string) error {
 func (e *Engine) GetWireGuardServerPublicKey() (string, error) {
 	_, pub, err := e.store.EnsureWireGuardServerKeys()
 	return pub, err
+}
+
+// RefreshObjectSource hämtar om ett enskilt Object med automatisk källa
+// (Fas 5 — hot-lista/GeoIP) via pkg/threatfeed, skriver om Values via
+// Store.UpdateObjectValues och applicerar sedan om nftables (bara nftables,
+// se ReapplyNftablesOnly) så att ändringen faktiskt slår igenom direkt.
+// Ett fetch-fel sparas i objektets Source.LastError (synligt i GUI:t) men
+// stoppar INTE resten av flödet eller ersätter en fungerande lista med tom
+// data (pkg/threatfeed.Fetch vägrar redan returnera en tom lista som "OK").
+func (e *Engine) RefreshObjectSource(ctx context.Context, objID string) error {
+	cfg := e.store.GetRunningConfig()
+	var src *config.ObjectSource
+	for _, obj := range cfg.Objects {
+		if obj.ID == objID {
+			src = obj.Source
+			break
+		}
+	}
+	if src == nil {
+		return fmt.Errorf("objekt %q saknar en automatisk källa", objID)
+	}
+
+	values, fetchErr := threatfeed.Fetch(src.Kind, src.URL, src.CountryCode)
+	if updErr := e.store.UpdateObjectValues(objID, values, fetchErr); updErr != nil {
+		return updErr
+	}
+	if fetchErr != nil {
+		return fetchErr
+	}
+	return e.ReapplyNftablesOnly(ctx)
+}
+
+// RefreshDueObjectSources går igenom alla Object med automatisk källa i
+// running-konfigurationen och uppdaterar dem vars RefreshHours har passerat
+// sedan LastUpdated (eller som aldrig hämtats än). Kallas periodiskt från en
+// bakgrundsgoroutine i main.go. Returnerar antalet objekt som faktiskt
+// uppdaterades (för loggning).
+func (e *Engine) RefreshDueObjectSources(ctx context.Context) int {
+	cfg := e.store.GetRunningConfig()
+	if cfg == nil {
+		return 0
+	}
+
+	refreshed := 0
+	for _, obj := range cfg.Objects {
+		if obj.Source == nil {
+			continue
+		}
+		hours := obj.Source.RefreshHours
+		if hours <= 0 {
+			hours = 24
+		}
+		due := true
+		if obj.Source.LastUpdated != "" {
+			if t, err := time.Parse(time.RFC3339, obj.Source.LastUpdated); err == nil {
+				due = time.Since(t) >= time.Duration(hours)*time.Hour
+			}
+		}
+		if !due {
+			continue
+		}
+		if err := e.RefreshObjectSource(ctx, obj.ID); err != nil {
+			log.Printf("[THREATFEED] misslyckades uppdatera objekt %q (%s): %v", obj.Name, obj.Source.Kind, err)
+			continue
+		}
+		refreshed++
+	}
+	return refreshed
+}
+
+// ReapplyNftablesOnly appliceras efter en bakgrundsuppdatering av en
+// hot-lista/GeoIP-objekts Values (Fas 5, pkg/threatfeed) — medvetet begränsat
+// till nftables (inte hela applyBackends) eftersom en periodisk listuppdatering
+// annars skulle starta om DHCP/WireGuard/OpenVPN i onödan (t.ex. tappa
+// aktiva VPN-tunnlar) för en ändring som bara påverkar IP-mängder.
+func (e *Engine) ReapplyNftablesOnly(ctx context.Context) error {
+	cfg := e.store.GetRunningConfig()
+	if _, err := e.nftAdapter.ApplyConfig(ctx, cfg, false); err != nil {
+		return fmt.Errorf("nftables: %w", err)
+	}
+	return nil
 }
 
 // GetOpenVPNCACertPEM returnerar (och vid behov genererar) brandväggens
