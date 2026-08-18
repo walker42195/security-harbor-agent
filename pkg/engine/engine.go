@@ -247,12 +247,22 @@ func (e *Engine) GetWireGuardServerPublicKey() (string, error) {
 // stoppar INTE resten av flödet eller ersätter en fungerande lista med tom
 // data (pkg/threatfeed.Fetch vägrar redan returnera en tom lista som "OK").
 func (e *Engine) RefreshObjectSource(ctx context.Context, objID string) error {
-	cfg := e.store.GetRunningConfig()
+	// Sök candidate FÖRE running: ett nyss skapat hot-lista/GeoIP-objekt
+	// finns bara i candidate tills det appliceras+bekräftas, men GUI:t
+	// triggar ändå en direkt hämtning vid skapandet för att visa en
+	// förhandsvisning av listans innehåll innan användaren väljer att
+	// applicera — det påverkar inte brandväggen (ReapplyNftablesOnly
+	// applicerar bara running, se nedan).
 	var src *config.ObjectSource
-	for _, obj := range cfg.Objects {
-		if obj.ID == objID {
-			src = obj.Source
-			break
+	for _, cfg := range []*config.Config{e.store.GetCandidateConfig(), e.store.GetRunningConfig()} {
+		if cfg == nil || src != nil {
+			continue
+		}
+		for _, obj := range cfg.Objects {
+			if obj.ID == objID {
+				src = obj.Source
+				break
+			}
 		}
 	}
 	if src == nil {
