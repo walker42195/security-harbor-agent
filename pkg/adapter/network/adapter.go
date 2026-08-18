@@ -67,7 +67,16 @@ func (a *Adapter) DiscoverInterfaces() ([]DiscoveredInterface, error) {
 	return result, nil
 }
 
-// PopulateDynamicIPs populerar konfigurationens DHCP-gränssnitt med deras aktiva Linux IP-adresser.
+// PopulateDynamicIPs populerar konfigurationens DHCP-gränssnitt med deras
+// aktiva Linux IP-adress OCH default gateway. Statiska gränssnitt rörs
+// inte (deras IPv4/Gateway kommer redan från den deklarativa configen).
+//
+// cfg.Interfaces kopieras till en ny slice innan mutation — cfg kan komma
+// direkt från store.GetRunningConfig() via en shallow `cfgCopy := *cfg` i
+// API-handlern, och en shallow struct-kopia delar fortfarande samma
+// underliggande []Interface-array. Att skriva i den hade tyst mutaterat
+// den RIKTIGA lagrade running-configen (inte bara svarskopian) varje gång
+// någon läste /api/v1/config/running.
 func (a *Adapter) PopulateDynamicIPs(cfg *config.Config) {
 	if cfg == nil {
 		return
@@ -82,8 +91,11 @@ func (a *Adapter) PopulateDynamicIPs(cfg *config.Config) {
 		discMap[d.Name] = d.IPs
 	}
 
-	for i := range cfg.Interfaces {
-		iface := &cfg.Interfaces[i]
+	ifaces := make([]config.Interface, len(cfg.Interfaces))
+	copy(ifaces, cfg.Interfaces)
+
+	for i := range ifaces {
+		iface := &ifaces[i]
 		if iface.AddressType == "dhcp" || iface.IPv4 == "" {
 			if ips, ok := discMap[iface.Device]; ok {
 				for _, ip := range ips {
@@ -94,7 +106,33 @@ func (a *Adapter) PopulateDynamicIPs(cfg *config.Config) {
 				}
 			}
 		}
+		if iface.AddressType == "dhcp" {
+			if gw := defaultGatewayFor(iface.Device); gw != "" {
+				iface.Gateway = gw
+			}
+		}
 	}
+	cfg.Interfaces = ifaces
+}
+
+// defaultGatewayFor läser default-gatewayen för ett specifikt gränssnitt
+// (relevant för WAN i "dhcp"-läge, där gatewayen kommer från ISP:ns
+// DHCP-svar och inte finns i den deklarativa configen).
+func defaultGatewayFor(device string) string {
+	if device == "" {
+		return ""
+	}
+	out, err := exec.Command("ip", "-4", "route", "show", "default", "dev", device).Output()
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(string(out))
+	for i, f := range fields {
+		if f == "via" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
 }
 
 // ApplyInterfaceConfig tillämpar IP-adresser, länkstatus och VLAN-gränssnitt på Linux.
