@@ -114,7 +114,8 @@ func objectMatchExpr(cfg *config.Config, objID, field string) (expr []interface{
 		return nil, true
 	}
 	cidrs := resolveObjectCIDRs(cfg, objID, map[string]bool{})
-	if len(cidrs) == 0 {
+	elements := cidrsToSetElements(cidrs)
+	if len(elements) == 0 {
 		return nil, false
 	}
 	return []interface{}{
@@ -122,10 +123,36 @@ func objectMatchExpr(cfg *config.Config, objID, field string) (expr []interface{
 			"match": map[string]interface{}{
 				"op":    "==",
 				"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": field}},
-				"right": map[string]interface{}{"set": cidrs},
+				"right": map[string]interface{}{"set": elements},
 			},
 		},
 	}, false
+}
+
+// cidrsToSetElements omvandlar en lista av IP/CIDR-strängar till nftables
+// JSON-mängdelement. En bar CIDR-sträng som "1.2.3.0/24" är INTE giltig
+// direkt i "set"-listan — nft -j försöker då tolka den som ett hostnamn att
+// DNS-slå upp (`Could not resolve hostname`), upptäckt vid skarp testning
+// mot 10.0.0.163 med en riktig Spamhaus DROP-lista (1693 poster) 2026-08-18.
+// CIDR-poster måste uttryckas som {"prefix":{"addr":..,"len":..}} — enstaka
+// IP-adresser utan "/" fungerar dock fint som råa strängar.
+func cidrsToSetElements(cidrs []string) []interface{} {
+	var elements []interface{}
+	for _, c := range cidrs {
+		if !strings.Contains(c, "/") {
+			elements = append(elements, c)
+			continue
+		}
+		addr, lenStr, ok := strings.Cut(c, "/")
+		length, err := strconv.Atoi(lenStr)
+		if !ok || err != nil {
+			continue
+		}
+		elements = append(elements, map[string]interface{}{
+			"prefix": map[string]interface{}{"addr": addr, "len": length},
+		})
+	}
+	return elements
 }
 
 type Adapter struct {

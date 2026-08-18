@@ -225,8 +225,18 @@ func TestRenderJSONPolicyObjectMatching(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RenderJSON misslyckades: %v", err)
 		}
-		if !strings.Contains(string(data), "1.2.3.0/24") || !strings.Contains(string(data), "5.6.7.8/32") {
-			t.Errorf("förväntade hot-listans CIDR-block i den genererade JSON-regeln, men de saknas: %s", string(data))
+		// CIDR-poster måste vara strukturerade {"prefix":{"addr":..,"len":..}}
+		// i JSON:en, inte bara-strängen "1.2.3.0/24" — nft -j tolkar annars
+		// bar-strängen som ett hostnamn att DNS-slå upp och avvisar hela
+		// regeln (upptäckt vid skarp testning 2026-08-18).
+		if !strings.Contains(string(data), `"addr": "1.2.3.0"`) || !strings.Contains(string(data), `"len": 24`) {
+			t.Errorf("förväntade en strukturerad prefix-post för 1.2.3.0/24 i den genererade JSON-regeln, men den saknas: %s", string(data))
+		}
+		if strings.Contains(string(data), `"1.2.3.0/24"`) {
+			t.Errorf("hittade CIDR som en RÅ STRÄNG i set-elementen — nft -j avvisar det med \"Could not resolve hostname\": %s", string(data))
+		}
+		if !strings.Contains(string(data), `"addr": "5.6.7.8"`) {
+			t.Errorf("förväntade en strukturerad prefix-post för 5.6.7.8/32 i den genererade JSON-regeln, men den saknas: %s", string(data))
 		}
 	})
 
