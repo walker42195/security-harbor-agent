@@ -11,6 +11,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/suricata"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/syslog"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
@@ -33,23 +34,32 @@ type Engine struct {
 	dhcpAdapter    *dhcp.Adapter
 	wgAdapter      *wireguard.Adapter
 	ovpnAdapter    *openvpn.Adapter
-	dnsAdapter     *dns.Adapter
-	syslogAdapter  *syslog.Adapter
-	state          State
-	confirmTimer   *time.Timer
-	unconfirmedCfg *config.Config
+	dnsAdapter      *dns.Adapter
+	syslogAdapter   *syslog.Adapter
+	suricataAdapter *suricata.Adapter
+	state           State
+	confirmTimer    *time.Timer
+	unconfirmedCfg  *config.Config
+
+	// idsLastAlertTS håller den senaste larm-tidsstämpeln vi redan hanterat
+	// för auto-block (Fas 9), så samma larm inte blockeras om och om igen.
+	// Rensas vid omstart (samma lättviktiga i-minnet-approach som resten av
+	// engine-tillståndet) — värsta fallet efter en omstart är att de senast
+	// hanterade larmen bedöms på nytt, inte att något missas.
+	idsLastAlertTS string
 }
 
-func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter, syslogAdapter *syslog.Adapter) *Engine {
+func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter, syslogAdapter *syslog.Adapter, suricataAdapter *suricata.Adapter) *Engine {
 	return &Engine{
-		store:         st,
-		nftAdapter:    nftAdapter,
-		dhcpAdapter:   dhcpAdapter,
-		wgAdapter:     wgAdapter,
-		ovpnAdapter:   ovpnAdapter,
-		dnsAdapter:    dnsAdapter,
-		syslogAdapter: syslogAdapter,
-		state:         StateIdle,
+		store:           st,
+		nftAdapter:      nftAdapter,
+		dhcpAdapter:     dhcpAdapter,
+		wgAdapter:       wgAdapter,
+		ovpnAdapter:     ovpnAdapter,
+		dnsAdapter:      dnsAdapter,
+		syslogAdapter:   syslogAdapter,
+		suricataAdapter: suricataAdapter,
+		state:           StateIdle,
 	}
 }
 
@@ -118,6 +128,10 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 
 	if err := e.syslogAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
 		return fmt.Errorf("syslog: %w", err)
+	}
+
+	if err := e.suricataAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+		return fmt.Errorf("suricata: %w", err)
 	}
 
 	return nil
@@ -470,6 +484,77 @@ func (e *Engine) ReapplyNftablesOnly(ctx context.Context) error {
 		return fmt.Errorf("nftables: %w", err)
 	}
 	return nil
+}
+
+// GetSecurityEvents returnerar de senaste Suricata-larmen (Fas 9), läst
+// direkt ur eve.json vid varje anrop — samma "ingen egen lagring, läs om
+// vid behov"-princip som parseFirewallLog använder mot journald.
+func (e *Engine) GetSecurityEvents(maxLines int) ([]config.SecurityEvent, error) {
+	return suricata.ReadRecentAlerts(e.suricataAdapter.EvePath(), maxLines)
+}
+
+// ProcessIDSAutoBlock läser larm sedan senast (idsLastAlertTS) och lägger
+// nya käll-IP:n med severity <= AutoBlockSeverity till det Object
+// (AutoBlockObjectID) användaren själv pekat ut i IDS-inställningarna —
+// samma "skriv direkt i running/candidate, applicera bara om nftables"-
+// mönster som hotlist-uppdatering (Fas 5, se RefreshObjectSource). Skapar
+// ALDRIG objektet eller en policy själv. Kallas periodiskt från en
+// bakgrundsgoroutine i main.go.
+func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
+	cfg := e.store.GetRunningConfig()
+	if cfg == nil || cfg.IDS == nil || !cfg.IDS.Enabled || !cfg.IDS.AutoBlock || cfg.IDS.AutoBlockObjectID == "" {
+		return nil
+	}
+
+	events, err := e.GetSecurityEvents(2000)
+	if err != nil {
+		return fmt.Errorf("ids: kunde inte läsa larm: %w", err)
+	}
+
+	var obj *config.Object
+	for i := range cfg.Objects {
+		if cfg.Objects[i].ID == cfg.IDS.AutoBlockObjectID {
+			obj = &cfg.Objects[i]
+			break
+		}
+	}
+	if obj == nil {
+		return fmt.Errorf("ids: auto-block-objektet %q finns inte", cfg.IDS.AutoBlockObjectID)
+	}
+
+	blocked := map[string]bool{}
+	for _, ip := range obj.Values {
+		blocked[ip] = true
+	}
+
+	newestSeen := e.idsLastAlertTS
+	added := false
+	for _, ev := range events {
+		if e.idsLastAlertTS != "" && ev.Timestamp <= e.idsLastAlertTS {
+			continue
+		}
+		if ev.Timestamp > newestSeen {
+			newestSeen = ev.Timestamp
+		}
+		if ev.Severity == 0 || ev.Severity > cfg.IDS.AutoBlockSeverity || ev.SrcIP == "" {
+			continue
+		}
+		if !blocked[ev.SrcIP] {
+			blocked[ev.SrcIP] = true
+			obj.Values = append(obj.Values, ev.SrcIP)
+			added = true
+		}
+	}
+	e.idsLastAlertTS = newestSeen
+
+	if !added {
+		return nil
+	}
+
+	if err := e.store.UpdateObjectValuesDirect(obj.ID, obj.Values); err != nil {
+		return fmt.Errorf("ids: kunde inte spara auto-block-objektet: %w", err)
+	}
+	return e.ReapplyNftablesOnly(ctx)
 }
 
 // GetOpenVPNCACertPEM returnerar (och vid behov genererar) brandväggens

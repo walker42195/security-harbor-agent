@@ -15,6 +15,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/suricata"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/syslog"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/api"
@@ -50,7 +51,8 @@ func main() {
 	ovpnAdapter := openvpn.NewAdapter("")
 	dnsAdapter := dns.NewAdapter("")
 	syslogAdapter := syslog.NewAdapter("")
-	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter, syslogAdapter)
+	suricataAdapter := suricata.NewAdapter("", "")
+	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter, syslogAdapter, suricataAdapter)
 	auth := api.NewAuthManager()
 
 	// Applicera initial konfiguration vid start (om ej dry-run)
@@ -115,6 +117,32 @@ func main() {
 					return
 				case <-ticker.C:
 					refresh()
+				}
+			}
+		}()
+	}
+
+	// Fas 9: periodisk bevakning av Suricata-larm för IDS.AutoBlock (se
+	// Engine.ProcessIDSAutoBlock). Var 30:e sekund är gott nog för en
+	// "eftersläpande" auto-blockering (paketet som utlöste larmet har redan
+	// passerat oavsett) — ingen inline/realtidsblockering byggs i det här
+	// steget, se kommentaren i pkg/config/model.go:IDSConfig.
+	if !*dryRun {
+		idsCtx, cancelIDS := context.WithCancel(context.Background())
+		defer cancelIDS()
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-idsCtx.Done():
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(idsCtx, 20*time.Second)
+					if err := eng.ProcessIDSAutoBlock(ctx); err != nil {
+						log.Printf("[IDS] auto-block misslyckades: %v", err)
+					}
+					cancel()
 				}
 			}
 		}()

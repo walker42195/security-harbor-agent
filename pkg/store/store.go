@@ -211,6 +211,48 @@ func (s *Store) UpdateObjectValues(objID string, values []string, fetchErr error
 	return nil
 }
 
+// UpdateObjectValuesDirect skriver om Values för ETT VANLIGT Object (utan
+// Source, till skillnad från UpdateObjectValues) i BÅDE running och
+// candidate om det finns i båda. Används av IDS-auto-block (Fas 9) för att
+// lägga till larmade käll-IP:n i ett objekt användaren själv pekat ut —
+// precis som hotlist-uppdatering går det INTE via Safe Apply/candidate-
+// bekräftelse. Anroparen (Engine) ansvarar för att sedan trigga en ny
+// nftables-applicering.
+func (s *Store) UpdateObjectValuesDirect(objID string, values []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	apply := func(cfg *config.Config) {
+		if cfg == nil {
+			return
+		}
+		for i := range cfg.Objects {
+			if cfg.Objects[i].ID != objID {
+				continue
+			}
+			found = true
+			cfg.Objects[i].Values = values
+		}
+	}
+	apply(s.runningCfg)
+	apply(s.candidateCfg)
+
+	if !found {
+		return fmt.Errorf("objekt %q hittades inte", objID)
+	}
+
+	if err := s.saveConfigLocked(filepath.Join(s.baseDir, "running.json"), s.runningCfg); err != nil {
+		return err
+	}
+	if s.candidateCfg != nil {
+		if err := s.saveConfigLocked(filepath.Join(s.baseDir, "candidate.json"), s.candidateCfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func dnsBlocklistPath(baseDir, id string) string {
 	return filepath.Join(baseDir, "dns_blocklist_"+id+".txt")
 }

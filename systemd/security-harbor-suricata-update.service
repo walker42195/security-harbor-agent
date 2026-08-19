@@ -1,0 +1,11 @@
+[Unit]
+Description=Security Harbor - hämta uppdaterat Suricata-regelset (ET Open)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/suricata-update
+# Körs som root (systemd default) — suricata-update behöver skriva till
+# /var/lib/suricata/rules. Fristående, syftesbyggd process precis som
+# uppdatering av hot-listor/GeoIP (Fas 5) — agenten triggar bara körningen
+# (se systemd/security-harbor-suricata-update.timer) och läser sedan bara
+# larmen som Suricata själv skriver, den skriver ingenting hit själv.

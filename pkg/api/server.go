@@ -59,6 +59,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/conntrack", s.authMiddleware(s.handleConntrack))
 	mux.HandleFunc("/api/v1/diagnostics/firewall-log", s.authMiddleware(s.handleFirewallLog))
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
+	mux.HandleFunc("/api/v1/diagnostics/security-events", s.authMiddleware(s.handleSecurityEvents))
 	mux.HandleFunc("/api/v1/vpn/wireguard/server-info", s.authMiddleware(s.handleWireGuardServerInfo))
 	mux.HandleFunc("/api/v1/vpn/openvpn/ca-info", s.authMiddleware(s.handleOpenVPNCAInfo))
 	mux.HandleFunc("/api/v1/policies/hit-counts", s.authMiddleware(s.handleHitCounts))
@@ -492,6 +493,19 @@ func (s *Server) handleFirewallLog(w http.ResponseWriter, r *http.Request) {
 	entries := parseFirewallLog()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(entries)
+}
+
+// handleSecurityEvents returnerar de senaste Suricata-larmen (Fas 9).
+// Läsrättighet räcker (admin+viewer) — precis som conntrack/firewall-log,
+// det är bara diagnostik, ingen handling utförs.
+func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
+	events, err := s.engine.GetSecurityEvents(1000)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(events)
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {

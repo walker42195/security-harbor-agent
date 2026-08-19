@@ -17,6 +17,24 @@ type Config struct {
 	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`   // VPN-serverkonfiguration (Fas 4)
 	DNS        *DNSConfig       `json:"dns,omitempty"`       // DNS-resolver & domänfiltrering (Fas 6)
 	Syslog     *SyslogConfig    `json:"syslog,omitempty"`    // Centraliserad logg-vidarebefordran (Fas 8)
+	IDS        *IDSConfig       `json:"ids,omitempty"`       // Suricata IDS (Fas 9)
+}
+
+// IDSConfig styr Suricata i passivt IDS-läge (af-packet, INTE inline/
+// NFQUEUE-läge — se pkg/adapter/suricata). AutoBlock lägger automatiskt
+// käll-IP:n från larm på/under AutoBlockSeverity till ett REDAN
+// EXISTERANDE Object (AutoBlockObjectID, t.ex. ett vanligt "iplist"-objekt
+// som användaren skapat i Objekt-vyn) — samma "skriv om Values direkt i
+// running"-mönster som hotlist-uppdatering (Fas 5) använder. Agenten
+// skapar ALDRIG objektet eller en policy automatiskt: blockering kräver
+// fortfarande att användaren själv har en Deny-policy som refererar
+// objektet — detta bygger bara upp/underhåller listans innehåll.
+type IDSConfig struct {
+	Enabled           bool   `json:"enabled"`
+	Interface         string `json:"interface"`
+	AutoBlock         bool   `json:"auto_block"`
+	AutoBlockObjectID string `json:"auto_block_object_id,omitempty"`
+	AutoBlockSeverity int    `json:"auto_block_severity"` // t.ex. 2 — bara larm med severity <= detta värde triggar block (1=högst allvarlighetsgrad)
 }
 
 // SyslogConfig styr vidarebefordran av brandväggens systemloggar (bl.a.
@@ -339,4 +357,20 @@ type FirewallLogEntry struct {
 	Protocol   string `json:"protocol"`
 	SrcPort    int    `json:"src_port,omitempty"`
 	DstPort    int    `json:"dst_port,omitempty"`
+}
+
+// SecurityEvent representerar ett larm från Suricata (Fas 9 — IDS/IPS),
+// utplockat ur eve.json. Precis som FirewallLogEntry lagras dessa aldrig i
+// den deklarativa configen — de läses bara ut vid varje förfrågan (se
+// pkg/adapter/suricata.ReadRecentAlerts).
+type SecurityEvent struct {
+	Timestamp string `json:"timestamp"`
+	Severity  int    `json:"severity"` // 1 (högst) - 3 (lägst), Suricatas egen skala
+	Signature string `json:"signature"`
+	Category  string `json:"category,omitempty"`
+	SrcIP     string `json:"src_ip"`
+	SrcPort   int    `json:"src_port,omitempty"`
+	DstIP     string `json:"dst_ip"`
+	DstPort   int    `json:"dst_port,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
 }
