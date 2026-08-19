@@ -637,3 +637,105 @@ func TestRenderJSONGatewayModeStillHasForwardAndNAT(t *testing.T) {
 		t.Error("förväntade nat-kedjorna i gateway-läge (tomt Mode-fält), men saknas")
 	}
 }
+
+// TestRenderJSONZoneRestrictsForwardTraffic skyddar mot en riktig
+// säkerhetslucka hittad 2026-08-19: SourceZone/DestZone sattes av GUI:t
+// men lästes ALDRIG av FORWARD-kedjans regelgenerering — en zon-begränsad
+// policy utan ett valt objekt blev i praktiken en ANY-till-ANY-regel.
+func TestRenderJSONZoneRestrictsForwardTraffic(t *testing.T) {
+	adapter := NewAdapter()
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+			{ID: "srv0", Device: "ens19.10", Parent: "ens19", VLANID: 10, Zone: "SERVERS", Enabled: true, AddressType: "static", IPv4: "10.0.10.1/24"},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-servers-to-lan", Name: "Servers till LAN RDP", Enabled: true,
+				SourceZone: "SERVERS", DestZone: "LAN", SourceObj: "ANY", DestObj: "ANY",
+				Service: "RDP", Action: config.ActionAccept,
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	s := string(data)
+
+	if !strings.Contains(s, `"iifname"`) || !strings.Contains(s, `"ens19.10"`) {
+		t.Errorf("förväntade en iifname-matchning mot SERVERS-zonens gränssnitt (ens19.10), men saknas: %s", s)
+	}
+	if !strings.Contains(s, `"oifname"`) || !strings.Contains(s, `"ens19"`) {
+		t.Errorf("förväntade en oifname-matchning mot LAN-zonens gränssnitt (ens19), men saknas: %s", s)
+	}
+}
+
+// TestRenderJSONZoneWithNoMatchingInterfaceSkipsRule speglar
+// TestRenderJSONPolicyObjectMatching/tom-lista-fallet: en zon som inte
+// matchar något aktiverat gränssnitt (t.ex. en felstavning) ska hoppa
+// över regeln helt, INTE bli en matcha-allt-regel.
+func TestRenderJSONZoneWithNoMatchingInterfaceSkipsRule(t *testing.T) {
+	adapter := NewAdapter()
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-typo-zone", Name: "Felstavad zon-policy", Enabled: true,
+				SourceZone: "SERVRAR", DestZone: "ANY", SourceObj: "ANY", DestObj: "ANY",
+				Service: "ANY", Action: config.ActionAccept,
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	if strings.Contains(string(data), "Felstavad zon-policy") {
+		t.Errorf("en SourceZone som inte matchar något gränssnitt fick ändå en genererad regel — det skulle matcha ALL trafik: %s", string(data))
+	}
+}
+
+// TestRenderJSONZoneAnyIsUnrestricted är ett regressionsskydd: en policy
+// utan zon-begränsning (SourceZone/DestZone tomt eller "ANY", som alla
+// befintliga tester i den här filen redan använder) ska fortsätta fungera
+// precis som innan zoneMatchExpr fanns.
+func TestRenderJSONZoneAnyIsUnrestricted(t *testing.T) {
+	adapter := NewAdapter()
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-any-zone", Name: "Ingen zonbegränsning", Enabled: true,
+				SourceZone: "ANY", DestZone: "", SourceObj: "ANY", DestObj: "ANY",
+				Service: "ANY", Action: config.ActionAccept,
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	if !strings.Contains(string(data), "Ingen zonbegränsning") {
+		t.Errorf("en policy med SourceZone=ANY/tomt DestZone ska fortfarande generera en regel: %s", string(data))
+	}
+}

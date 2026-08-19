@@ -246,6 +246,78 @@ func cidrsToSetElements(cidrs []string) []interface{} {
 	return elements
 }
 
+// zoneMatchExpr bygger ett nftables match-uttryck som begränsar en policy
+// till trafik som passerar in/ut via ett gränssnitt i den angivna zonen
+// (via `meta iifname`/`oifname` mot en mängd device-namn). Samma
+// (nil,true)/(nil,false)-kontrakt som objectMatchExpr ovan: (nil,true) =
+// zoneSpec är "ANY"/tomt, ingen begränsning; (nil,false) = zoneSpec var
+// satt men matchade INGET aktiverat gränssnitt (t.ex. en felstavad zon) —
+// anroparen MÅSTE då hoppa över regeln helt, annars blir en tom
+// uttryckslista "matcha allt" i nftables semantik (samma fälla som
+// objectMatchExpr redan skyddar mot för tomma objekt-listor).
+//
+// zoneSpec kan vara kommaseparerad ("LAN, SERVERS") eftersom GUI:t skriver
+// flervalda zoner så — se policies_screen.dart:s resolveObjOrZones. Två
+// syntetiska GUI-strängar hanteras särskilt eftersom de inte matchar något
+// riktigt Zone.Name: "Any-External (WAN)" → wanDevices, "Any-Trusted
+// (LAN)" → samma icke-WAN-katalog som lanDevices redan beräknas som.
+//
+// Upptäckt 2026-08-19: SourceZone/DestZone sattes av GUI:t men lästes
+// ALDRIG av FORWARD-kedjans regelgenerering — en zon-begränsad policy utan
+// ett valt objekt blev i praktiken en ANY-till-ANY-regel i den skarpa
+// rulesetet, en riktig säkerhetslucka, inte bara en kosmetisk GUI-detalj.
+func zoneMatchExpr(cfg *config.Config, zoneSpec, metaKey string, wanDevices, lanDevices []string) (expr []interface{}, isAny bool) {
+	trimmed := strings.TrimSpace(zoneSpec)
+	if trimmed == "" || strings.EqualFold(trimmed, "ANY") {
+		return nil, true
+	}
+
+	seen := map[string]bool{}
+	var devices []string
+	addDevice := func(d string) {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			devices = append(devices, d)
+		}
+	}
+
+	for _, part := range strings.Split(trimmed, ",") {
+		zoneName := strings.TrimSpace(part)
+		if zoneName == "" {
+			continue
+		}
+		switch zoneName {
+		case "Any-External (WAN)":
+			for _, d := range wanDevices {
+				addDevice(d)
+			}
+		case "Any-Trusted (LAN)":
+			for _, d := range lanDevices {
+				addDevice(d)
+			}
+		default:
+			for _, iface := range cfg.Interfaces {
+				if iface.Enabled && iface.Zone == zoneName && iface.Device != "" {
+					addDevice(iface.Device)
+				}
+			}
+		}
+	}
+
+	if len(devices) == 0 {
+		return nil, false
+	}
+	return []interface{}{
+		map[string]interface{}{
+			"match": map[string]interface{}{
+				"op":    "==",
+				"left":  map[string]interface{}{"meta": map[string]interface{}{"key": metaKey}},
+				"right": map[string]interface{}{"set": devices},
+			},
+		},
+	}, false
+}
+
 type Adapter struct {
 	tableName string
 	family    string
@@ -626,6 +698,18 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				continue
 			}
 
+			// Zon-begränsning (se zoneMatchExpr-dokumentationen ovan för
+			// bakgrunden till varför detta behövdes) — samma tomt-mängd-
+			// skydd som för objekten ovan.
+			srcIfaceExpr, srcZoneIsAny := zoneMatchExpr(cfg, pol.SourceZone, "iifname", wanDevices, lanDevices)
+			if !srcZoneIsAny && srcIfaceExpr == nil {
+				continue
+			}
+			dstIfaceExpr, dstZoneIsAny := zoneMatchExpr(cfg, pol.DestZone, "oifname", wanDevices, lanDevices)
+			if !dstZoneIsAny && dstIfaceExpr == nil {
+				continue
+			}
+
 			for _, svcExpr := range resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{}) {
 				rule := &Rule{
 					Family:  a.family,
@@ -635,6 +719,8 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				}
 
 				rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
+				rule.Expr = append(rule.Expr, srcIfaceExpr...)
+				rule.Expr = append(rule.Expr, dstIfaceExpr...)
 				rule.Expr = append(rule.Expr, srcExpr...)
 				rule.Expr = append(rule.Expr, dstExpr...)
 				rule.Expr = append(rule.Expr, svcExpr...)

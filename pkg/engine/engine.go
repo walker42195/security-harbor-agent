@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -196,6 +197,54 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 		return fmt.Errorf("konfigurationen måste ha minst ett gränssnitt")
 	}
 
+	// 3. Validera att varje policys zon-val faktiskt matchar något
+	// konfigurerat gränssnitt — annars hoppar nftables-adaptern (se
+	// zoneMatchExpr, pkg/adapter/nftables) tyst över regeln (samma skydd
+	// mot "matcha allt" som redan finns för tomma objekt-listor), vilket
+	// utan denna kontroll bara syns som "regeln gör aldrig något",
+	// obegripligt för en administratör som skrivit fel zonnamn.
+	for _, pol := range cfg.Policies {
+		if !pol.Enabled || pol.Local {
+			continue
+		}
+		if err := validatePolicyZone(cfg, pol.Name, "källzonen", pol.SourceZone); err != nil {
+			return err
+		}
+		if err := validatePolicyZone(cfg, pol.Name, "målzonen", pol.DestZone); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validatePolicyZone kontrollerar att varje kommaseparerad del av en
+// policys SourceZone/DestZone antingen är "ANY"/tom, en av GUI:ts två
+// syntetiska specialsträngar ("Any-External (WAN)"/"Any-Trusted (LAN)"),
+// eller matchar minst ett AKTIVERAT gränssnitts Zone-fält — samma
+// tolkning som zoneMatchExpr i pkg/adapter/nftables använder vid
+// regelgenerering, bara för validering istället för rendering.
+func validatePolicyZone(cfg *config.Config, policyName, label, zoneSpec string) error {
+	trimmed := strings.TrimSpace(zoneSpec)
+	if trimmed == "" || strings.EqualFold(trimmed, "ANY") {
+		return nil
+	}
+	for _, part := range strings.Split(trimmed, ",") {
+		zoneName := strings.TrimSpace(part)
+		if zoneName == "" || zoneName == "Any-External (WAN)" || zoneName == "Any-Trusted (LAN)" {
+			continue
+		}
+		matched := false
+		for _, iface := range cfg.Interfaces {
+			if iface.Enabled && iface.Zone == zoneName {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("policy %q: %s %q matchar inget konfigurerat och aktiverat gränssnitt", policyName, label, zoneName)
+		}
+	}
 	return nil
 }
 
