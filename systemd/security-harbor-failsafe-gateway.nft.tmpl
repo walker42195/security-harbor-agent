@@ -1,6 +1,14 @@
-# Security Harbor Failsafe nftables ruleset
+# Security Harbor Failsafe nftables ruleset — GATEWAY-läge.
 # Denna laddas av security-harbor-failsafe.service innan agenten startar.
-# Syfte: Garantera fail-closed på WAN samtidigt som SSH (22) och Management API (8443) tillåts på LAN.
+# Syfte: Garantera fail-closed på WAN samtidigt som SSH (22) och
+# Management API (8443) tillåts på LAN.
+#
+# Genereras av install.sh vid installationstillfället (INTE en statisk,
+# checkad-in fil — se install.sh) med det faktiska WAN-gränssnittets
+# devicenamn substituerat i {{WAN_DEVICE}} nedan. En statisk fil hade bara
+# råkat stämma på en enda referensmaskin och varit fel/farlig (öppnar
+# SSH/API mot ALLT som inte har det förväntade namnet) på vilken riktig
+# installation som helst med andra gränssnittsnamn.
 
 flush ruleset
 
@@ -15,7 +23,7 @@ table inet security_harbor_failsafe {
         ct state established,related accept
 
         # Tillåt SSH (22) och Management API (8443) på LAN / icke-WAN interfaces
-        iifname != "ens18" tcp dport { 22, 8443 } accept
+        iifname != "{{WAN_DEVICE}}" tcp dport { 22, 8443 } accept
 
         # Drop allt annat tyst (WAN är 100% stängd/stealth)
         drop

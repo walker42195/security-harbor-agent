@@ -36,7 +36,13 @@ type Store struct {
 // loadOrCreateMasterKey i masterkey.go) — genereras slumpmässigt vid
 // första anropet på en ny installation, laddas därefter från disk. Ingen
 // hårdkodad/delad nyckel någonstans i källkoden längre.
-func NewStore(baseDir string) (*Store, error) {
+//
+// seedMode styr VILKEN standardkonfiguration som skapas om baseDir är
+// tom (helt ny installation) — config.ModeGateway (eller "") för en
+// router/appliance-seed, config.ModeHost för enkortsdator-seed (Fas 13).
+// Rör bara den allra första uppstarten; en redan initierad installation
+// läser sin befintliga running.json oavsett vad som skickas in här.
+func NewStore(baseDir string, seedMode string) (*Store, error) {
 	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return nil, fmt.Errorf("misslyckades skapa store-katalog %s: %w", baseDir, err)
 	}
@@ -57,7 +63,7 @@ func NewStore(baseDir string) (*Store, error) {
 	}
 
 	// Ladda eller skapa standardkonfiguration
-	if err := s.loadOrInit(); err != nil {
+	if err := s.loadOrInit(seedMode); err != nil {
 		return nil, err
 	}
 
@@ -70,49 +76,13 @@ func NewStore(baseDir string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) loadOrInit() error {
+func (s *Store) loadOrInit(seedMode string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	runningPath := filepath.Join(s.baseDir, "running.json")
 	if _, err := os.Stat(runningPath); os.IsNotExist(err) {
-		// Skapa default initial konfiguration
-		defaultCfg := &config.Config{
-			Version:   1,
-			Revision:  1,
-			UpdatedAt: time.Now(),
-			Interfaces: []config.Interface{
-				{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
-				{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
-			},
-			Zones: []config.Zone{
-				{Name: "WAN", Description: "Utsida / Internet"},
-				{Name: "LAN", Description: "Internt nätverk"},
-				{Name: "SERVERS", Description: "Serverzon"},
-				{Name: "IOT", Description: "IoT-enheter"},
-				{Name: "VPN", Description: "VPN-klienter"},
-			},
-			Policies: []config.Policy{
-				{
-					ID:          "sys-ssh-lan",
-					Name:        "Tillåt SSH till brandväggen (LAN)",
-					Enabled:     true,
-					Priority:    1,
-					SourceZone:  "LAN",
-					DestZone:    "SELF",
-					Service:     "22",
-					Action:      config.ActionAccept,
-					Local:       true,
-					Critical:    true,
-					Description: "Tillåter SSH-inloggning till brandväggen själv från det interna nätverket. Om du inaktiverar denna behöver du en annan väg in (t.ex. tangentbord och skärm, eller seriekonsol) för att kunna administrera brandväggen.",
-				},
-			},
-			Settings: config.Settings{
-				HostName:           "security-harbor",
-				APIPort:            8443,
-				RollbackTimeoutSec: 30,
-			},
-		}
+		defaultCfg := defaultSeedConfig(seedMode)
 		s.runningCfg = defaultCfg
 		s.candidateCfg = defaultCfg
 		return s.saveConfigLocked(runningPath, defaultCfg)
@@ -131,6 +101,68 @@ func (s *Store) loadOrInit() error {
 	s.runningCfg = &cfg
 	s.candidateCfg = &cfg
 	return nil
+}
+
+// defaultSeedConfig bygger standardkonfigurationen för en helt ny
+// installation. Gateway-läge (default) behåller det ursprungliga,
+// dev-referensmiljö-formade seedet (ens18/ens19, en LAN-IP som råkar
+// matcha 10.0.0.163) av bakåtkompatibilitetsskäl — host-läge (Fas 13) får
+// ett genuint topologi-neutralt seed: ett enda, generiskt namngivet
+// interface, ingen WAN/LAN-uppdelning, ingen hårdkodad IP.
+func defaultSeedConfig(seedMode string) *config.Config {
+	base := config.Config{
+		Version:   1,
+		Revision:  1,
+		UpdatedAt: time.Now(),
+		Policies: []config.Policy{
+			{
+				ID:          "sys-ssh-lan",
+				Name:        "Tillåt SSH till brandväggen",
+				Enabled:     true,
+				Priority:    1,
+				SourceZone:  "LAN",
+				DestZone:    "SELF",
+				Service:     "22",
+				Action:      config.ActionAccept,
+				Local:       true,
+				Critical:    true,
+				Description: "Tillåter SSH-inloggning till brandväggen själv från det interna nätverket. Om du inaktiverar denna behöver du en annan väg in (t.ex. tangentbord och skärm, eller seriekonsol) för att kunna administrera brandväggen.",
+			},
+		},
+		Settings: config.Settings{
+			HostName:           "security-harbor",
+			APIPort:            8443,
+			RollbackTimeoutSec: 30,
+		},
+	}
+
+	if seedMode == config.ModeHost {
+		base.Settings.Mode = config.ModeHost
+		base.Interfaces = []config.Interface{
+			{ID: "host0", Device: "eth0", Zone: "HOST", Enabled: true, AddressType: "dhcp"},
+		}
+		base.Zones = []config.Zone{
+			{Name: "HOST", Description: "Denna dators enda gränssnitt"},
+		}
+		// SSH-policyn ovan pekar på SourceZone "LAN" — i host-läge finns
+		// ingen "LAN"-zon (bara "HOST"), så peka om den till den faktiska
+		// zonen.
+		base.Policies[0].SourceZone = "HOST"
+		return &base
+	}
+
+	base.Interfaces = []config.Interface{
+		{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+		{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+	}
+	base.Zones = []config.Zone{
+		{Name: "WAN", Description: "Utsida / Internet"},
+		{Name: "LAN", Description: "Internt nätverk"},
+		{Name: "SERVERS", Description: "Serverzon"},
+		{Name: "IOT", Description: "IoT-enheter"},
+		{Name: "VPN", Description: "VPN-klienter"},
+	}
+	return &base
 }
 
 func (s *Store) saveConfigLocked(path string, cfg *config.Config) error {

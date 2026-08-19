@@ -320,6 +320,25 @@ type Settings struct {
 	APIPort              int      `json:"api_port"`               // Standard 8443
 	AllowedManagementLAN []string `json:"allowed_management_lan"` // Tillåtna IP-nät för API
 	RollbackTimeoutSec   int      `json:"rollback_timeout_sec"`   // Standard 30 sekunder
+
+	// Mode styr agentens driftläge (Fas 13): "" eller "gateway" (standard,
+	// oförändrat beteende — router/appliance med FORWARD/NAT/DHCP) eller
+	// "host" (enkelkorts-/värddator-läge — bara INPUT/OUTPUT-hårdning,
+	// ingen FORWARD/NAT/DHCP/IDS, inget WAN/LAN-zonkrav). Se
+	// pkg/adapter/nftables.RenderJSON och Engine.applyBackends.
+	Mode string `json:"mode,omitempty"`
+}
+
+const (
+	ModeGateway = "gateway"
+	ModeHost    = "host"
+)
+
+// IsHostMode returnerar true om configen är i enkelkorts-/värddator-läge.
+// Tomt Mode-fält (befintliga/gamla installationer) räknas som gateway-läge
+// — bakåtkompatibelt default.
+func (c *Config) IsHostMode() bool {
+	return c.Settings.Mode == ModeHost
 }
 
 // ConntrackEntry representerar en aktiv stateful nätverksanslutning för diagnostik.

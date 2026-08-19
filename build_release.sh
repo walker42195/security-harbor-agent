@@ -17,14 +17,21 @@ GOOS=linux GOARCH=amd64 go build -o "$DIST_DIR/security-harbor-nmap-runner" ./cm
 GOOS=linux GOARCH=amd64 go build -o "$DIST_DIR/security-harbor-tcpdump-runner" ./cmd/security-harbor-tcpdump-runner
 echo "-> $DIST_DIR/security-harbor-agent, security-harbor-nmap-runner, security-harbor-tcpdump-runner"
 
-echo "=== 2. Kopierar systemd-enheter och polkit-regler ==="
+echo "=== 2. Kopierar systemd-enheter, polkit-regler och failsafe-mallar ==="
 mkdir -p "$DIST_DIR/systemd"
-cp systemd/*.service systemd/*.timer systemd/*.rules "$DIST_DIR/systemd/"
+cp systemd/*.service systemd/*.timer systemd/*.rules systemd/*.nft.tmpl "$DIST_DIR/systemd/"
 
-echo "=== 3. Kopierar install.sh ==="
+echo "=== 3. Kopierar install.sh och uninstall.sh ==="
 cp install.sh "$DIST_DIR/install.sh"
-chmod +x "$DIST_DIR/install.sh"
+cp uninstall.sh "$DIST_DIR/uninstall.sh"
+chmod +x "$DIST_DIR/install.sh" "$DIST_DIR/uninstall.sh"
+
+echo "=== 4. Paketerar som tarboll (för GitHub Release) ==="
+tar -czf "security-harbor-dist.tar.gz" -C "$DIST_DIR" .
+echo "-> security-harbor-dist.tar.gz"
 
 echo "=== Klart: $DIST_DIR/ är en fristående installationsbunt ==="
-echo "Kopiera hela katalogen till målmaskinen (t.ex. scp -r dist/ user@host:/tmp/security-harbor-install)"
+echo "Antingen: kopiera katalogen till målmaskinen (scp -r dist/ user@host:/tmp/security-harbor-install)"
 echo "och kör: sudo ./install.sh"
+echo "Eller: bifoga security-harbor-dist.tar.gz på en GitHub Release (se README) för"
+echo "att aktivera en-rads-installation via curl."

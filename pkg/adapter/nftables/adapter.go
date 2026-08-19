@@ -268,13 +268,22 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	}
 
+	// hostMode: enkelkorts-/värddator-läge (Fas 13) — bara INPUT/OUTPUT-
+	// hårdning, inga FORWARD/NAT-kedjor alls. En administratör som granskar
+	// regelsetet på sin bärbara dator ska inte se en tom "forward"-tabell.
+	hostMode := cfg.IsHostMode()
+
 	// 1. Chains
 	chains := []Chain{
 		{Family: a.family, Table: a.tableName, Name: "input", Type: "filter", Hook: "input", Prio: 0, Policy: "drop"},
-		{Family: a.family, Table: a.tableName, Name: "forward", Type: "filter", Hook: "forward", Prio: 0, Policy: "drop"},
 		{Family: a.family, Table: a.tableName, Name: "output", Type: "filter", Hook: "output", Prio: 0, Policy: "accept"},
-		{Family: a.family, Table: a.tableName, Name: "prerouting", Type: "nat", Hook: "prerouting", Prio: -100},
-		{Family: a.family, Table: a.tableName, Name: "postrouting", Type: "nat", Hook: "postrouting", Prio: 100},
+	}
+	if !hostMode {
+		chains = append(chains,
+			Chain{Family: a.family, Table: a.tableName, Name: "forward", Type: "filter", Hook: "forward", Prio: 0, Policy: "drop"},
+			Chain{Family: a.family, Table: a.tableName, Name: "prerouting", Type: "nat", Hook: "prerouting", Prio: -100},
+			Chain{Family: a.family, Table: a.tableName, Name: "postrouting", Type: "nat", Hook: "postrouting", Prio: 100},
+		)
 	}
 
 	for _, c := range chains {
@@ -548,209 +557,214 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
-	// 3. FORWARDING CHAIN (Stateful & Inter-VLAN Policies)
-	root.Nftables = append(root.Nftables, NFTElement{
-		Rule: &Rule{
-			Family:  a.family,
-			Table:   a.tableName,
-			Chain:   "forward",
-			Comment: "Allow established/related forwarding",
-			Expr: []interface{}{
-				map[string]interface{}{
-					"match": map[string]interface{}{
-						"op":    "in",
-						"left":  map[string]interface{}{"ct": map[string]interface{}{"key": "state"}},
-						"right": []string{"established", "related"},
-					},
-				},
-				map[string]interface{}{"accept": nil},
-			},
-		},
-	})
-
-	// Användarpolicies
-	for _, pol := range cfg.Policies {
-		if !pol.Enabled || pol.Local {
-			continue
-		}
-
-		// Om detta är en Port Forwarding (DNAT) policy sköts den i prerouting/forward
-		if pol.Action == config.ActionDNAT && pol.NAT != nil {
-			// Tillåt forwarding till den interna IP-adressen vid DNAT
-			root.Nftables = append(root.Nftables, NFTElement{
-				Rule: &Rule{
-					Family:  a.family,
-					Table:   a.tableName,
-					Chain:   "forward",
-					Comment: fmt.Sprintf("Allow DNAT forwarding for %s", pol.Name),
-					Expr: []interface{}{
-						map[string]interface{}{
-							"match": map[string]interface{}{
-								"op":    "==",
-								"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
-								"right": pol.NAT.InternalIP,
-							},
-						},
-						map[string]interface{}{"accept": nil},
-					},
-				},
-			})
-			continue
-		}
-
-		// Käll-/mål-objekt (t.ex. GeoIP-landsblock eller en hot-lista från
-		// Spamhaus/Tor, Fas 5): en satt (icke-"ANY") SourceObj/DestObj som
-		// löser upp till en TOM lista (källan har inte hämtats än, eller
-		// misslyckades) hoppar över hela regeln — annars skulle en trasig
-		// hot-lista av misstag matcha ALL trafik (tom uttryckslista i
-		// nftables = "matcha allt"), vilket är motsatsen till avsikten.
-		srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
-		if !srcIsAny && srcExpr == nil {
-			continue
-		}
-		dstExpr, dstIsAny := objectMatchExpr(cfg, pol.DestObj, "daddr")
-		if !dstIsAny && dstExpr == nil {
-			continue
-		}
-
-		for _, svcExpr := range resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{}) {
-			rule := &Rule{
+	// 3.–5. FORWARDING/NAT-kedjorna hoppas över helt i host-läge (Fas 13) —
+	// de kräver ingen enda kedja/regel att fungera korrekt, se hostMode-
+	// deklarationen ovan.
+	if !hostMode {
+		// 3. FORWARDING CHAIN (Stateful & Inter-VLAN Policies)
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
 				Family:  a.family,
 				Table:   a.tableName,
 				Chain:   "forward",
-				Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
+				Comment: "Allow established/related forwarding",
+				Expr: []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "in",
+							"left":  map[string]interface{}{"ct": map[string]interface{}{"key": "state"}},
+							"right": []string{"established", "related"},
+						},
+					},
+					map[string]interface{}{"accept": nil},
+				},
+			},
+		})
+
+		// Användarpolicies
+		for _, pol := range cfg.Policies {
+			if !pol.Enabled || pol.Local {
+				continue
 			}
 
-			rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
-			rule.Expr = append(rule.Expr, srcExpr...)
-			rule.Expr = append(rule.Expr, dstExpr...)
-			rule.Expr = append(rule.Expr, svcExpr...)
-			rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
+			// Om detta är en Port Forwarding (DNAT) policy sköts den i prerouting/forward
+			if pol.Action == config.ActionDNAT && pol.NAT != nil {
+				// Tillåt forwarding till den interna IP-adressen vid DNAT
+				root.Nftables = append(root.Nftables, NFTElement{
+					Rule: &Rule{
+						Family:  a.family,
+						Table:   a.tableName,
+						Chain:   "forward",
+						Comment: fmt.Sprintf("Allow DNAT forwarding for %s", pol.Name),
+						Expr: []interface{}{
+							map[string]interface{}{
+								"match": map[string]interface{}{
+									"op":    "==",
+									"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+									"right": pol.NAT.InternalIP,
+								},
+							},
+							map[string]interface{}{"accept": nil},
+						},
+					},
+				})
+				continue
+			}
 
-			if pol.Action == config.ActionAccept {
-				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-ACCEPT-FWD-%s: ", logSlug(pol.Name))}})
-				rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
-				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
-			} else if pol.Action == config.ActionDrop {
-				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-DENY-FWD-%s: ", logSlug(pol.Name))}})
-				rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
-				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
+			// Käll-/mål-objekt (t.ex. GeoIP-landsblock eller en hot-lista från
+			// Spamhaus/Tor, Fas 5): en satt (icke-"ANY") SourceObj/DestObj som
+			// löser upp till en TOM lista (källan har inte hämtats än, eller
+			// misslyckades) hoppar över hela regeln — annars skulle en trasig
+			// hot-lista av misstag matcha ALL trafik (tom uttryckslista i
+			// nftables = "matcha allt"), vilket är motsatsen till avsikten.
+			srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+			if !srcIsAny && srcExpr == nil {
+				continue
+			}
+			dstExpr, dstIsAny := objectMatchExpr(cfg, pol.DestObj, "daddr")
+			if !dstIsAny && dstExpr == nil {
+				continue
+			}
+
+			for _, svcExpr := range resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{}) {
+				rule := &Rule{
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "forward",
+					Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
+				}
+
+				rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
+				rule.Expr = append(rule.Expr, srcExpr...)
+				rule.Expr = append(rule.Expr, dstExpr...)
+				rule.Expr = append(rule.Expr, svcExpr...)
+				rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
+
+				if pol.Action == config.ActionAccept {
+					rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-ACCEPT-FWD-%s: ", logSlug(pol.Name))}})
+					rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
+					root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
+				} else if pol.Action == config.ActionDrop {
+					rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-DENY-FWD-%s: ", logSlug(pol.Name))}})
+					rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
+					root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
+				}
 			}
 		}
-	}
 
-	// Forward: logga och neka allt annat mellan zoner/VLAN som inte
-	// matchade en explicit policy ovan (Default Deny Inter-VLAN, se avsnitt
-	// 2.4 i genomförandeplanen), så att det syns i firewall-loggen.
-	root.Nftables = append(root.Nftables, NFTElement{
-		Rule: &Rule{
-			Family:  a.family,
-			Table:   a.tableName,
-			Chain:   "forward",
-			Comment: "Log & deny all other forwarding",
-			Expr: []interface{}{
-				map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD-DefaultDeny: "}},
-				map[string]interface{}{"drop": nil},
+		// Forward: logga och neka allt annat mellan zoner/VLAN som inte
+		// matchade en explicit policy ovan (Default Deny Inter-VLAN, se avsnitt
+		// 2.4 i genomförandeplanen), så att det syns i firewall-loggen.
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "forward",
+				Comment: "Log & deny all other forwarding",
+				Expr: []interface{}{
+					map[string]interface{}{"log": map[string]interface{}{"prefix": "SH-DENY-FWD-DefaultDeny: "}},
+					map[string]interface{}{"drop": nil},
+				},
 			},
-		},
-	})
+		})
 
-	// 4. NAT PREROUTING CHAIN (Port Forwarding / DNAT, samt 1:1 NAT — Fas 7)
-	for _, pol := range cfg.Policies {
-		if pol.Enabled && pol.Action == config.ActionDNAT && pol.NAT != nil {
-			proto := "tcp"
-			if pol.NAT.Protocol != "" {
-				proto = pol.NAT.Protocol
-			}
-			expr := []interface{}{}
-			// 1:1 NAT (statisk NAT, Fas 7): om NAT.ExternalIP är satt gäller
-			// vidarebefordringen bara den specifika WAN-IP:n, inte alla
-			// IP:er på WAN-interfacet.
-			if pol.NAT.ExternalIP != "" {
-				expr = append(expr, map[string]interface{}{
-					"match": map[string]interface{}{
-						"op":    "==",
-						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
-						"right": pol.NAT.ExternalIP,
+		// 4. NAT PREROUTING CHAIN (Port Forwarding / DNAT, samt 1:1 NAT — Fas 7)
+		for _, pol := range cfg.Policies {
+			if pol.Enabled && pol.Action == config.ActionDNAT && pol.NAT != nil {
+				proto := "tcp"
+				if pol.NAT.Protocol != "" {
+					proto = pol.NAT.Protocol
+				}
+				expr := []interface{}{}
+				// 1:1 NAT (statisk NAT, Fas 7): om NAT.ExternalIP är satt gäller
+				// vidarebefordringen bara den specifika WAN-IP:n, inte alla
+				// IP:er på WAN-interfacet.
+				if pol.NAT.ExternalIP != "" {
+					expr = append(expr, map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+							"right": pol.NAT.ExternalIP,
+						},
+					})
+				}
+				expr = append(expr,
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
+							"right": pol.NAT.ExternalPort,
+						},
+					},
+					map[string]interface{}{
+						"dnat": map[string]interface{}{
+							"family": "ip",
+							"addr":   pol.NAT.InternalIP,
+							"port":   pol.NAT.InternalPort,
+						},
+					},
+				)
+				root.Nftables = append(root.Nftables, NFTElement{
+					Rule: &Rule{
+						Family:  a.family,
+						Table:   a.tableName,
+						Chain:   "prerouting",
+						Comment: fmt.Sprintf("Port Forwarding (DNAT): %s", pol.Name),
+						Expr:    expr,
 					},
 				})
 			}
-			expr = append(expr,
-				map[string]interface{}{
-					"match": map[string]interface{}{
-						"op":    "==",
-						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
-						"right": pol.NAT.ExternalPort,
-					},
-				},
-				map[string]interface{}{
-					"dnat": map[string]interface{}{
-						"family": "ip",
-						"addr":   pol.NAT.InternalIP,
-						"port":   pol.NAT.InternalPort,
-					},
-				},
-			)
+		}
+
+		// 4b. NAT POSTROUTING: SNAT-overrides (Fas 7 — Avancerad NAT). Måste
+		// ligga FÖRE den generella masquerade-loopen nedan: nftables nat-
+		// kedjor applicerar bara EN nat-åtgärd per anslutning, så den första
+		// matchande regeln (i regelordning) avgör — en specifik SNAT-override
+		// måste alltså komma före den generella masquerade-regeln för att
+		// någonsin få effekt.
+		for _, pol := range cfg.Policies {
+			if !pol.Enabled || pol.Action != config.ActionSNAT || pol.NAT == nil || pol.NAT.ExternalIP == "" {
+				continue
+			}
+			srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+			if !srcIsAny && srcExpr == nil {
+				continue
+			}
+			expr := append([]interface{}{}, srcExpr...)
+			expr = append(expr, map[string]interface{}{"snat": map[string]interface{}{"addr": pol.NAT.ExternalIP}})
 			root.Nftables = append(root.Nftables, NFTElement{
 				Rule: &Rule{
 					Family:  a.family,
 					Table:   a.tableName,
-					Chain:   "prerouting",
-					Comment: fmt.Sprintf("Port Forwarding (DNAT): %s", pol.Name),
+					Chain:   "postrouting",
+					Comment: fmt.Sprintf("SNAT override: %s", pol.Name),
 					Expr:    expr,
 				},
 			})
 		}
-	}
 
-	// 4b. NAT POSTROUTING: SNAT-overrides (Fas 7 — Avancerad NAT). Måste
-	// ligga FÖRE den generella masquerade-loopen nedan: nftables nat-
-	// kedjor applicerar bara EN nat-åtgärd per anslutning, så den första
-	// matchande regeln (i regelordning) avgör — en specifik SNAT-override
-	// måste alltså komma före den generella masquerade-regeln för att
-	// någonsin få effekt.
-	for _, pol := range cfg.Policies {
-		if !pol.Enabled || pol.Action != config.ActionSNAT || pol.NAT == nil || pol.NAT.ExternalIP == "" {
-			continue
-		}
-		srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
-		if !srcIsAny && srcExpr == nil {
-			continue
-		}
-		expr := append([]interface{}{}, srcExpr...)
-		expr = append(expr, map[string]interface{}{"snat": map[string]interface{}{"addr": pol.NAT.ExternalIP}})
-		root.Nftables = append(root.Nftables, NFTElement{
-			Rule: &Rule{
-				Family:  a.family,
-				Table:   a.tableName,
-				Chain:   "postrouting",
-				Comment: fmt.Sprintf("SNAT override: %s", pol.Name),
-				Expr:    expr,
-			},
-		})
-	}
-
-	// 5. NAT POSTROUTING CHAIN (Outbound Masquerade för alla interna nät mot WAN)
-	for _, wanDev := range wanDevices {
-		root.Nftables = append(root.Nftables, NFTElement{
-			Rule: &Rule{
-				Family:  a.family,
-				Table:   a.tableName,
-				Chain:   "postrouting",
-				Comment: fmt.Sprintf("Outbound NAT Masquerade on %s", wanDev),
-				Expr: []interface{}{
-					map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "oifname"}},
-							"right": wanDev,
+		// 5. NAT POSTROUTING CHAIN (Outbound Masquerade för alla interna nät mot WAN)
+		for _, wanDev := range wanDevices {
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "postrouting",
+					Comment: fmt.Sprintf("Outbound NAT Masquerade on %s", wanDev),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "oifname"}},
+								"right": wanDev,
+							},
 						},
+						map[string]interface{}{"masquerade": nil},
 					},
-					map[string]interface{}{"masquerade": nil},
 				},
-			},
-		})
-	}
+			})
+		}
+	} // !hostMode
 
 	return json.MarshalIndent(root, "", "  ")
 }

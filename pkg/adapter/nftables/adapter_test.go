@@ -534,3 +534,106 @@ func TestRenderJSONOpenVPNWANAllow(t *testing.T) {
 		t.Errorf("OpenVPN-allow-regeln måste ligga FÖRE HARD WAN DROP (index %d > %d), annars är porten meningslös", allowIdx, dropIdx)
 	}
 }
+
+// TestRenderJSONHostModeSkipsForwardAndNAT verifierar Fas 13:s
+// enkelkorts-/värddator-läge — inga forward/nat-kedjor eller -regler ska
+// genereras alls, men INPUT-kedjan (inkl. en lokal accept-policy) ska
+// fortfarande fungera precis som i gateway-läge.
+func TestRenderJSONHostModeSkipsForwardAndNAT(t *testing.T) {
+	adapter := NewAdapter()
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "eth0", Device: "eth0", Zone: "HOST", Enabled: true, AddressType: "dhcp"},
+		},
+		Policies: []config.Policy{
+			{ID: "ssh", Name: "SSH Admin", Enabled: true, Local: true, Action: config.ActionAccept, Service: "22"},
+		},
+		Settings: config.Settings{APIPort: 8443, Mode: config.ModeHost},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var root JSONRoot
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("Ogiltig JSON: %v", err)
+	}
+
+	sawInput, sawForward, sawNAT := false, false, false
+	for _, el := range root.Nftables {
+		if el.Chain != nil {
+			switch el.Chain.Name {
+			case "input":
+				sawInput = true
+			case "forward":
+				sawForward = true
+			case "prerouting", "postrouting":
+				sawNAT = true
+			}
+		}
+		if el.Rule != nil {
+			switch el.Rule.Chain {
+			case "forward":
+				sawForward = true
+			case "prerouting", "postrouting":
+				sawNAT = true
+			}
+		}
+	}
+
+	if !sawInput {
+		t.Error("förväntade en input-kedja i host-läge, saknas")
+	}
+	if sawForward {
+		t.Error("förväntade INGEN forward-kedja/regel i host-läge, men hittade en")
+	}
+	if sawNAT {
+		t.Error("förväntade INGA nat-kedjor/regler (prerouting/postrouting) i host-läge, men hittade en")
+	}
+}
+
+// TestRenderJSONGatewayModeStillHasForwardAndNAT skyddar mot att
+// host-läges-avgränsningen av misstag också slår av forward/nat i det
+// vanliga (gateway) läget — bakåtkompatibilitet.
+func TestRenderJSONGatewayModeStillHasForwardAndNAT(t *testing.T) {
+	adapter := NewAdapter()
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Settings: config.Settings{APIPort: 8443}, // Mode ospecificerat = gateway
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var root JSONRoot
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("Ogiltig JSON: %v", err)
+	}
+
+	sawForwardChain, sawNATChain := false, false
+	for _, el := range root.Nftables {
+		if el.Chain != nil && el.Chain.Name == "forward" {
+			sawForwardChain = true
+		}
+		if el.Chain != nil && (el.Chain.Name == "prerouting" || el.Chain.Name == "postrouting") {
+			sawNATChain = true
+		}
+	}
+	if !sawForwardChain {
+		t.Error("förväntade forward-kedjan i gateway-läge (tomt Mode-fält), men saknas")
+	}
+	if !sawNATChain {
+		t.Error("förväntade nat-kedjorna i gateway-läge (tomt Mode-fält), men saknas")
+	}
+}

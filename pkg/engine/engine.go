@@ -71,8 +71,16 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 	if _, err := e.nftAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
 		return fmt.Errorf("nftables: %w", err)
 	}
-	if err := e.dhcpAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
-		return fmt.Errorf("dhcp: %w", err)
+
+	// DHCP och Suricata är gateway-/router-specifika roller (DHCP-server
+	// och IDS-sniffing hör inte hemma på en enkortsdator, Fas 13) — rör
+	// aldrig kea-dhcp4-server/suricata i host-läge, oavsett vad running-
+	// configen råkar innehålla (ett host-läges-install har dem inte ens
+	// installerade, se install.sh).
+	if !cfg.IsHostMode() {
+		if err := e.dhcpAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+			return fmt.Errorf("dhcp: %w", err)
+		}
 	}
 	if cfg.WireGuard != nil && cfg.WireGuard.Enabled {
 		privKey, _, err := e.store.EnsureWireGuardServerKeys()
@@ -130,8 +138,10 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 		return fmt.Errorf("syslog: %w", err)
 	}
 
-	if err := e.suricataAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
-		return fmt.Errorf("suricata: %w", err)
+	if !cfg.IsHostMode() {
+		if err := e.suricataAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+			return fmt.Errorf("suricata: %w", err)
+		}
 	}
 
 	return nil

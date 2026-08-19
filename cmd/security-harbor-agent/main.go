@@ -28,6 +28,7 @@ func main() {
 	bindAddr := flag.String("bind", "10.0.0.163:8443", "IP/Port för Management API (HTTPS)")
 	webUIDir := flag.String("webui-dir", "/var/lib/security-harbor/webui", "Sökväg till statiska filer för web-UI (flutter build web)")
 	dryRun := flag.Bool("dry-run", false, "Starta i dry-run läge utan att ändra nftables i kärnan")
+	seedMode := flag.String("mode", "", "Driftläge för EN HELT NY installation (\"\"/\"gateway\" eller \"host\", Fas 13) — rör bara den allra första uppstarten, ignoreras om running.json redan finns")
 	flag.Parse()
 
 	fmt.Println("=====================================================")
@@ -40,7 +41,7 @@ func main() {
 	// Master-nyckeln för kryptering at-rest genereras slumpmässigt per
 	// installation och sparas i --data-dir (se pkg/store/masterkey.go) —
 	// inget hårdkodat här längre.
-	st, err := store.NewStore(*configDir)
+	st, err := store.NewStore(*configDir, *seedMode)
 	if err != nil {
 		log.Fatalf("Kunde inte starta store: %v", err)
 	}

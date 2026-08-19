@@ -1,0 +1,33 @@
+# Security Harbor Failsafe nftables ruleset — HOST-läge (Fas 13,
+# enkelkorts-/värddator-brandvägg).
+# Denna laddas av security-harbor-failsafe.service innan agenten startar.
+#
+# Ingen "allt utom X är betrott"-logik här — till skillnad från
+# gateway-varianten finns det bara ETT gränssnitt, och det spelar
+# dubbelroll (både admin-åtkomst OCH ev. exponerad sida). Failsafe-nätet
+# är därför bara: loopback, established/related, samt SSH+Management-API
+# — vilket är exakt vad den riktiga host-läges-INPUT-kedjan (se
+# pkg/adapter/nftables) ändå landar i, så det här är inte mer permissivt
+# än steady-state, bara samma princip som ett tillfälligt bootstrap-nät.
+
+flush ruleset
+
+table inet security_harbor_failsafe {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iifname "lo" accept
+        ct state established,related accept
+        tcp dport { 22, 8443 } accept
+
+        drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
