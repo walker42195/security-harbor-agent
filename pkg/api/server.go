@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -89,6 +90,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/auth/users/create", s.authMiddlewareAdmin(s.handleCreateUser))
 	mux.HandleFunc("/api/v1/auth/users/delete", s.authMiddlewareAdmin(s.handleDeleteUser))
 	mux.HandleFunc("/api/v1/auth/users/reset-password", s.authMiddlewareAdmin(s.handleResetUserPassword))
+	mux.HandleFunc("/api/v1/system/backup", s.authMiddlewareAdmin(s.handleBackup))
+	mux.HandleFunc("/api/v1/system/restore", s.authMiddlewareAdmin(s.handleRestore))
+	mux.HandleFunc("/api/v1/system/factory-reset", s.authMiddlewareAdmin(s.handleFactoryReset))
 
 	// Web-UI (Fas 8+) — statiska filer (flutter build web), t.ex. driftsatta
 	// via rsync till --webui-dir. Registreras SIST men ServeMux matchar
@@ -324,6 +328,95 @@ func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// handleBackup skapar en lösenfras-krypterad backup av persistenslagret
+// (Fas 10, se Engine.Backup/pkg/store/backup.go) och returnerar den som
+// base64 i JSON — konsekvent med resten av API:t, ingen ny content-type.
+func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Passphrase string `json:"passphrase"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Passphrase == "" {
+		http.Error(w, "Lösenfras saknas", http.StatusBadRequest)
+		return
+	}
+	data, err := s.engine.Backup(req.Passphrase)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"backup_b64": base64.StdEncoding.EncodeToString(data)})
+}
+
+// handleRestore skriver tillbaka en backup och startar om agenten rent
+// (systemd Restart=always tar hand om omstarten, se
+// systemd/security-harbor-agent.service) istället för att försöka
+// hot-swappa engine-tillståndet i en levande process.
+func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Passphrase string `json:"passphrase"`
+		BackupB64  string `json:"backup_b64"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Passphrase == "" || req.BackupB64 == "" {
+		http.Error(w, "Lösenfras eller backup-data saknas", http.StatusBadRequest)
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(req.BackupB64)
+	if err != nil {
+		http.Error(w, "Ogiltig base64-data", http.StatusBadRequest)
+		return
+	}
+	if err := s.engine.Restore(data, req.Passphrase); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	restartSelfAfterResponse(w)
+}
+
+// handleFactoryReset kräver att den INLOGGADE admin-användarens nuvarande
+// lösenord skickas med som extra bekräftelse-spärr (samma
+// VerifyUserCredentials-väg som login) innan ALL config/nyckeldata
+// (utom audit.log) tas bort — se Engine.FactoryReset.
+func (s *Server) handleFactoryReset(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Password == "" {
+		http.Error(w, "Lösenord saknas", http.StatusBadRequest)
+		return
+	}
+	username, _ := r.Context().Value(ctxKeyUsername).(string)
+	if _, err := s.engine.VerifyUserCredentials(username, req.Password); err != nil {
+		http.Error(w, "Fel lösenord", http.StatusUnauthorized)
+		return
+	}
+	if err := s.engine.FactoryReset(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	restartSelfAfterResponse(w)
+}
+
+// restartSelfAfterResponse avslutar processen strax efter att svaret
+// hunnit skickas — systemd (Restart=always, se
+// systemd/security-harbor-agent.service) startar om agenten rent med de
+// (åter-/fabriks-)återställda filerna. Flusar svaret om writern stödjer
+// det, väntar sedan en kort stund innan os.Exit så TCP-anslutningen hinner
+// stängas ordentligt hos klienten.
+func restartSelfAfterResponse(w http.ResponseWriter) {
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+	}()
 }
 
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {

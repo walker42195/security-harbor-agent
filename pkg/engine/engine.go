@@ -594,6 +594,32 @@ func (e *Engine) GetState() State {
 // Tunna passthrough-metoder till store.Users, för att hålla samma
 // lagerarkitektur (API -> Engine -> Store) som resten av agenten.
 
+// Backup skapar en lösenfras-krypterad backup av hela persistenslagret
+// (Fas 10, se pkg/store/backup.go). Tunn passthrough, inget engine-
+// specifikt tillstånd inblandat.
+func (e *Engine) Backup(passphrase string) ([]byte, error) {
+	return e.store.Backup(passphrase)
+}
+
+// Restore skriver tillbaka en backup skapad av Backup. Anroparen (API-
+// handlern) ansvarar för att sedan starta om processen (systemd
+// Restart=always tar hand om det) — Restore i sig försöker INTE hot-
+// swappa engine-tillståndet, se pkg/store/backup.go.
+func (e *Engine) Restore(data []byte, passphrase string) error {
+	return e.store.Restore(data, passphrase)
+}
+
+// FactoryReset tar bort ALL config-/nyckeldata i baseDir (utom
+// audit.log — revisionshistoriken ska överleva en reset) så att nästa
+// uppstart återgår till samma första-start-seedning som en helt ny
+// installation (loadOrInit/UserStore, se pkg/store/store.go respektive
+// users.go). Anroparen ansvarar för att verifiera lösenordet FÖRE detta
+// anropas (se handleFactoryReset) — den här funktionen litar blint på att
+// den redan är auktoriserad.
+func (e *Engine) FactoryReset() error {
+	return e.store.FactoryReset()
+}
+
 func (e *Engine) VerifyUserCredentials(username, password string) (*store.PublicUser, error) {
 	return e.store.Users.VerifyCredentials(username, password)
 }
