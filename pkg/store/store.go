@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -295,8 +296,23 @@ func (s *Store) UpdateObjectValuesDirect(objID string, values []string) error {
 	return nil
 }
 
-func dnsBlocklistPath(baseDir, id string) string {
-	return filepath.Join(baseDir, "dns_blocklist_"+id+".txt")
+// blocklistIDPattern är en sträng ALLOWLIST för DNSBlocklistSource.ID —
+// den kommer direkt från klienten (admin-API:t, se handleCandidateConfig)
+// och används för att bygga ett filnamn. Utan denna spärr kan ett ID som
+// innehåller "/" eller ".." fly ur baseDir helt (path traversal, hittat
+// och bekräftat skarpt under en säkerhetsgranskning 2026-08-19 — ett ID
+// som "/../pentest_poc_test" fick filen att hamna direkt i baseDir, helt
+// utan "dns_blocklist_"-prefixet, och kunde i princip landat i vilken
+// katalog som helst agenten har skrivrättighet till, t.ex. /etc/wireguard
+// eller /etc/suricata). Bara alfanumeriskt + bindestreck/understreck
+// tillåts — gott om utrymme för alla ID:n GUI:t faktiskt genererar.
+var blocklistIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+func dnsBlocklistPath(baseDir, id string) (string, error) {
+	if !blocklistIDPattern.MatchString(id) {
+		return "", fmt.Errorf("ogiltigt blocklist-ID %q (endast bokstäver, siffror, - och _ tillåtna)", id)
+	}
+	return filepath.Join(baseDir, "dns_blocklist_"+id+".txt"), nil
 }
 
 // SaveDNSBlocklistDomains cachar den hämtade DNS-domänblocklistan för EN
@@ -307,7 +323,11 @@ func dnsBlocklistPath(baseDir, id string) string {
 func (s *Store) SaveDNSBlocklistDomains(id string, domains []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return os.WriteFile(dnsBlocklistPath(s.baseDir, id), []byte(strings.Join(domains, "\n")), 0644)
+	path, err := dnsBlocklistPath(s.baseDir, id)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(strings.Join(domains, "\n")), 0644)
 }
 
 // LoadDNSBlocklistDomains läser den cachade domänlistan för EN källa.
@@ -315,7 +335,11 @@ func (s *Store) SaveDNSBlocklistDomains(id string, domains []string) error {
 func (s *Store) LoadDNSBlocklistDomains(id string) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	data, err := os.ReadFile(dnsBlocklistPath(s.baseDir, id))
+	path, err := dnsBlocklistPath(s.baseDir, id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil

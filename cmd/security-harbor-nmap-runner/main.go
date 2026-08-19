@@ -11,11 +11,23 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 )
+
+// maxRunTime är ett internt säkerhetsnät oberoende av systemds
+// TimeoutStartSec (se systemd/security-harbor-nmap.service) — hittat
+// under en säkerhetsgranskning 2026-08-19: en tung skanning
+// (-sS -p- -sV -sU -O) kunde tidigare köra OBEGRÄNSAT (varken
+// huvuddaemonens 5-minuters context-timeout eller något i den här
+// processen satte någon gräns alls), vilket lämnade
+// security-harbor-nmap.service i "activating"-läge i 23 timmar och
+// blockerade ALLA efterföljande skanningar tills den dödades manuellt.
+const maxRunTime = 4 * time.Minute
 
 const (
 	requestPath = "/run/security-harbor/nmap-request.json"
@@ -47,9 +59,13 @@ func main() {
 		return
 	}
 
-	out, err := exec.Command("nmap", req.Args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), maxRunTime)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "nmap", req.Args...).CombinedOutput()
 	text := string(out)
-	if err != nil && text == "" {
+	if ctx.Err() == context.DeadlineExceeded {
+		text += fmt.Sprintf("\nnmap-runner: avbruten efter %s (tidsgräns)", maxRunTime)
+	} else if err != nil && text == "" {
 		text = fmt.Sprintf("nmap-runner: nmap misslyckades: %v", err)
 	}
 	writeResult(text)

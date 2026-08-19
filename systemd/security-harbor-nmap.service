@@ -4,6 +4,16 @@ Description=Security Harbor nmap-skanning (privilegierad hjälptjänst)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/security-harbor-nmap-runner
+# TimeoutStartSec: skyddsnät OBEROENDE av det interna maxRunTime i
+# security-harbor-nmap-runner (se cmd/security-harbor-nmap-runner/main.go)
+# — säkerhetsgranskning 2026-08-19 hittade en instans av den här tjänsten
+# som fastnat i "activating" i 23 TIMMAR (en tung -sS -p- -sV -sU -O-
+# skanning som varken huvuddaemonens 5-minuters context-timeout eller
+# något i denna processen begränsade), vilket blockerade alla
+# efterföljande skanningar tills den dödades manuellt. Om körningens egen
+# tidsgräns av någon anledning inte skulle utlösas (t.ex. en hängande
+# syscall) dödar systemd själv processen efter denna gräns.
+TimeoutStartSec=300
 # Ingen härdning här avsiktligt — körs redan som root (systemd default),
 # vilket är exakt den privilegienivå SYN/UDP/OS-detektion i nmap alltid
 # har krävt. Den härdade daemon-processen (security-harbor-agent.service,

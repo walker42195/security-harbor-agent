@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
@@ -727,7 +728,19 @@ const (
 	nmapResultPath  = "/run/security-harbor/nmap-result.json"
 )
 
+// nmapHelperMu serialiserar anrop till den delade request-/resultatfilen
+// (samma icke-templatade unit för alla anrop). Utan detta lås kan två
+// samtidiga admin-sessioner kapplöpa om filerna — säkerhetsgranskning
+// 2026-08-19 bekräftade skarpt att session B:s förfrågan om att skanna
+// 10.0.0.163 fick TILLBAKA session A:s resultat för 127.0.0.1 (fel mål,
+// tyst felaktig utdata till fel session). Låset gör att anrop köas
+// istället för att kapplöpa — samma mönster används för tcpdump nedan.
+var nmapHelperMu sync.Mutex
+
 func runNmapViaHelperService(ctx context.Context, args []string) (string, error) {
+	nmapHelperMu.Lock()
+	defer nmapHelperMu.Unlock()
+
 	// Rensa ett ev. gammalt resultat FÖRST, så ett tyst misslyckande i
 	// hjälptjänsten inte råkar returnera en tidigare skannings utdata.
 	_ = os.Remove(nmapResultPath)
@@ -820,7 +833,14 @@ const (
 // cmd/security-harbor-tcpdump-runner) — tcpdump kräver CAP_NET_RAW/root för
 // en raw socket, vilket den härdade huvuddaemonen (NoNewPrivileges=true)
 // inte kan bevilja sig själv.
+// tcpdumpHelperMu: samma serialisering och samma anledning som
+// nmapHelperMu ovan.
+var tcpdumpHelperMu sync.Mutex
+
 func runTcpdumpViaHelperService(ctx context.Context, iface, filter string, packetCount, durationSec int) (string, error) {
+	tcpdumpHelperMu.Lock()
+	defer tcpdumpHelperMu.Unlock()
+
 	_ = os.Remove(tcpdumpResultPath)
 
 	reqData, err := json.Marshal(map[string]interface{}{
