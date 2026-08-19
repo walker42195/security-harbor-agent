@@ -101,15 +101,23 @@ func (s *Server) Start() error {
 	// inget om web-UI:t inte är driftsatt.
 	mux.Handle("/", http.FileServer(http.Dir(s.webUIDir)))
 
-	// wanBlockMiddleware omsluter HELA mux:en, så web-UI:t blockeras på WAN
-	// precis som Management-API:t.
-	handler := s.wanBlockMiddleware(mux)
+	// wanBlockMiddleware och securityHeadersMiddleware omsluter HELA
+	// mux:en, så web-UI:t skyddas/får samma huvuden som Management-API:t.
+	handler := s.wanBlockMiddleware(securityHeadersMiddleware(mux))
 
 	s.srv = &http.Server{
 		Addr:         s.bindAddr,
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
+		// IdleTimeout skyddar mot slow-loris-liknande resursutmattning via
+		// keep-alive-anslutningar som annars inte fångas av Read/WriteTimeout
+		// (de gäller bara EN aktiv request, inte tomgångstid mellan dem).
+		IdleTimeout: 60 * time.Second,
+		// MaxHeaderBytes: uttryckligt satt betydligt snävare än Go:s
+		// 1 MB-default — det här är ett internt JSON-API, inga rimliga
+		// headers närmar sig ens en bråkdel av 64 KB.
+		MaxHeaderBytes: 1 << 16,
 	}
 
 	if s.tlsCert != nil {
@@ -141,6 +149,24 @@ func (s *Server) wanBlockMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Forbidden: Management API disabled on WAN interface", http.StatusForbidden)
 			return
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// securityHeadersMiddleware sätter grundläggande säkerhetshuvuden på VARJE
+// svar (Fas 12) — även på den statiska web-UI-filservern, inte bara
+// /api/v1/*. HSTS är rimligt eftersom TLS redan är obligatoriskt för hela
+// Management-API:t (se tlsCert-hanteringen i Start()). CSP hålls medvetet
+// enkel (default-src 'self') eftersom Flutter Web-bygget är helt
+// self-contained utan externa resurser (typsnitt/skript/bilder bakas in i
+// bygget, se artifact-liknande CSP-resonemang i webUI-driftsättningen).
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "default-src 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -195,10 +221,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-	if s.auth.IsLockedOut(clientIP) {
-		http.Error(w, "IP spärrad p.g.a. för många misslyckade försök", http.StatusTooManyRequests)
-		return
-	}
 
 	var creds struct {
 		Username string `json:"username"`
@@ -206,6 +228,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	// Spärren kollas för BÅDE käll-IP och användarnamn (Fas 12) — annars
+	// kan en angripare kringgå en ren IP-spärr genom att rotera käll-IP
+	// mot samma användarnamn.
+	if s.auth.IsLockedOut(clientIP, creds.Username) {
+		http.Error(w, "Spärrad p.g.a. för många misslyckade försök", http.StatusTooManyRequests)
 		return
 	}
 
@@ -221,7 +251,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.auth.RecordFailedAttempt(clientIP)
+	s.auth.RecordFailedAttempt(clientIP, creds.Username)
 	http.Error(w, "Felaktigt användarnamn eller lösenord", http.StatusUnauthorized)
 }
 

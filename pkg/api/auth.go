@@ -15,44 +15,66 @@ type TokenSession struct {
 	ExpiresAt time.Time
 }
 
+// AuthManager håller BÅDE per-IP OCH per-användarnamn misslyckade
+// inloggningsförsök/lockouts, som två oberoende, parallella spärrar (Fas
+// 12 — den ursprungliga per-IP-spärren ensam går att kringgå genom att
+// rotera källa-IP mot ETT specifikt användarnamn; per-användarnamn-spärren
+// täcker det fallet oavsett hur många IP:n angriparen använder). Ett
+// inloggningsförsök blockeras om ANTINGEN käll-IP:t ELLER användarnamnet
+// för tillfället är låst.
 type AuthManager struct {
 	mu       sync.RWMutex
 	sessions map[string]TokenSession
-	attempts map[string]int
-	lockouts map[string]time.Time
+
+	ipAttempts   map[string]int
+	ipLockouts   map[string]time.Time
+	userAttempts map[string]int
+	userLockouts map[string]time.Time
 }
 
 func NewAuthManager() *AuthManager {
 	return &AuthManager{
-		sessions: make(map[string]TokenSession),
-		attempts: make(map[string]int),
-		lockouts: make(map[string]time.Time),
+		sessions:     make(map[string]TokenSession),
+		ipAttempts:   make(map[string]int),
+		ipLockouts:   make(map[string]time.Time),
+		userAttempts: make(map[string]int),
+		userLockouts: make(map[string]time.Time),
 	}
 }
 
-func (a *AuthManager) IsLockedOut(ip string) bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	until, ok := a.lockouts[ip]
+func isLockedOutLocked(lockouts map[string]time.Time, key string) bool {
+	until, ok := lockouts[key]
 	if !ok {
 		return false
 	}
-	if time.Now().After(until) {
-		return false
-	}
-	return true
+	return !time.Now().After(until)
 }
 
-func (a *AuthManager) RecordFailedAttempt(ip string) {
+// IsLockedOut returnerar true om KÄLL-IP:T ELLER ANVÄNDARNAMNET (eller
+// båda) för tillfället är låst.
+func (a *AuthManager) IsLockedOut(ip, username string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return isLockedOutLocked(a.ipLockouts, ip) || isLockedOutLocked(a.userLockouts, username)
+}
+
+func recordFailedAttemptLocked(attempts map[string]int, lockouts map[string]time.Time, key string) {
+	attempts[key]++
+	if attempts[key] >= 5 {
+		lockouts[key] = time.Now().Add(15 * time.Minute)
+		attempts[key] = 0
+	}
+}
+
+// RecordFailedAttempt räknar upp BÅDA räknarna (käll-IP och användarnamn)
+// oberoende av varandra — vardera låser efter 5 försök i 15 minuter.
+func (a *AuthManager) RecordFailedAttempt(ip, username string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.attempts[ip]++
-	if a.attempts[ip] >= 5 {
-		a.lockouts[ip] = time.Now().Add(15 * time.Minute)
-		a.attempts[ip] = 0
-	}
+	recordFailedAttemptLocked(a.ipAttempts, a.ipLockouts, ip)
+	recordFailedAttemptLocked(a.userAttempts, a.userLockouts, username)
 }
 
 func (a *AuthManager) CreateSession(user, role string, duration time.Duration) (string, error) {
