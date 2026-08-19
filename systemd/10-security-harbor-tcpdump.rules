@@ -1,0 +1,13 @@
+// Tillåter ENDAST security-harbor-tjänstekontot att starta EXAKT
+// security-harbor-tcpdump.service (inget annat systemd-anrop, ingen annan
+// användare) — se pkg/api/server.go:runTcpdumpViaHelperService och
+// cmd/security-harbor-tcpdump-runner. Utan denna regel avvisar polkit
+// `systemctl start` från ett icke-interaktivt tjänstekonto som saknar
+// admin-grupp.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "security-harbor-tcpdump.service" &&
+        subject.user == "security-harbor") {
+        return polkit.Result.YES;
+    }
+});

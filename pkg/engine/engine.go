@@ -11,6 +11,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/syslog"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
@@ -33,20 +34,22 @@ type Engine struct {
 	wgAdapter      *wireguard.Adapter
 	ovpnAdapter    *openvpn.Adapter
 	dnsAdapter     *dns.Adapter
+	syslogAdapter  *syslog.Adapter
 	state          State
 	confirmTimer   *time.Timer
 	unconfirmedCfg *config.Config
 }
 
-func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter) *Engine {
+func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter, syslogAdapter *syslog.Adapter) *Engine {
 	return &Engine{
-		store:       st,
-		nftAdapter:  nftAdapter,
-		dhcpAdapter: dhcpAdapter,
-		wgAdapter:   wgAdapter,
-		ovpnAdapter: ovpnAdapter,
-		dnsAdapter:  dnsAdapter,
-		state:       StateIdle,
+		store:         st,
+		nftAdapter:    nftAdapter,
+		dhcpAdapter:   dhcpAdapter,
+		wgAdapter:     wgAdapter,
+		ovpnAdapter:   ovpnAdapter,
+		dnsAdapter:    dnsAdapter,
+		syslogAdapter: syslogAdapter,
+		state:         StateIdle,
 	}
 }
 
@@ -111,6 +114,10 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 		}
 	} else if err := e.dnsAdapter.ApplyConfig(ctx, cfg, nil, nil, dryRun); err != nil {
 		return fmt.Errorf("dns: %w", err)
+	}
+
+	if err := e.syslogAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+		return fmt.Errorf("syslog: %w", err)
 	}
 
 	return nil

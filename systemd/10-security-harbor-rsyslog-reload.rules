@@ -1,0 +1,16 @@
+// Tillåter ENDAST security-harbor-tjänstekontot att ladda om/starta om
+// EXAKT rsyslog.service (inget annat systemd-anrop, ingen annan användare)
+// — se pkg/adapter/syslog/adapter.go. Till skillnad från nmap/tcpdump körs
+// rsyslog-omladdningen direkt av agentprocessen (D-Bus-anropet exekveras av
+// systemd/PID1 med systemds egna rättigheter, ingen egen
+// privilegiehöjning krävs i agentprocessen) — men utan denna polkit-regel
+// avvisas anropet ändå, eftersom security-harbor-tjänstekontot saknar
+// admin-grupp.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.systemd1.manage-units" ||
+         action.id == "org.freedesktop.systemd1.reload-daemon") &&
+        action.lookup("unit") == "rsyslog.service" &&
+        subject.user == "security-harbor") {
+        return polkit.Result.YES;
+    }
+});

@@ -16,6 +16,17 @@ type Config struct {
 	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"` // VPN-serverkonfiguration (Fas 3)
 	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`   // VPN-serverkonfiguration (Fas 4)
 	DNS        *DNSConfig       `json:"dns,omitempty"`       // DNS-resolver & domänfiltrering (Fas 6)
+	Syslog     *SyslogConfig    `json:"syslog,omitempty"`    // Centraliserad logg-vidarebefordran (Fas 8)
+}
+
+// SyslogConfig styr vidarebefordran av brandväggens systemloggar (bl.a.
+// SH-ACCEPT/SH-DENY-raderna från nftables) till en central syslog-mottagare
+// på nätet, utöver den lokala journald-lagringen som alltid finns kvar.
+type SyslogConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"` // "udp" eller "tcp"
 }
 
 // DNSConfig styr brandväggens lokala DNS-resolver (Fas 6). Den faktiska

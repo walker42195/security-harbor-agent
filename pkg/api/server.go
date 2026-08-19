@@ -73,6 +73,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddlewareAdmin(s.handlePing))
 	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddlewareAdmin(s.handleTraceroute))
 	mux.HandleFunc("/api/v1/diagnostics/nmap", s.authMiddlewareAdmin(s.handleNmap))
+	mux.HandleFunc("/api/v1/diagnostics/tcpdump", s.authMiddlewareAdmin(s.handleTcpdumpCapture))
 	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddlewareAdmin(s.handleWireGuardGeneratePeerKeys))
 	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddlewareAdmin(s.handleOpenVPNGenerateClient))
 	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddlewareAdmin(s.handleRefreshObjectSource))
@@ -607,6 +608,102 @@ func runNmapViaHelperService(ctx context.Context, args []string) (string, error)
 	}
 
 	resultData, err := os.ReadFile(nmapResultPath)
+	if err != nil {
+		return "", fmt.Errorf("hjälptjänsten skrev inget resultat: %w", err)
+	}
+	var result struct {
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		return "", fmt.Errorf("ogiltigt resultat från hjälptjänsten: %w", err)
+	}
+	return result.Output, nil
+}
+
+// handleTcpdumpCapture kör en avgränsad (tids- och paketantalsbegränsad)
+// paketfångst mot ett konfigurerat gränssnitt. Ingen verklig "live"-ström —
+// hela fångsten körs klart och returneras som textutdata i ett svar, precis
+// som nmap redan hanterar flera minuter långa skanningar. Taket på 12
+// sekunder håller sig inom serverns globala WriteTimeout (se Start()).
+func (s *Server) handleTcpdumpCapture(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Interface   string `json:"interface"`
+		Filter      string `json:"filter"`
+		PacketCount int    `json:"packet_count"`
+		DurationSec int    `json:"duration_sec"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Interface == "" {
+		http.Error(w, "Gränssnitt saknas", http.StatusBadRequest)
+		return
+	}
+
+	// Gränssnittet måste vara ett av de som faktiskt är konfigurerade på
+	// brandväggen — förhindrar både flagg-injektion via -i och att fångst
+	// körs mot ett godtyckligt, oavsiktligt device.
+	cfg := s.engine.GetRunningConfig()
+	valid := false
+	if cfg != nil {
+		for _, iface := range cfg.Interfaces {
+			if iface.Device == req.Interface {
+				valid = true
+				break
+			}
+		}
+	}
+	if !valid {
+		http.Error(w, "Okänt eller ej konfigurerat gränssnitt", http.StatusBadRequest)
+		return
+	}
+
+	if req.PacketCount <= 0 || req.PacketCount > 2000 {
+		req.PacketCount = 200
+	}
+	if req.DurationSec <= 0 || req.DurationSec > 12 {
+		req.DurationSec = 10
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 13*time.Second)
+	defer cancel()
+
+	result, err := runTcpdumpViaHelperService(ctx, req.Interface, req.Filter, req.PacketCount, req.DurationSec)
+	if err != nil {
+		result = fmt.Sprintf("tcpdump misslyckades: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"output": result})
+}
+
+const (
+	tcpdumpRequestPath = "/run/security-harbor/tcpdump-request.json"
+	tcpdumpResultPath  = "/run/security-harbor/tcpdump-result.json"
+)
+
+// runTcpdumpViaHelperService triggar security-harbor-tcpdump.service, exakt
+// samma privilegie-separeringsmönster som runNmapViaHelperService (se
+// cmd/security-harbor-tcpdump-runner) — tcpdump kräver CAP_NET_RAW/root för
+// en raw socket, vilket den härdade huvuddaemonen (NoNewPrivileges=true)
+// inte kan bevilja sig själv.
+func runTcpdumpViaHelperService(ctx context.Context, iface, filter string, packetCount, durationSec int) (string, error) {
+	_ = os.Remove(tcpdumpResultPath)
+
+	reqData, err := json.Marshal(map[string]interface{}{
+		"interface":    iface,
+		"filter":       filter,
+		"packet_count": packetCount,
+		"duration_sec": durationSec,
+	})
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(tcpdumpRequestPath, reqData, 0600); err != nil {
+		return "", fmt.Errorf("kunde inte skriva request-fil: %w", err)
+	}
+
+	if out, err := exec.CommandContext(ctx, "systemctl", "start", "--wait", "security-harbor-tcpdump.service").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("kunde inte starta security-harbor-tcpdump.service: %w — %s", err, strings.TrimSpace(string(out)))
+	}
+
+	resultData, err := os.ReadFile(tcpdumpResultPath)
 	if err != nil {
 		return "", fmt.Errorf("hjälptjänsten skrev inget resultat: %w", err)
 	}

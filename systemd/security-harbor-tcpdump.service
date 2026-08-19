@@ -1,0 +1,13 @@
+[Unit]
+Description=Security Harbor paketfångst (privilegierad hjälptjänst)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/security-harbor-tcpdump-runner
+# Ingen härdning här avsiktligt — körs redan som root (systemd default),
+# vilket är den privilegienivå tcpdump alltid har krävt för en raw socket
+# (CAP_NET_RAW). Den härdade daemon-processen (security-harbor-agent.service,
+# NoNewPrivileges=true m.m.) triggar den här tjänsten via
+# `systemctl start --wait` istället för att köra tcpdump själv, så
+# privilegiehöjningen är isolerad till denna minimala, syftesbyggda
+# engångskörning i stället för att försvaga huvuddaemonens sandbox.

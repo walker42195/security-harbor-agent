@@ -15,6 +15,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/syslog"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/api"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
@@ -48,7 +49,8 @@ func main() {
 	wgAdapter := wireguard.NewAdapter("")
 	ovpnAdapter := openvpn.NewAdapter("")
 	dnsAdapter := dns.NewAdapter("")
-	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter)
+	syslogAdapter := syslog.NewAdapter("")
+	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter, syslogAdapter)
 	auth := api.NewAuthManager()
 
 	// Applicera initial konfiguration vid start (om ej dry-run)
