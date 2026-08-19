@@ -203,8 +203,14 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 	// mot "matcha allt" som redan finns för tomma objekt-listor), vilket
 	// utan denna kontroll bara syns som "regeln gör aldrig något",
 	// obegripligt för en administratör som skrivit fel zonnamn.
+	// DNAT-policyer undantas: de matchas av NAT.ExternalPort/InternalIP,
+	// inte av SourceZone/DestZone (nftables-adaptern läser aldrig zon-
+	// fälten för DNAT-regler) — att ändå kräva giltiga zoner där gav
+	// falska valideringsfel för DNAT-regler skapade innan den här
+	// kontrollen fanns (upptäckt skarpt 2026-08-19, samma dag kontrollen
+	// lades till).
 	for _, pol := range cfg.Policies {
-		if !pol.Enabled || pol.Local {
+		if !pol.Enabled || pol.Local || pol.Action == config.ActionDNAT {
 			continue
 		}
 		if err := validatePolicyZone(cfg, pol.Name, "källzonen", pol.SourceZone); err != nil {
@@ -229,7 +235,18 @@ func validatePolicyZone(cfg *config.Config, policyName, label, zoneSpec string) 
 	if trimmed == "" || strings.EqualFold(trimmed, "ANY") {
 		return nil
 	}
-	for _, part := range strings.Split(trimmed, ",") {
+	parts := strings.Split(trimmed, ",")
+	// "ANY" NÅGONSTANS i en kommaseparerad lista (t.ex. "10.0.0.5, ANY" —
+	// GUI:t lägger till ANY som standardval, en administratör som sedan
+	// lägger till ett eget värde utan att ta bort ANY ska inte straffas
+	// för det) betyder "ingen begränsning", precis som om HELA fältet
+	// vore "ANY" — samma tolkning som zoneMatchExpr använder.
+	for _, part := range parts {
+		if strings.EqualFold(strings.TrimSpace(part), "ANY") {
+			return nil
+		}
+	}
+	for _, part := range parts {
 		zoneName := strings.TrimSpace(part)
 		if zoneName == "" || zoneName == "Any-External (WAN)" || zoneName == "Any-Trusted (LAN)" {
 			continue

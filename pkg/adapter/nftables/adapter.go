@@ -271,6 +271,14 @@ func zoneMatchExpr(cfg *config.Config, zoneSpec, metaKey string, wanDevices, lan
 	if trimmed == "" || strings.EqualFold(trimmed, "ANY") {
 		return nil, true
 	}
+	// "ANY" NÅGONSTANS i en kommaseparerad lista betyder "ingen
+	// begränsning" — samma tolkning som validatePolicyZone
+	// (pkg/engine/engine.go) använder, se den funktionens kommentar.
+	for _, part := range strings.Split(trimmed, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), "ANY") {
+			return nil, true
+		}
+	}
 
 	seen := map[string]bool{}
 	var devices []string
