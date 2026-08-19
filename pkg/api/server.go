@@ -161,13 +161,21 @@ func (s *Server) wanBlockMiddleware(next http.Handler) http.Handler {
 // enkel (default-src 'self') eftersom Flutter Web-bygget är helt
 // self-contained utan externa resurser (typsnitt/skript/bilder bakas in i
 // bygget, se artifact-liknande CSP-resonemang i webUI-driftsättningen).
+//
+// script-src lägger till 'wasm-unsafe-eval' (INTE det bredare
+// 'unsafe-eval') — hittat och åtgärdat 2026-08-19: en ren default-src
+// 'self' gjorde webb-GUI:t till en helt vit sida, eftersom Flutter Webs
+// CanvasKit-renderare (WebAssembly.compileStreaming) kräver den
+// specifika, avgränsade CSP3-nyckeln för att kompilera WASM alls —
+// 'wasm-unsafe-eval' tillåter BARA WebAssembly-kompilering, inte
+// godtycklig eval()/Function() av vanlig JS som 'unsafe-eval' hade gjort.
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
-		h.Set("Content-Security-Policy", "default-src 'self'")
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'")
 		next.ServeHTTP(w, r)
 	})
 }
