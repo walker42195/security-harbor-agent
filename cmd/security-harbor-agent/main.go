@@ -31,7 +31,7 @@ func main() {
 	flag.Parse()
 
 	fmt.Println("=====================================================")
-	fmt.Println(" SECURITY HARBOR FIREWALL AGENT v0.7.0 (Fas 7)       ")
+	fmt.Println(" SECURITY HARBOR FIREWALL AGENT v0.12.0 (Fas 12)     ")
 	fmt.Println("=====================================================")
 	if *dryRun {
 		fmt.Println("[MODE] DRY-RUN AKTIVT - inga ändringar görs i kärnan!")
