@@ -120,8 +120,13 @@ men berör inte koden i praktiken.
 - **Inte en oberoende, extern penetrationstest.** Detta är en
   självgenomförd kodgranskning + nmap-verifiering av utvecklaren/AI-
   assistenten själv. Se `pentest_fas12_2026-08-19.md` (Doc-Harbor) för den
-  senaste körningen. En riktig tredjeparts-pentest är fortsatt
-  rekommenderad innan systemet körs som enda skydd mot internet.
+  första körningen och `pentest_djup_2026-08-19.md` (Doc-Harbor) för en
+  senare, djupare omgång med faktiska aktiva intrångsförsök (inte bara
+  portskanning) — tre verkliga buggar hittades och åtgärdades där (path
+  traversal i DNS-blocklistans lagring, en kapplöpning mellan samtidiga
+  diagnostikanrop, samt en hjälptjänst som kunde fastna permanent utan
+  tidsgräns). En riktig tredjeparts-pentest är fortsatt rekommenderad
+  innan systemet körs som enda skydd mot internet.
 - **Källkoden är publik** (sedan Fas 13) — det innebär att design och
   implementation är öppen för granskning, men betyder INTE att systemet är
   granskat av någon oberoende part (se ovan).
