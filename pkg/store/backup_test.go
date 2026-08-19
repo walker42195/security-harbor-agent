@@ -8,13 +8,9 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
-func testMasterKey() []byte {
-	return []byte("01234567890123456789012345678901") [:32]
-}
-
 func TestBackupRestoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, testMasterKey())
+	s, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -42,7 +38,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	// Återställ i en NY store-katalog med en ANNAN master-nyckel, för att
 	// verifiera att backupen är portabel oavsett master-nyckel-skillnad.
 	dir2 := t.TempDir()
-	s2, err := NewStore(dir2, []byte("annan-masternyckel-32-bytes-lang"))
+	s2, err := NewStore(dir2)
 	if err != nil {
 		t.Fatalf("NewStore (mål) misslyckades: %v", err)
 	}
@@ -51,7 +47,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 
 	// running.json ska nu finnas i mål-katalogen med rätt innehåll.
-	restored, err := NewStore(dir2, []byte("annan-masternyckel-32-bytes-lang"))
+	restored, err := NewStore(dir2)
 	if err != nil {
 		t.Fatalf("NewStore (läs tillbaka) misslyckades: %v", err)
 	}
@@ -73,7 +69,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 
 func TestRestoreWrongPassphraseFails(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, testMasterKey())
+	s, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -83,7 +79,7 @@ func TestRestoreWrongPassphraseFails(t *testing.T) {
 	}
 
 	dir2 := t.TempDir()
-	s2, err := NewStore(dir2, testMasterKey())
+	s2, err := NewStore(dir2)
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -98,7 +94,7 @@ func TestRestoreWrongPassphraseFails(t *testing.T) {
 
 func TestRestoreGarbageDataFails(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, testMasterKey())
+	s, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -109,7 +105,7 @@ func TestRestoreGarbageDataFails(t *testing.T) {
 
 func TestFactoryResetRemovesStateKeepsAuditLog(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, testMasterKey())
+	s, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}

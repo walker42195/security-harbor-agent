@@ -37,10 +37,10 @@ func main() {
 		fmt.Println("[MODE] DRY-RUN AKTIVT - inga ändringar görs i kärnan!")
 	}
 
-	// 32-bytes masterkey (i prod genereras eller hämtas denna från HSM/TPM/Vault)
-	masterKey := []byte("SecurityHarborMasterKey2026Secur")
-
-	st, err := store.NewStore(*configDir, masterKey)
+	// Master-nyckeln för kryptering at-rest genereras slumpmässigt per
+	// installation och sparas i --data-dir (se pkg/store/masterkey.go) —
+	// inget hårdkodat här längre.
+	st, err := store.NewStore(*configDir)
 	if err != nil {
 		log.Fatalf("Kunde inte starta store: %v", err)
 	}

@@ -31,9 +31,19 @@ type Store struct {
 	Users        *UserStore
 }
 
-func NewStore(baseDir string, masterKey []byte) (*Store, error) {
+// NewStore öppnar (eller skapar) persistenslagret i baseDir. Master-
+// nyckeln för kryptering at-rest hanteras HELT internt (se
+// loadOrCreateMasterKey i masterkey.go) — genereras slumpmässigt vid
+// första anropet på en ny installation, laddas därefter från disk. Ingen
+// hårdkodad/delad nyckel någonstans i källkoden längre.
+func NewStore(baseDir string) (*Store, error) {
 	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return nil, fmt.Errorf("misslyckades skapa store-katalog %s: %w", baseDir, err)
+	}
+
+	masterKey, err := loadOrCreateMasterKey(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("misslyckades hämta master-nyckel: %w", err)
 	}
 
 	crypto, err := NewCryptoHandler(masterKey)

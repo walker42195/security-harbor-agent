@@ -29,14 +29,16 @@ produktionslämplighet.**
   `wireguard_server.key.enc`, `management_tls.key.enc`,
   `openvpn_ca.key.enc`, `openvpn_server.key.enc`), fräsch slumpad nonce
   per krypteringsanrop.
-- **Känd begränsning:** master-nyckeln (32 bytes) är i dagsläget
-  **hårdkodad i källkoden** (`cmd/security-harbor-agent/main.go`,
-  kommentaren erkänner själv att den i produktion borde hämtas från en
-  HSM/TPM/Vault). Det betyder att kryptering at-rest idag skyddar mot
-  "någon läser disken utan att ha koden", INTE mot "någon har binären/
-  källkoden". Detta ändras INTE i Fas 12 — det är en separat, större
-  arkitekturförändring (nyckelhantering) som förtjänar sin egen fas snarare
-  än att smygas in som en bieffekt av hårdningsarbetet.
+- Master-nyckeln (32 bytes) **genereras slumpmässigt per installation**
+  (`pkg/store/masterkey.go`, `crypto/rand`) och sparas i `baseDir/
+  master.key` — INTE hårdkodad i källkoden längre (fixat i samband med att
+  repot gjordes publikt, Fas 13, eftersom en hårdkodad, delad nyckel i
+  publik källkod hade gjort ALLA installationers krypterade hemligheter
+  dekrypterbara av vem som helst). `master.key` är inte i sig krypterad —
+  det finns inget att kryptera den under — skyddet kommer från
+  filsystemsrättigheter (0600) och systemd-sandboxningen. **Kvarvarande
+  känd begränsning:** ingen riktig HSM/TPM/Vault-integration än — det är
+  en separat, större nyckelhanteringsförbättring som fortfarande är öppen.
 - **Backup-filer (Fas 10) är oberoende av master-nyckeln** — en backup
   krypteras under en scrypt-härledd nyckel från en lösenfras
   administratören själv väljer vid varje backup-tillfälle, aldrig lagrad
@@ -120,8 +122,9 @@ men berör inte koden i praktiken.
   assistenten själv. Se `pentest_fas12_2026-08-19.md` (Doc-Harbor) för den
   senaste körningen. En riktig tredjeparts-pentest är fortsatt
   rekommenderad innan systemet körs som enda skydd mot internet.
-- **Inte skyddat mot en angripare som har källkoden**, p.g.a. den
-  hårdkodade master-nyckeln (se ovan).
+- **Källkoden är publik** (sedan Fas 13) — det innebär att design och
+  implementation är öppen för granskning, men betyder INTE att systemet är
+  granskat av någon oberoende part (se ovan).
 - **Ingen OTA/automatisk uppdatering.** Ett självuppdaterande system som
   hämtar och kör kod från nätet på en brandvägg är en känslig funktion i
   sig — det byggs medvetet inte i det här skedet. Uppdatering är manuell.

@@ -23,8 +23,7 @@ func main() {
 		log.Fatal("--password krävs")
 	}
 
-	masterKey := []byte("SecurityHarborMasterKey2026Secur")
-	st, err := store.NewStore(*configDir, masterKey)
+	st, err := store.NewStore(*configDir)
 	if err != nil {
 		log.Fatalf("Kunde inte öppna store: %v", err)
 	}
