@@ -139,6 +139,31 @@ mkdir -p "$DATA_DIR" "$CONF_DIR"
 chown -R security-harbor:security-harbor "$DATA_DIR" "$CONF_DIR"
 chmod 700 "$DATA_DIR"
 
+# Skrivrätt på de KONFIGURATIONSFILER agenten faktiskt behöver ändra i
+# andra paket. ReadWritePaths i systemd-enheten räcker INTE: den tar bara
+# bort systemds egen skrivspärr (ProtectSystem=strict), vanliga
+# fil-rättigheter gäller fortfarande - och agenten kör som den opriviligerade
+# användaren security-harbor.
+#
+# Upptäckt skarpt 2026-08-20: att slå på IDS i GUI:t och trycka Applicera
+# misslyckades alltid med "suricata: misslyckades skriva
+# /etc/suricata/suricata.yaml: permission denied", eftersom filen är
+# root:root 0644. Samma latenta fel fanns för centraliserad syslog, som
+# skapar en ny fil i /etc/rsyslog.d (också root:root). Övriga adaptrar
+# (unbound/kea/openvpn/wireguard) råkade fungera eftersom deras kataloger
+# redan chownades vid en tidigare installation.
+#
+# Group-write i stället för att chowna filerna: paketens uppdateringar äger
+# fortfarande sina filer, vi lägger bara till gruppåtkomst.
+if [ -f /etc/suricata/suricata.yaml ]; then
+  chgrp security-harbor /etc/suricata/suricata.yaml
+  chmod g+w /etc/suricata/suricata.yaml
+fi
+if [ -d /etc/rsyslog.d ]; then
+  chgrp security-harbor /etc/rsyslog.d
+  chmod g+ws /etc/rsyslog.d
+fi
+
 echo "=== 4. Installerar binärer ==="
 for bin in security-harbor-agent security-harbor-nmap-runner security-harbor-tcpdump-runner; do
   install -m 0755 -o root -g root "$SCRIPT_DIR/$bin" "$BIN_DIR/$bin"

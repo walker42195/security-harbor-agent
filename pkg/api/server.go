@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -102,18 +103,29 @@ func (s *Server) Start() error {
 	// inget om web-UI:t inte är driftsatt.
 	mux.Handle("/", http.FileServer(http.Dir(s.webUIDir)))
 
-	// wanBlockMiddleware och securityHeadersMiddleware omsluter HELA
+	// managementACLMiddleware och securityHeadersMiddleware omsluter HELA
 	// mux:en, så web-UI:t skyddas/får samma huvuden som Management-API:t.
-	handler := s.wanBlockMiddleware(securityHeadersMiddleware(mux))
+	handler := s.managementACLMiddleware(securityHeadersMiddleware(mux))
 
 	s.srv = &http.Server{
-		Addr:         s.bindAddr,
-		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		// IdleTimeout skyddar mot slow-loris-liknande resursutmattning via
-		// keep-alive-anslutningar som annars inte fångas av Read/WriteTimeout
-		// (de gäller bara EN aktiv request, inte tomgångstid mellan dem).
+		Addr:    s.bindAddr,
+		Handler: handler,
+		// ReadHeaderTimeout är den egentliga slow-loris-spärren: den kapar
+		// en anslutning som droppar headers byte-för-byte, oberoende av hur
+		// länge själva handlern sedan får köra.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// WriteTimeout måste rymma de MEDVETET långkörande diagnostik-
+		// endpointsen. Upptäckt vid kodgranskning 2026-08-20: den var satt
+		// till 15 s, medan handleNmap ger sig själv 5 minuter och en
+		// Suricata-omstart (Fas 9) ensam tar ~15 s på referensmaskinen —
+		// deadlinen sätts på anslutningen INNAN handlern körs, så en lång
+		// nmap-skanning eller ett IDS-apply hann aldrig få tillbaka sitt
+		// svar till GUI:t. 6 minuter ger 5-minutersskanningen marginal.
+		WriteTimeout: 6 * time.Minute,
+		// IdleTimeout skyddar mot resursutmattning via keep-alive-
+		// anslutningar som annars inte fångas av Read/WriteTimeout (de
+		// gäller bara EN aktiv request, inte tomgångstid mellan dem).
 		IdleTimeout: 60 * time.Second,
 		// MaxHeaderBytes: uttryckligt satt betydligt snävare än Go:s
 		// 1 MB-default — det här är ett internt JSON-API, inga rimliga
@@ -143,14 +155,69 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) wanBlockMiddleware(next http.Handler) http.Handler {
+// clientIP plockar ut käll-IP:n ur r.RemoteAddr på ett sätt som fungerar
+// för BÅDE IPv4 och IPv6.
+//
+// Upptäckt vid kodgranskning 2026-08-20: koden gjorde tidigare
+// strings.Split(r.RemoteAddr, ":")[0], vilket för en IPv6-klient
+// ("[::1]:54321") ger "[" — alltså samma nyckel för ALLA IPv6-klienter.
+// Eftersom den strängen används som nyckel i inloggningsspärren (se
+// AuthManager) delade varje IPv6-klient på en och samma försöksräknare:
+// fem misslyckade försök från vilken IPv6-adress som helst låste ute alla
+// andra IPv6-klienter, och en angripare kunde inte särskiljas från dem.
+func clientIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+// managementACLMiddleware begränsar Management-API:t till de nät
+// administratören listat i Settings.AllowedManagementLAN (CIDR eller bar
+// IP). Tom lista = ingen extra begränsning; nftables-reglerna (HARD WAN
+// DROP + "Allow Management API on LAN") är fortfarande den primära
+// spärren, det här är ett andra lager för den som vill snäva in ännu mer.
+//
+// Ersätter en tidigare "wanBlockMiddleware" som blockerade allt från det
+// HÅRDKODADE nätet 10.13.13.0/24 under rubriken "Management API disabled
+// on WAN interface". Det hade ingenting med brandväggens faktiska
+// WAN-gränssnitt att göra (10.13.13.x är ett internt nät i ett HELT annat
+// projekt) — den gav alltså noll skydd på en riktig installation samtidigt
+// som den låtsades göra det, och kunde dessutom av misstag stänga ute en
+// administratör som råkade ha just det nätet på insidan.
+// Settings.AllowedManagementLAN fanns redan i datamodellen men lästes
+// aldrig av någon kod; nu gör den faktiskt vad namnet säger.
+func (s *Server) managementACLMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-		if strings.HasPrefix(clientIP, "10.13.13.") {
-			http.Error(w, "Forbidden: Management API disabled on WAN interface", http.StatusForbidden)
+		cfg := s.engine.GetRunningConfig()
+		if cfg == nil || len(cfg.Settings.AllowedManagementLAN) == 0 {
+			next.ServeHTTP(w, r)
 			return
 		}
-		next.ServeHTTP(w, r)
+		ip := net.ParseIP(clientIP(r.RemoteAddr))
+		if ip != nil && ip.IsLoopback() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		for _, entry := range cfg.Settings.AllowedManagementLAN {
+			entry = strings.TrimSpace(entry)
+			if entry == "" || ip == nil {
+				continue
+			}
+			if strings.Contains(entry, "/") {
+				if _, netw, err := net.ParseCIDR(entry); err == nil && netw.Contains(ip) {
+					next.ServeHTTP(w, r)
+					return
+				}
+				continue
+			}
+			if allowed := net.ParseIP(entry); allowed != nil && allowed.Equal(ip) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		http.Error(w, "Forbidden: käll-IP ligger utanför tillåtna management-nät", http.StatusForbidden)
 	})
 }
 
@@ -229,7 +296,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+	ip := clientIP(r.RemoteAddr)
 
 	var creds struct {
 		Username string `json:"username"`
@@ -243,7 +310,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Spärren kollas för BÅDE käll-IP och användarnamn (Fas 12) — annars
 	// kan en angripare kringgå en ren IP-spärr genom att rotera käll-IP
 	// mot samma användarnamn.
-	if s.auth.IsLockedOut(clientIP, creds.Username) {
+	if s.auth.IsLockedOut(ip, creds.Username) {
 		http.Error(w, "Spärrad p.g.a. för många misslyckade försök", http.StatusTooManyRequests)
 		return
 	}
@@ -260,7 +327,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.auth.RecordFailedAttempt(clientIP, creds.Username)
+	s.auth.RecordFailedAttempt(ip, creds.Username)
 	http.Error(w, "Felaktigt användarnamn eller lösenord", http.StatusUnauthorized)
 }
 
@@ -640,6 +707,27 @@ func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(events)
 }
 
+// diagnosticHostPattern är en ALLOWLIST för mål till ping/traceroute/nmap:
+// IP-adresser (v4/v6), CIDR och värdnamn. Argumenten skickas aldrig via ett
+// skal (exec.Command anropar execve direkt) så klassisk shell-injektion är
+// inte möjlig — men ETT VÄRDE SOM BÖRJAR MED "-" tolkas av verktyget som en
+// egen flagga. handleNmap avvisade redan det; ping och traceroute gjorde det
+// INTE (upptäckt vid kodgranskning 2026-08-20), så en admin kunde t.ex.
+// skicka "-f" och få ping att köra flood-ping istället för fyra paket.
+// Alla tre går nu genom samma kontroll, och "--" avslutar dessutom
+// flagg-tolkningen hos verktyget som ett andra lager.
+var diagnosticHostPattern = regexp.MustCompile(`^[A-Za-z0-9._:\[\]/-]+$`)
+
+func validateDiagnosticHost(host string) error {
+	if host == "" || len(host) > 255 {
+		return fmt.Errorf("ogiltigt värde för host")
+	}
+	if strings.HasPrefix(host, "-") || !diagnosticHostPattern.MatchString(host) {
+		return fmt.Errorf("ogiltigt värde för host")
+	}
+	return nil
+}
+
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Host string `json:"host"`
@@ -648,7 +736,11 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Host saknas", http.StatusBadRequest)
 		return
 	}
-	out, _ := exec.Command("ping", "-c", "4", "-W", "2", req.Host).CombinedOutput()
+	if err := validateDiagnosticHost(req.Host); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	out, _ := exec.Command("ping", "-c", "4", "-W", "2", "--", req.Host).CombinedOutput()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
 }
@@ -661,7 +753,11 @@ func (s *Server) handleTraceroute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Host saknas", http.StatusBadRequest)
 		return
 	}
-	out, _ := exec.Command("traceroute", "-n", "-w", "1", "-m", "15", req.Host).CombinedOutput()
+	if err := validateDiagnosticHost(req.Host); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	out, _ := exec.Command("traceroute", "-n", "-w", "1", "-m", "15", "--", req.Host).CombinedOutput()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
 }
@@ -687,8 +783,8 @@ func (s *Server) handleNmap(w http.ResponseWriter, r *http.Request) {
 	// execve direkt) så klassisk shell-injektion är inte möjlig — men ett
 	// host-värde som börjar med "-" skulle annars tolkas som en egen
 	// nmap-flagga. Avvisa det explicit.
-	if strings.HasPrefix(req.Host, "-") {
-		http.Error(w, "Ogiltigt värde för host", http.StatusBadRequest)
+	if err := validateDiagnosticHost(req.Host); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if !req.SYNScan && !req.FullTCP && !req.UDPScan && !req.OSDetect {
@@ -1071,12 +1167,41 @@ func (s *Server) handleCandidateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// auditUser plockar ut den FAKTISKT inloggade användaren ur request-
+// contexten för revisionsloggen. Tidigare skickades strängen "master"
+// hårdkodat från apply/confirm/rollback — med flera administratörskonton
+// (Fas 8) blev revisionshistoriken därmed obrukbar, eftersom varje
+// ändring tillskrevs "master" oavsett vem som faktiskt gjorde den.
+func auditUser(r *http.Request) string {
+	if u, _ := r.Context().Value(ctxKeyUsername).(string); u != "" {
+		return u
+	}
+	return "okänd"
+}
+
+// detachedApplyContext ger en konfigurationsapplicering en EGEN livstid,
+// frikopplad från HTTP-requestens context.
+//
+// Upptäckt vid kodgranskning 2026-08-20: apply/rollback ärvde r.Context(),
+// som avbryts så fort klienten kopplar ner eller serverns WriteTimeout
+// löper ut. Mitt i ett apply innebär det att exec.CommandContext dödar
+// nft/systemctl HALVVÄGS — brandväggen kan då bli stående i ett delvis
+// applicerat tillstånd (t.ex. nya nftables-regler men gammal DHCP/IDS)
+// bara för att en webbläsarflik stängdes. En applicering måste få köra
+// klart och sedan antingen bekräftas eller rullas tillbaka av Safe
+// Apply-timern; den får aldrig avbrytas mitt i av klientsidan.
+func detachedApplyContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Minute)
+}
+
 func (s *Server) handleApplyConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.engine.ApplyCandidate(r.Context(), "master"); err != nil {
+	ctx, cancel := detachedApplyContext()
+	defer cancel()
+	if err := s.engine.ApplyCandidate(ctx, auditUser(r)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1089,7 +1214,9 @@ func (s *Server) handleConfirmConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.engine.ConfirmConfig(r.Context(), "master"); err != nil {
+	ctx, cancel := detachedApplyContext()
+	defer cancel()
+	if err := s.engine.ConfirmConfig(ctx, auditUser(r)); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1102,7 +1229,9 @@ func (s *Server) handleRollbackConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := s.engine.RollbackConfig(r.Context(), "master"); err != nil {
+	ctx, cancel := detachedApplyContext()
+	defer cancel()
+	if err := s.engine.RollbackConfig(ctx, auditUser(r)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

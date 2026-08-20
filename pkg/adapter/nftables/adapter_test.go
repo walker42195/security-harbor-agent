@@ -739,3 +739,173 @@ func TestRenderJSONZoneAnyIsUnrestricted(t *testing.T) {
 		t.Errorf("en policy med SourceZone=ANY/tomt DestZone ska fortfarande generera en regel: %s", string(data))
 	}
 }
+
+// TestRenderJSONLocalPolicyHonorsDropAction skyddar mot en bugg där
+// INPUT-kedjans loop för lokala policies alltid la till {"accept": nil}
+// utan att titta på pol.Action — en lokal regel som administratören satt
+// till "Denied (Drop)" i GUI:t renderades då som en ACCEPT-regel, alltså
+// raka motsatsen till vad GUI:t visade.
+func TestRenderJSONLocalPolicyHonorsDropAction(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Policies: []config.Policy{
+			{ID: "pol-ssh-deny", Name: "Blockera SSH", Enabled: true, Local: true, Service: "22", Action: config.ActionDrop},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `SH-DENY-INPUT-Blockera SSH: `) {
+		t.Errorf("en lokal drop-policy ska ge ett SH-DENY-INPUT-prefix, inte ett accept-prefix: %s", s)
+	}
+	if strings.Contains(s, `SH-ACCEPT-INPUT-Blockera SSH: `) {
+		t.Errorf("en lokal drop-policy renderades som ACCEPT — det är just buggen testet skyddar mot: %s", s)
+	}
+}
+
+// TestRenderJSONRejectActionGeneratesRule: config.ActionReject föll
+// tidigare igenom FORWARD-kedjans if/else-if utan att generera NÅGON
+// regel alls, dvs den var tyst verkningslös.
+func TestRenderJSONRejectActionGeneratesRule(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Policies: []config.Policy{
+			{ID: "pol-rej", Name: "Neka med svar", Enabled: true, SourceObj: "ANY", DestObj: "ANY", Service: "ANY", Action: config.ActionReject},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "Neka med svar") || !strings.Contains(s, `"reject"`) {
+		t.Errorf("en reject-policy ska generera en regel med ett reject-verdikt: %s", s)
+	}
+}
+
+// TestRenderJSONDNATForwardIsPortRestricted: följeregeln i FORWARD-kedjan
+// matchade tidigare BARA mål-IP:n, vilket öppnade ALLA portar och
+// protokoll mot den interna värden istället för bara den vidarebefordrade
+// tjänsten.
+func TestRenderJSONDNATForwardIsPortRestricted(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-dnat", Name: "Webbserver", Enabled: true, Action: config.ActionDNAT,
+				NAT: &config.NATConfig{ExternalPort: 443, InternalIP: "192.168.10.10", InternalPort: 8443, Protocol: "tcp"},
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("ogiltig JSON: %v", err)
+	}
+	elements, _ := root["nftables"].([]interface{})
+
+	found := false
+	for _, el := range elements {
+		m, _ := el.(map[string]interface{})
+		rule, _ := m["rule"].(map[string]interface{})
+		if rule == nil || rule["chain"] != "forward" {
+			continue
+		}
+		comment, _ := rule["comment"].(string)
+		if !strings.Contains(comment, "Webbserver") {
+			continue
+		}
+		found = true
+		exprs, _ := rule["expr"].([]interface{})
+		hasPort := false
+		for _, e := range exprs {
+			em, _ := e.(map[string]interface{})
+			match, _ := em["match"].(map[string]interface{})
+			if match == nil {
+				continue
+			}
+			left, _ := match["left"].(map[string]interface{})
+			payload, _ := left["payload"].(map[string]interface{})
+			if payload["field"] == "dport" && payload["protocol"] == "tcp" && match["right"] == float64(8443) {
+				hasPort = true
+			}
+		}
+		if !hasPort {
+			t.Errorf("DNAT-följeregeln saknar port/protokoll-matchning och öppnar därmed hela den interna värden: %s", string(data))
+		}
+	}
+	if !found {
+		t.Fatalf("hittade ingen DNAT-följeregel i forward-kedjan: %s", string(data))
+	}
+}
+
+// TestRenderJSONUnparseableServiceSkipsRule: en tjänstesträng som inte
+// gick att tolka gav tidigare en regel HELT UTAN portbegränsning — en
+// accept-regel avsedd för en enda port öppnade då tyst alla portar
+// (fail-open). Regeln ska hoppas över istället.
+func TestRenderJSONUnparseableServiceSkipsRule(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Policies: []config.Policy{
+			{ID: "pol-bad", Name: "Trasig tjänst", Enabled: true, SourceObj: "ANY", DestObj: "ANY", Service: "80,443", Action: config.ActionAccept},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	if strings.Contains(string(data), "Trasig tjänst") {
+		t.Errorf("en policy med en otolkbar tjänst ska hoppas över, inte bli en regel utan portbegränsning: %s", string(data))
+	}
+}
+
+// TestServiceMatchExprPortRange: portintervall ska stödjas, och portar
+// utanför 1-65535 avvisas (tidigare kollades bara > 0, så 99999 slank
+// igenom till nft som ett obegripligt lågnivåfel vid apply).
+func TestServiceMatchExprPortRange(t *testing.T) {
+	if _, ok := serviceMatchExpr("TCP:8000-8100"); !ok {
+		t.Errorf("portintervall TCP:8000-8100 ska kunna tolkas")
+	}
+	if _, ok := serviceMatchExpr("99999"); ok {
+		t.Errorf("port 99999 är utanför giltigt intervall och ska avvisas")
+	}
+	if _, ok := serviceMatchExpr("0"); ok {
+		t.Errorf("port 0 ska avvisas")
+	}
+	if expr, ok := serviceMatchExpr("ANY"); !ok || expr != nil {
+		t.Errorf("ANY ska ge (nil, true) = medvetet ingen begränsning")
+	}
+}

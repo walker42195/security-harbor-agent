@@ -74,6 +74,16 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 		return nil
 	}
 
+	// Dry-run kontrollerar att vi FAKTISKT kan skriva konfigurationsfilen
+	// innan något appliceras skarpt. Utan det upptäcktes ett rättighets-
+	// problem först mitt i apply-flödet, efter att nftables redan ändrats
+	// (se ApplyCandidate i pkg/engine). Felmeddelandet pekar ut åtgärden,
+	// eftersom orsaken annars är svårgissad: systemd-enhetens
+	// ReadWritePaths tillåter katalogen, men filen ägs av root och agenten
+	// kör som security-harbor.
+	if err := a.checkWritable(); err != nil {
+		return err
+	}
 	if dryRun {
 		return nil
 	}
@@ -96,6 +106,22 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 		return fmt.Errorf("systemctl restart %s misslyckades: %w - output: %s", unit, err, string(out))
 	}
 	return nil
+}
+
+// checkWritable verifierar att suricata.yaml finns och är skrivbar för
+// agentens användare, med ett felmeddelande som säger vad man ska göra.
+func (a *Adapter) checkWritable() error {
+	f, err := os.OpenFile(a.yamlPath, os.O_WRONLY, 0)
+	if err == nil {
+		return f.Close()
+	}
+	if os.IsNotExist(err) {
+		return fmt.Errorf("IDS kan inte aktiveras: %s saknas — är paketet suricata installerat? (apt install suricata suricata-update)", a.yamlPath)
+	}
+	if os.IsPermission(err) {
+		return fmt.Errorf("IDS kan inte aktiveras: agenten saknar skrivrätt på %s. Kör på brandväggen: sudo chgrp security-harbor %s && sudo chmod g+w %s", a.yamlPath, a.yamlPath, a.yamlPath)
+	}
+	return fmt.Errorf("IDS kan inte aktiveras: %s går inte att öppna för skrivning: %w", a.yamlPath, err)
 }
 
 // eveAlert är de fälten vi bryr oss om i en eve.json-rad av typen "alert".

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -29,12 +30,12 @@ const (
 )
 
 type Engine struct {
-	mu             sync.Mutex
-	store          *store.Store
-	nftAdapter     *nftables.Adapter
-	dhcpAdapter    *dhcp.Adapter
-	wgAdapter      *wireguard.Adapter
-	ovpnAdapter    *openvpn.Adapter
+	mu              sync.Mutex
+	store           *store.Store
+	nftAdapter      *nftables.Adapter
+	dhcpAdapter     *dhcp.Adapter
+	wgAdapter       *wireguard.Adapter
+	ovpnAdapter     *openvpn.Adapter
 	dnsAdapter      *dns.Adapter
 	syslogAdapter   *syslog.Adapter
 	suricataAdapter *suricata.Adapter
@@ -187,16 +188,39 @@ func (e *Engine) UpdateCandidate(cfg *config.Config) error {
 
 // ValidateCandidate validerar en candidate-konfiguration utan att ändra systemet.
 func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) error {
-	// 1. Kör dry-run validering av samtliga backends
+	// Ordningen är medveten: VÅRA egna, begripliga kontroller körs FÖRE
+	// backendarnas dry-run. Kördes de efter (som tidigare) vann alltid
+	// nft:s lågnivåfel kapplöpningen om vem som fick rapportera — en DNAT
+	// med ogiltig intern IP och port 99999 gav t.ex. "Could not resolve
+	// hostname: Temporary failure in name resolution / Service out of
+	// range" i GUI:t, i stället för "policy X: intern mål-IP ... är inte en
+	// giltig IP-adress". Samma fel, obegripligt formulerat.
+	if len(cfg.Interfaces) == 0 {
+		return fmt.Errorf("konfigurationen måste ha minst ett gränssnitt")
+	}
+	if err := validatePolicies(cfg); err != nil {
+		return err
+	}
+
+	// Därefter backendarnas egen dry-run (nft -c, Kea, Unbound m.fl.), som
+	// fångar allt vi inte modellerar själva.
 	if err := e.applyBackends(ctx, cfg, true); err != nil {
 		return fmt.Errorf("validering misslyckades: %w", err)
 	}
 
-	// 2. Validera IP-överlapp och logiska fel
-	if len(cfg.Interfaces) == 0 {
-		return fmt.Errorf("konfigurationen måste ha minst ett gränssnitt")
-	}
+	return nil
+}
 
+// validatePolicies kör de policy-nära kontrollerna: att varje zon-val
+// matchar ett konfigurerat gränssnitt, att tjänste-/portsträngen går att
+// tolka, och att DNAT-parametrarna är kompletta.
+//
+// Zon-kontrollen finns eftersom nftables-adaptern (se zoneMatchExpr)
+// annars tyst hoppar över regeln — samma skydd mot "matcha allt" som redan
+// finns för tomma objekt-listor — vilket utan kontrollen bara syns som att
+// "regeln aldrig gör något", obegripligt för en administratör som skrivit
+// fel zonnamn.
+func validatePolicies(cfg *config.Config) error {
 	// 3. Validera att varje policys zon-val faktiskt matchar något
 	// konfigurerat gränssnitt — annars hoppar nftables-adaptern (se
 	// zoneMatchExpr, pkg/adapter/nftables) tyst över regeln (samma skydd
@@ -210,7 +234,33 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 	// kontrollen fanns (upptäckt skarpt 2026-08-19, samma dag kontrollen
 	// lades till).
 	for _, pol := range cfg.Policies {
-		if !pol.Enabled || pol.Local || pol.Action == config.ActionDNAT {
+		if !pol.Enabled {
+			continue
+		}
+
+		// 4. Tjänste-/portsträngen måste gå att tolka. En otolkbar sträng
+		// (t.ex. "80,443" eller en felstavning) fick tidigare
+		// nftables-adaptern att generera en regel HELT UTAN portbegränsning
+		// — en accept-regel avsedd för en enda port öppnade då tyst alla
+		// portar. Adaptern hoppar numera över sådana regler istället
+		// (fail-closed), men utan den här kontrollen hade användaren bara
+		// sett att regeln "aldrig gör något", utan att förstå varför.
+		if err := validatePolicyService(cfg, pol); err != nil {
+			return err
+		}
+
+		// 5. DNAT-parametrar måste vara kompletta och rimliga — annars
+		// genereras en trasig prerouting-regel som nft avvisar med ett
+		// lågnivåfel långt från orsaken.
+		if pol.Action == config.ActionDNAT {
+			if err := validatePolicyNAT(pol); err != nil {
+				return err
+			}
+			// DNAT-policyer undantas från zon-kontrollen nedan.
+			continue
+		}
+
+		if pol.Local {
 			continue
 		}
 		if err := validatePolicyZone(cfg, pol.Name, "källzonen", pol.SourceZone); err != nil {
@@ -221,6 +271,42 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 		}
 	}
 
+	return nil
+}
+
+// validatePolicyService kontrollerar att policyns Service-referens går att
+// översätta till ett nftables-matchningsuttryck — samma parsning som
+// nftables-adaptern använder vid rendering, exponerad som ett begripligt
+// valideringsfel istället för en tyst bortvald regel.
+func validatePolicyService(cfg *config.Config, pol config.Policy) error {
+	if nftables.PolicyServiceIsParseable(cfg, pol.Service) {
+		return nil
+	}
+	return fmt.Errorf(
+		"policy %q: tjänsten/porten %q går inte att tolka (använd t.ex. \"443\", \"TCP:443\", \"UDP:53\", \"TCP:8000-8100\", \"ICMP\" eller \"ANY\" — en lista som \"80,443\" måste läggas upp som en Tjänst med flera portar under Tjänster)",
+		pol.Name, pol.Service)
+}
+
+// validatePolicyNAT kontrollerar att en DNAT-policy har de fält som
+// prerouting-regeln faktiskt behöver.
+func validatePolicyNAT(pol config.Policy) error {
+	if pol.NAT == nil {
+		return fmt.Errorf("policy %q: port forwarding (DNAT) saknar NAT-inställningar", pol.Name)
+	}
+	if net.ParseIP(pol.NAT.InternalIP) == nil {
+		return fmt.Errorf("policy %q: intern mål-IP %q är inte en giltig IP-adress", pol.Name, pol.NAT.InternalIP)
+	}
+	if pol.NAT.ExternalIP != "" && net.ParseIP(pol.NAT.ExternalIP) == nil {
+		return fmt.Errorf("policy %q: extern IP %q är inte en giltig IP-adress", pol.Name, pol.NAT.ExternalIP)
+	}
+	for label, port := range map[string]int{"extern port": pol.NAT.ExternalPort, "intern port": pol.NAT.InternalPort} {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("policy %q: %s %d ligger utanför giltigt intervall 1-65535", pol.Name, label, port)
+		}
+	}
+	if proto := strings.ToLower(pol.NAT.Protocol); proto != "" && proto != "tcp" && proto != "udp" {
+		return fmt.Errorf("policy %q: protokollet %q stöds inte för port forwarding (använd tcp eller udp)", pol.Name, pol.NAT.Protocol)
+	}
 	return nil
 }
 
@@ -277,9 +363,27 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 		return fmt.Errorf("kan inte applicera ogiltig konfiguration: %w", err)
 	}
 
-	// Applicera skarpt mot Linux-kärnan (nftables, Kea DHCP, WireGuard)
+	// Applicera skarpt mot Linux-kärnan (nftables, Kea DHCP, WireGuard).
+	//
+	// applyBackends applicerar backendsen i tur och ordning med nftables
+	// FÖRST. Om en senare backend fallerar (upptäckt skarpt 2026-08-20:
+	// suricata kunde inte skriva /etc/suricata/suricata.yaml) hann de
+	// tidigare redan ändra systemet — brandväggen stod då kvar med
+	// candidate-konfigurationens nftables-regler medan API:t svarade
+	// "misslyckades", och eftersom vi returnerar innan state sätts till
+	// StateUnconfirmed startades ingen Safe Apply-timer som kunde städa
+	// upp. Resultatet var ett tyst halvapplicerat tillstånd som ingen
+	// automatik rullade tillbaka. Nu återställs running-konfigurationen
+	// omedelbart vid ett misslyckat apply, så systemet alltid landar i ett
+	// känt tillstånd.
 	if err := e.applyBackends(ctx, candidate, false); err != nil {
-		return fmt.Errorf("misslyckades applicera konfiguration: %w", err)
+		applyErr := err
+		if rbErr := e.applyBackends(ctx, e.store.GetRunningConfig(), false); rbErr != nil {
+			log.Printf("[SAFE APPLY] KRITISKT: apply misslyckades (%v) OCH återställningen till running config misslyckades (%v) — systemet kan vara halvapplicerat", applyErr, rbErr)
+			return fmt.Errorf("misslyckades applicera konfiguration: %w (återställningen misslyckades också: %v)", applyErr, rbErr)
+		}
+		_ = e.store.LogAudit(user, "APPLY_FAILED_ROLLED_BACK", fmt.Sprintf("Apply misslyckades (%v), återställde till running config", applyErr))
+		return fmt.Errorf("misslyckades applicera konfiguration: %w", applyErr)
 	}
 
 	e.state = StateUnconfirmed
@@ -587,19 +691,27 @@ func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
 		return fmt.Errorf("ids: kunde inte läsa larm: %w", err)
 	}
 
-	var obj *config.Object
+	// Kopiera ut Values i stället för att ta en pekare in i den DELADE
+	// running-konfigurationen: den läses samtidigt av API-handlers (t.ex.
+	// GET /config/running) och av nftables-renderingen, så ett append rakt
+	// in i den slicen är en datakapplöpning (upptäckt vid kodgranskning
+	// 2026-08-20). Skrivningen sker i stället samlat via
+	// store.UpdateObjectValuesDirect, som tar store-låset.
+	var objID string
+	var values []string
 	for i := range cfg.Objects {
 		if cfg.Objects[i].ID == cfg.IDS.AutoBlockObjectID {
-			obj = &cfg.Objects[i]
+			objID = cfg.Objects[i].ID
+			values = append(values, cfg.Objects[i].Values...)
 			break
 		}
 	}
-	if obj == nil {
+	if objID == "" {
 		return fmt.Errorf("ids: auto-block-objektet %q finns inte", cfg.IDS.AutoBlockObjectID)
 	}
 
 	blocked := map[string]bool{}
-	for _, ip := range obj.Values {
+	for _, ip := range values {
 		blocked[ip] = true
 	}
 
@@ -617,7 +729,7 @@ func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
 		}
 		if !blocked[ev.SrcIP] {
 			blocked[ev.SrcIP] = true
-			obj.Values = append(obj.Values, ev.SrcIP)
+			values = append(values, ev.SrcIP)
 			added = true
 		}
 	}
@@ -627,7 +739,7 @@ func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
 		return nil
 	}
 
-	if err := e.store.UpdateObjectValuesDirect(obj.ID, obj.Values); err != nil {
+	if err := e.store.UpdateObjectValuesDirect(objID, values); err != nil {
 		return fmt.Errorf("ids: kunde inte spara auto-block-objektet: %w", err)
 	}
 	return e.ReapplyNftablesOnly(ctx)

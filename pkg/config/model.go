@@ -269,10 +269,17 @@ const (
 
 // Policy representerar en brandväggs- eller NAT-regel.
 type Policy struct {
-	ID          string       `json:"id"`
-	Name        string       `json:"name"`
-	Enabled     bool         `json:"enabled"`
-	Priority    int          `json:"priority"`      // Lägre nummer = högre prioritet
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// Priority är ENBART ett informativt fält. Den faktiska
+	// matchningsordningen i nftables bestäms av ordningen i Config.Policies
+	// (första matchande regel vinner) — se nftables-adapterns rendering och
+	// _movePolicy i GUI:ts policies_screen.dart, som därför flyttar posten i
+	// listan i stället för att ändra ett nummer. Kommentaren sa tidigare
+	// "Lägre nummer = högre prioritet", vilket var direkt missvisande:
+	// ingen kod har någonsin sorterat på fältet.
+	Priority    int          `json:"priority"`
 	SourceZone  string       `json:"source_zone"`   // Zon eller "ANY"
 	DestZone    string       `json:"dest_zone"`     // Zon eller "ANY"
 	SourceObj   string       `json:"source_obj"`    // Objekt-ID eller "ANY"

@@ -72,6 +72,18 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 		return err
 	}
 
+	// Samma resonemang som suricata-adapterns checkWritable: /etc/rsyslog.d
+	// ägs av root, agenten kör som security-harbor, och systemd-enhetens
+	// ReadWritePaths tar bara bort systemds egen spärr — inte de vanliga
+	// fil-rättigheterna. Utan den här dry-run-kontrollen upptäcktes
+	// problemet först mitt i ett skarpt apply, efter att nftables redan
+	// ändrats.
+	if conf != "" {
+		if err := checkDirWritable(a.dir); err != nil {
+			return err
+		}
+	}
+
 	if dryRun {
 		return nil
 	}
@@ -99,5 +111,21 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 	if out, err := exec.CommandContext(ctx, "systemctl", "reload-or-restart", "rsyslog.service").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl reload-or-restart rsyslog.service misslyckades: %w - output: %s", err, string(out))
 	}
+	return nil
+}
+
+// checkDirWritable verifierar att agenten faktiskt får skapa filer i
+// katalogen, med ett felmeddelande som säger vad man ska göra åt det.
+func checkDirWritable(dir string) error {
+	probe := filepath.Join(dir, ".security-harbor-write-test")
+	f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		if os.IsPermission(err) {
+			return fmt.Errorf("syslog-vidarebefordran kan inte aktiveras: agenten saknar skrivrätt i %s. Kör på brandväggen: sudo chgrp security-harbor %s && sudo chmod g+ws %s", dir, dir, dir)
+		}
+		return fmt.Errorf("syslog-vidarebefordran kan inte aktiveras: %s går inte att skriva i: %w", dir, err)
+	}
+	_ = f.Close()
+	_ = os.Remove(probe)
 	return nil
 }

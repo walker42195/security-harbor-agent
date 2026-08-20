@@ -22,13 +22,59 @@ func logSlug(name string) string {
 	return strings.ReplaceAll(name, ":", "-")
 }
 
+// portMatchExpr bygger ett dport-matchningsuttryck för ETT portnummer
+// eller ett portintervall ("8000-8100"). Returnerar ok=false för allt
+// annat, så anroparen kan skilja "kunde inte tolkas" från "ANY".
+func portMatchExpr(proto, spec string) (expr map[string]interface{}, ok bool) {
+	left := map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}}
+
+	if lo, hi, isRange := strings.Cut(spec, "-"); isRange {
+		loNum, errLo := strconv.Atoi(strings.TrimSpace(lo))
+		hiNum, errHi := strconv.Atoi(strings.TrimSpace(hi))
+		if errLo != nil || errHi != nil || !validPort(loNum) || !validPort(hiNum) || loNum > hiNum {
+			return nil, false
+		}
+		return map[string]interface{}{
+			"match": map[string]interface{}{
+				"op":    "==",
+				"left":  left,
+				"right": map[string]interface{}{"range": []int{loNum, hiNum}},
+			},
+		}, true
+	}
+
+	portNum, err := strconv.Atoi(spec)
+	if err != nil || !validPort(portNum) {
+		return nil, false
+	}
+	return map[string]interface{}{
+		"match": map[string]interface{}{"op": "==", "left": left, "right": portNum},
+	}, true
+}
+
+// validPort: 1-65535. Den gamla koden kollade bara > 0, så t.ex. port
+// 99999 slank igenom hela vägen till nft (som avvisar den vid apply — ett
+// obegripligt lågnivåfel istället för ett tydligt valideringsfel).
+func validPort(p int) bool { return p >= 1 && p <= 65535 }
+
 // serviceMatchExpr bygger nftables match-uttryck för en Service-sträng, t.ex.
-// "ANY", "ICMP", "22", "UDP:53". Delas mellan FORWARD-kedjans policies och
-// INPUT-kedjans lokala åtkomstpolicies för att undvika dubblerad parsning.
-func serviceMatchExpr(service string) []interface{} {
+// "ANY", "ICMP", "22", "UDP:53", "TCP:8000-8100". Delas mellan FORWARD-kedjans
+// policies och INPUT-kedjans lokala åtkomstpolicies för att undvika dubblerad
+// parsning.
+//
+// Returnerar (nil, true) för "ANY"/tomt = medvetet ingen portbegränsning, och
+// (nil, false) om strängen inte gick att tolka. Den skillnaden är viktig:
+// tidigare returnerade funktionen bara nil i BÅDA fallen, vilket gjorde en
+// oläslig tjänstesträng (t.ex. "80,443" eller en felstavning) till en regel
+// HELT UTAN portbegränsning — en accept-regel avsedd för en enda port
+// öppnade då tyst alla portar. Fail-open i en brandvägg; upptäckt vid
+// kodgranskning 2026-08-20. Anroparen hoppar nu över regeln istället, och
+// engine.ValidateCandidate ger användaren ett begripligt fel innan det ens
+// går så långt.
+func serviceMatchExpr(service string) (expr []interface{}, ok bool) {
 	svcUpper := strings.ToUpper(strings.TrimSpace(service))
 	if svcUpper == "ANY" || svcUpper == "" {
-		return nil
+		return nil, true
 	}
 	if svcUpper == "ICMP" || svcUpper == "PING" {
 		return []interface{}{
@@ -39,47 +85,40 @@ func serviceMatchExpr(service string) []interface{} {
 					"right": "icmp",
 				},
 			},
-		}
+		}, true
 	}
-	if strings.HasPrefix(svcUpper, "UDP") || strings.Contains(svcUpper, "UDP:") {
-		portStr := strings.TrimPrefix(svcUpper, "UDP:")
-		portStr = strings.TrimSpace(strings.TrimPrefix(portStr, "UDP"))
-		if portNum, err := strconv.Atoi(portStr); err == nil && portNum > 0 {
+
+	for _, p := range []string{"udp", "tcp"} {
+		prefix := strings.ToUpper(p)
+		if !strings.HasPrefix(svcUpper, prefix) {
+			continue
+		}
+		portStr := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(svcUpper, prefix), ":"))
+		if portStr == "" || portStr == "ANY" {
+			// Rent "TCP"/"UDP" utan port = hela protokollet.
 			return []interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
 						"op":    "==",
-						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}},
-						"right": portNum,
+						"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
+						"right": p,
 					},
 				},
-			}
+			}, true
 		}
-		return []interface{}{
-			map[string]interface{}{
-				"match": map[string]interface{}{
-					"op":    "==",
-					"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "l4proto"}},
-					"right": "udp",
-				},
-			},
+		m, valid := portMatchExpr(p, portStr)
+		if !valid {
+			return nil, false
 		}
+		return []interface{}{m}, true
 	}
-	// TCP eller rent portnummer
-	cleanPort := strings.TrimPrefix(svcUpper, "TCP:")
-	cleanPort = strings.TrimSpace(strings.TrimPrefix(cleanPort, "TCP"))
-	if portNum, err := strconv.Atoi(cleanPort); err == nil && portNum > 0 {
-		return []interface{}{
-			map[string]interface{}{
-				"match": map[string]interface{}{
-					"op":    "==",
-					"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
-					"right": portNum,
-				},
-			},
-		}
+
+	// Rent portnummer/-intervall utan protokollprefix tolkas som TCP.
+	m, valid := portMatchExpr("tcp", svcUpper)
+	if !valid {
+		return nil, false
 	}
-	return nil
+	return []interface{}{m}, true
 }
 
 // scheduleMatchExpr bygger ett nftables match-uttryck som begränsar en
@@ -123,13 +162,16 @@ func scheduleMatchExpr(sched *config.PolicySchedule) []interface{} {
 // istället EN regel per set (alla med samma action/kommentar) — samma
 // mönster som redan används för IP-objekt (se objectMatchExpr).
 // visited förhindrar en oändlig loop om grupper råkar peka på varandra.
-func resolveServiceMatchExprSets(cfg *config.Config, serviceRef string, visited map[string]bool) [][]interface{} {
+// Returnerar (sets, false) om NÅGON del av tjänsten inte gick att tolka —
+// anroparen ska då hoppa över policyn helt istället för att generera en
+// regel utan portbegränsning (se serviceMatchExpr om varför).
+func resolveServiceMatchExprSets(cfg *config.Config, serviceRef string, visited map[string]bool) (sets [][]interface{}, ok bool) {
 	trimmed := strings.TrimSpace(serviceRef)
 	if trimmed == "" || strings.EqualFold(trimmed, "ANY") {
-		return [][]interface{}{nil}
+		return [][]interface{}{nil}, true
 	}
 	if visited[trimmed] {
-		return nil
+		return nil, true
 	}
 	visited[trimmed] = true
 
@@ -138,29 +180,43 @@ func resolveServiceMatchExprSets(cfg *config.Config, serviceRef string, visited 
 			continue
 		}
 		if svc.Protocol == "group" {
-			var sets [][]interface{}
 			for _, memberID := range svc.Members {
-				sets = append(sets, resolveServiceMatchExprSets(cfg, memberID, visited)...)
+				memberSets, memberOK := resolveServiceMatchExprSets(cfg, memberID, visited)
+				if !memberOK {
+					return nil, false
+				}
+				sets = append(sets, memberSets...)
 			}
-			return sets
+			return sets, true
 		}
 		if len(svc.Ports) == 0 {
-			return [][]interface{}{serviceMatchExpr(svc.Protocol)}
+			expr, exprOK := serviceMatchExpr(svc.Protocol)
+			if !exprOK {
+				return nil, false
+			}
+			return [][]interface{}{expr}, true
 		}
-		var sets [][]interface{}
 		for _, port := range svc.Ports {
 			ref := port
 			if svc.Protocol != "" && !strings.EqualFold(svc.Protocol, "any") {
 				ref = strings.ToUpper(svc.Protocol) + ":" + port
 			}
-			sets = append(sets, serviceMatchExpr(ref))
+			expr, exprOK := serviceMatchExpr(ref)
+			if !exprOK {
+				return nil, false
+			}
+			sets = append(sets, expr)
 		}
-		return sets
+		return sets, true
 	}
 
 	// Inget Service-ID matchade -> tolka som en preset-sträng direkt
 	// (bakåtkompatibelt med hur GUI:t sparade Policy.Service innan Fas 7).
-	return [][]interface{}{serviceMatchExpr(trimmed)}
+	expr, exprOK := serviceMatchExpr(trimmed)
+	if !exprOK {
+		return nil, false
+	}
+	return [][]interface{}{expr}, true
 }
 
 // resolveObjectCIDRs slår upp ett Object-ID mot cfg.Objects och returnerar
@@ -324,6 +380,40 @@ func zoneMatchExpr(cfg *config.Config, zoneSpec, metaKey string, wanDevices, lan
 			},
 		},
 	}, false
+}
+
+// actionVerdictExpr översätter en PolicyAction till nftables terminala
+// verdikt-uttryck, plus det log-prefix-ord ("ACCEPT"/"DENY") som
+// pkg/api/server.go:parseFirewallLog förväntar sig.
+//
+// Upptäckt vid kodgranskning 2026-08-20: INPUT-kedjans loop för lokala
+// policies (pol.Local) lade tidigare ALLTID till {"accept": nil} utan att
+// ens titta på pol.Action — en lokal regel som administratören satt till
+// "Denied (Drop)" i GUI:t renderades alltså som en ACCEPT-regel, alltså
+// raka motsatsen till vad som visades. FORWARD-kedjan läste visserligen
+// Action, men kände bara igen accept/drop: en "reject"-policy (finns i
+// config.ActionReject och kan komma via API/backup-återläsning) föll
+// igenom helt utan att generera NÅGON regel, dvs tyst verkningslös.
+// Båda ställena går nu via den här gemensamma funktionen.
+//
+// ok=false betyder att verdiktet inte hör hemma i en filterkedja
+// (dnat/snat/masquerade hanteras i NAT-kedjorna) — anroparen ska då hoppa
+// över regeln istället för att generera en regel utan verdikt (som skulle
+// bli en ren "räkna och fortsätt"-regel, inte det användaren bad om).
+func actionVerdictExpr(action config.PolicyAction) (verdict map[string]interface{}, logWord string, ok bool) {
+	switch action {
+	case config.ActionAccept:
+		return map[string]interface{}{"accept": nil}, "ACCEPT", true
+	case config.ActionDrop:
+		return map[string]interface{}{"drop": nil}, "DENY", true
+	case config.ActionReject:
+		// icmpx/admin-prohibited ger ett tydligt "nekad"-svar till
+		// avsändaren istället för drop:ens tystnad — verifierat mot skarp
+		// `nft -j -c` 2026-08-20.
+		return map[string]interface{}{"reject": map[string]interface{}{"type": "icmpx", "expr": "admin-prohibited"}}, "DENY", true
+	default:
+		return nil, "", false
+	}
 }
 
 type Adapter struct {
@@ -524,8 +614,29 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		if !pol.Local || !pol.Enabled {
 			continue
 		}
+		// Verdiktet MÅSTE följa pol.Action — se actionVerdictExpr för den
+		// bugg som gjorde att en lokal drop-policy renderades som accept.
+		// Ett tomt Action-fält på en LOKAL policy behandlas som accept —
+		// exakt det beteende INPUT-kedjan hade före den här ändringen. Att
+		// istället hoppa över regeln hade riskerat att tyst ta bort en
+		// befintlig SSH-åtkomstregel i en äldre konfiguration och låsa ute
+		// administratören. (FORWARD-kedjan hoppade redan över tomt Action
+		// och fortsätter göra det — där hade ett accept-default istället
+		// ÖPPNAT trafik som tidigare var stängd.)
+		localAction := pol.Action
+		if localAction == "" {
+			localAction = config.ActionAccept
+		}
+		verdict, logWord, ok := actionVerdictExpr(localAction)
+		if !ok {
+			continue
+		}
+		svcSets, svcOK := resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{})
+		if !svcOK {
+			continue
+		}
 		for _, lanDev := range lanDevices {
-			for _, svcExpr := range resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{}) {
+			for _, svcExpr := range svcSets {
 				rule := &Rule{
 					Family:  a.family,
 					Table:   a.tableName,
@@ -544,8 +655,8 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
 				rule.Expr = append(rule.Expr, svcExpr...)
 				rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
-				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-ACCEPT-INPUT-%s: ", logSlug(pol.Name))}})
-				rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
+				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-%s-INPUT-%s: ", logWord, logSlug(pol.Name))}})
+				rule.Expr = append(rule.Expr, verdict)
 				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			}
 		}
@@ -669,23 +780,54 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 
 			// Om detta är en Port Forwarding (DNAT) policy sköts den i prerouting/forward
 			if pol.Action == config.ActionDNAT && pol.NAT != nil {
-				// Tillåt forwarding till den interna IP-adressen vid DNAT
+				// Följeregeln som släpper igenom den DNAT:ade trafiken i
+				// FORWARD-kedjan måste matcha EXAKT den vidarebefordrade
+				// tjänsten — inte bara mål-IP:n.
+				//
+				// Upptäckt vid kodgranskning 2026-08-20: regeln matchade
+				// tidigare BARA `ip daddr == InternalIP` och accepterade.
+				// En port forward av t.ex. TCP 443 till 192.168.10.10 öppnade
+				// i praktiken ALLA portar och ALLA protokoll mot den interna
+				// värden, från VILKEN källa som helst (inklusive andra interna
+				// zoner som annars stoppas av Default Deny Inter-VLAN) — en
+				// långt bredare öppning än den enda port administratören bad
+				// om. Nu matchas protokoll + INTERN målport (porten efter
+				// DNAT-översättningen, eftersom prerouting redan skrivit om
+				// paketet när det når forward-kedjan).
+				dnatProto := "tcp"
+				if pol.NAT.Protocol != "" {
+					dnatProto = pol.NAT.Protocol
+				}
+				dnatExpr := []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+							"right": pol.NAT.InternalIP,
+						},
+					},
+				}
+				if pol.NAT.InternalPort > 0 {
+					dnatExpr = append(dnatExpr, map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": dnatProto, "field": "dport"}},
+							"right": pol.NAT.InternalPort,
+						},
+					})
+				}
+				dnatExpr = append(dnatExpr,
+					map[string]interface{}{"counter": nil},
+					map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-ACCEPT-FWD-%s: ", logSlug(pol.Name))}},
+					map[string]interface{}{"accept": nil},
+				)
 				root.Nftables = append(root.Nftables, NFTElement{
 					Rule: &Rule{
 						Family:  a.family,
 						Table:   a.tableName,
 						Chain:   "forward",
 						Comment: fmt.Sprintf("Allow DNAT forwarding for %s", pol.Name),
-						Expr: []interface{}{
-							map[string]interface{}{
-								"match": map[string]interface{}{
-									"op":    "==",
-									"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
-									"right": pol.NAT.InternalIP,
-								},
-							},
-							map[string]interface{}{"accept": nil},
-						},
+						Expr:    dnatExpr,
 					},
 				})
 				continue
@@ -718,7 +860,19 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				continue
 			}
 
-			for _, svcExpr := range resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{}) {
+			// Samma gemensamma verdikt-översättning som INPUT-kedjan ovan —
+			// täcker nu även config.ActionReject, som tidigare föll igenom
+			// utan att generera någon regel alls.
+			verdict, logWord, ok := actionVerdictExpr(pol.Action)
+			if !ok {
+				continue
+			}
+			svcSets, svcOK := resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{})
+			if !svcOK {
+				continue
+			}
+
+			for _, svcExpr := range svcSets {
 				rule := &Rule{
 					Family:  a.family,
 					Table:   a.tableName,
@@ -733,16 +887,9 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				rule.Expr = append(rule.Expr, dstExpr...)
 				rule.Expr = append(rule.Expr, svcExpr...)
 				rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
-
-				if pol.Action == config.ActionAccept {
-					rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-ACCEPT-FWD-%s: ", logSlug(pol.Name))}})
-					rule.Expr = append(rule.Expr, map[string]interface{}{"accept": nil})
-					root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
-				} else if pol.Action == config.ActionDrop {
-					rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-DENY-FWD-%s: ", logSlug(pol.Name))}})
-					rule.Expr = append(rule.Expr, map[string]interface{}{"drop": nil})
-					root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
-				}
+				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-%s-FWD-%s: ", logWord, logSlug(pol.Name))}})
+				rule.Expr = append(rule.Expr, verdict)
+				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			}
 		}
 
@@ -886,4 +1033,13 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 	}
 
 	return rulesetJSON, nil
+}
+
+// PolicyServiceIsParseable exponerar tjänste-/portparsningen för
+// pkg/engine:s ValidateCandidate, så validering och rendering garanterat
+// använder EXAKT samma tolkning (annars kan validering säga OK om något
+// renderingen sedan hoppar över, eller tvärtom).
+func PolicyServiceIsParseable(cfg *config.Config, serviceRef string) bool {
+	_, ok := resolveServiceMatchExprSets(cfg, serviceRef, map[string]bool{})
+	return ok
 }

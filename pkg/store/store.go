@@ -81,11 +81,21 @@ func (s *Store) loadOrInit(seedMode string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// running och candidate måste vara SEPARATA objekt, inte två pekare
+	// till samma struct. Tidigare tilldelades samma pekare till båda, vilket
+	// betyder att allt som skriver i candidate (t.ex. UpdateObjectValues
+	// eller IDS-auto-block) samtidigt skrev i running — utan att en enda
+	// commit gjorts. Rollback-garantin i Safe Apply bygger på att running
+	// är den orörda "senast kända säkra" konfigurationen; delade de objekt
+	// fanns i praktiken inget att rulla tillbaka TILL.
+	// (Upptäckt vid kodgranskning 2026-08-20. I praktiken maskerades det
+	// oftast av att SetCandidateConfig byter ut candidate-pekaren vid
+	// första GUI-ändringen, men fönstret dessförinnan var verkligt.)
 	runningPath := filepath.Join(s.baseDir, "running.json")
 	if _, err := os.Stat(runningPath); os.IsNotExist(err) {
 		defaultCfg := defaultSeedConfig(seedMode)
 		s.runningCfg = defaultCfg
-		s.candidateCfg = defaultCfg
+		s.candidateCfg = cloneConfig(defaultCfg)
 		return s.saveConfigLocked(runningPath, defaultCfg)
 	}
 
@@ -100,8 +110,28 @@ func (s *Store) loadOrInit(seedMode string) error {
 	}
 
 	s.runningCfg = &cfg
-	s.candidateCfg = &cfg
+	s.candidateCfg = cloneConfig(&cfg)
 	return nil
+}
+
+// cloneConfig gör en djup kopia via JSON-serialisering. Configen är ren
+// data (inga funktioner/kanaler/cykler) och sparas redan som JSON, så
+// round-trippen är förlustfri per definition — samma representation som
+// filen på disk. Vid ett (i praktiken omöjligt) fel returneras originalet
+// hellre än nil, så anroparen aldrig får en nil-config.
+func cloneConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return cfg
+	}
+	var out config.Config
+	if err := json.Unmarshal(data, &out); err != nil {
+		return cfg
+	}
+	return &out
 }
 
 // defaultSeedConfig bygger standardkonfigurationen för en helt ny
@@ -427,7 +457,11 @@ func (s *Store) CommitCandidate() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.runningCfg = s.candidateCfg
+	// Kopia, inte samma pekare — se cloneConfig/loadOrInit. Annars pekar
+	// running och candidate på samma struct igen efter varje commit, och
+	// nästa direktskrivning i candidate (hotlist-uppdatering, IDS-auto-
+	// block) muterar running i smyg.
+	s.runningCfg = cloneConfig(s.candidateCfg)
 	runningPath := filepath.Join(s.baseDir, "running.json")
 	return s.saveConfigLocked(runningPath, s.runningCfg)
 }

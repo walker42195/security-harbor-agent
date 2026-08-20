@@ -67,12 +67,53 @@ func recordFailedAttemptLocked(attempts map[string]int, lockouts map[string]time
 	}
 }
 
+// pruneLocked rensar utgångna sessioner och utgångna lockout-poster.
+//
+// Upptäckt vid kodgranskning 2026-08-20: inget av de fyra map:arna
+// städades någonsin. sessions växte med en post per inloggning och
+// behöll dem för evigt (utgångna tokens avvisades korrekt, men posten låg
+// kvar). Allvarligare var userAttempts/userLockouts: nyckeln är det
+// ANVÄNDARNAMN klienten skickar in, så en angripare kunde skicka
+// misslyckade inloggningar med ett nytt påhittat användarnamn varje gång
+// och få agenten att allokera obegränsat med minne — en enkel
+// minnesutmattnings-DoS mot en brandvägg som ska vara det som står emot
+// sådant. Städningen körs vid inloggning/tokenvalidering, alltså utan en
+// egen bakgrundsgoroutine att hålla reda på.
+func (a *AuthManager) pruneLocked() {
+	now := time.Now()
+	for token, sess := range a.sessions {
+		if now.After(sess.ExpiresAt) {
+			delete(a.sessions, token)
+		}
+	}
+	for _, m := range []map[string]time.Time{a.ipLockouts, a.userLockouts} {
+		for key, until := range m {
+			if now.After(until) {
+				delete(m, key)
+			}
+		}
+	}
+	// Försöksräknare utan en aktiv lockout är bara meningsfulla i
+	// anslutning till pågående försök — släpp dem när spärren gått ut.
+	for key := range a.ipAttempts {
+		if _, locked := a.ipLockouts[key]; !locked && a.ipAttempts[key] == 0 {
+			delete(a.ipAttempts, key)
+		}
+	}
+	for key := range a.userAttempts {
+		if _, locked := a.userLockouts[key]; !locked && a.userAttempts[key] == 0 {
+			delete(a.userAttempts, key)
+		}
+	}
+}
+
 // RecordFailedAttempt räknar upp BÅDA räknarna (käll-IP och användarnamn)
 // oberoende av varandra — vardera låser efter 5 försök i 15 minuter.
 func (a *AuthManager) RecordFailedAttempt(ip, username string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	a.pruneLocked()
 	recordFailedAttemptLocked(a.ipAttempts, a.ipLockouts, ip)
 	recordFailedAttemptLocked(a.userAttempts, a.userLockouts, username)
 }
@@ -87,6 +128,7 @@ func (a *AuthManager) CreateSession(user, role string, duration time.Duration) (
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	a.pruneLocked()
 	a.sessions[token] = TokenSession{
 		Token:     token,
 		User:      user,
