@@ -200,7 +200,41 @@ func (e *Engine) GetCandidateConfig() *config.Config {
 }
 
 func (e *Engine) UpdateCandidate(cfg *config.Config) error {
+	// Status-fälten på ett Object.Source (LastUpdated/LastError/EntryCount)
+	// ägs av AGENTEN — de sätts av hot-lista/GeoIP-uppdateraren (Fas 5,
+	// UpdateObjectValues) utanför Safe Apply. En klient som PUT:ar hela
+	// configen ska inte kunna skriva över dem (upptäckt 2026-08-20: GUI:t
+	// utelämnade fälten i sin JSON, så varje sparning nollställde
+	// "senast uppdaterad" och objektet visade "Aldrig uppdaterad" trots att
+	// listan var hämtad). Återställ dem från den nu kända serversidan.
+	preserveObjectSourceStatus(cfg, e.store.GetRunningConfig())
 	return e.store.SetCandidateConfig(cfg)
+}
+
+// preserveObjectSourceStatus kopierar de agent-ägda status-fälten från
+// prev till motsvarande objekt (matchat på ID) i incoming. RefreshHours,
+// Kind, URL och CountryCode rörs INTE — de är klient-ägda inställningar.
+func preserveObjectSourceStatus(incoming, prev *config.Config) {
+	if incoming == nil || prev == nil {
+		return
+	}
+	prevByID := map[string]*config.ObjectSource{}
+	for i := range prev.Objects {
+		if prev.Objects[i].Source != nil {
+			prevByID[prev.Objects[i].ID] = prev.Objects[i].Source
+		}
+	}
+	for i := range incoming.Objects {
+		src := incoming.Objects[i].Source
+		if src == nil {
+			continue
+		}
+		if old, ok := prevByID[incoming.Objects[i].ID]; ok {
+			src.LastUpdated = old.LastUpdated
+			src.LastError = old.LastError
+			src.EntryCount = old.EntryCount
+		}
+	}
 }
 
 // ValidateCandidate validerar en candidate-konfiguration utan att ändra systemet.
