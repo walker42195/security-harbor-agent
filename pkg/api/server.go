@@ -549,7 +549,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"hostname":        hostname,
 		"state":           st,
-		"version":         "0.12.0-fas12",
+		"version":         "0.13.0",
 		"uptime":          readUptime(),
 		"cpu":             readCPUPercent(),
 		"cpu_cores":       runtime.NumCPU(),
