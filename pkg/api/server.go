@@ -243,6 +243,18 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'")
+
+		// Web-UI:ts statiska filer (allt utanför /api/) serveras med
+		// no-cache, så webbläsaren ALLTID omvaliderar mot servern (Go:s
+		// FileServer svarar 304 när filen är oförändrad, hela filen bara när
+		// den ändrats). Utan detta kunde webbläsaren fortsätta köra en gammal
+		// cachad main.dart.js efter en driftsättning — upptäckt 2026-08-20
+		// när en GUI-fix inte syntes hos klienten trots att den var deployad.
+		// (Flutter-bygget görs numera med --pwa-strategy=none, så ingen
+		// service worker cachar appen bakom ryggen på detta heller.)
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Cache-Control", "no-cache")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
