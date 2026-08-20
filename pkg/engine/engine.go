@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,22 @@ func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.
 func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun bool) error {
 	if _, err := e.nftAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
 		return fmt.Errorf("nftables: %w", err)
+	}
+
+	// Kärnans IPv4-forwarding MÅSTE vara på i gateway-läge, annars
+	// forwardar brandväggen INGEN trafik alls — LAN→WAN, inter-VLAN och
+	// all DNAT/port-forwarding är död oavsett hur korrekta nftables-
+	// reglerna är. Upptäckt 2026-08-20 vid ett WAN→LAN-genomströmningstest
+	// från utsidan: en SYN nådde WAN-interfacet, DNAT-regeln fanns, men
+	// paketet forwardades aldrig ut på LAN-sidan eftersom
+	// net.ipv4.ip_forward stod på kärnans default 0. Host-läge sätter
+	// tvärtom 0 (en enkortsdator ska inte routa mellan nät). Sätts vid
+	// varje apply OCH vid boot (ApplyRunningConfigAtBoot anropar denna),
+	// så inställningen överlever omstart utan en separat sysctl.d-fil.
+	if !dryRun {
+		if err := setIPForwarding(!cfg.IsHostMode()); err != nil {
+			return fmt.Errorf("ip-forwarding: %w", err)
+		}
 	}
 
 	// DHCP och Suricata är gateway-/router-specifika roller (DHCP-server
@@ -844,4 +861,18 @@ func (e *Engine) AdminResetPassword(userID, newPassword string) error {
 
 func (e *Engine) FindUserByUsername(username string) (*store.PublicUser, error) {
 	return e.store.Users.FindByUsername(username)
+}
+
+// setIPForwarding slår på/av kärnans IPv4-forwarding via /proc/sys.
+// Systemd-enheten kör med ProtectKernelTunables=false + CAP_NET_ADMIN, så
+// skrivningen är tillåten. Se applyBackends för varför detta behövs.
+func setIPForwarding(enabled bool) error {
+	val := []byte("0\n")
+	if enabled {
+		val = []byte("1\n")
+	}
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", val, 0644); err != nil {
+		return fmt.Errorf("kunde inte skriva net.ipv4.ip_forward: %w", err)
+	}
+	return nil
 }
