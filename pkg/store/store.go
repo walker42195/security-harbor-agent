@@ -145,6 +145,20 @@ func defaultSeedConfig(seedMode string) *config.Config {
 		Version:   1,
 		Revision:  1,
 		UpdatedAt: time.Now(),
+		// Ett tomt standardobjekt som IDS auto-block (Fas 9) kan skriva
+		// larmade käll-IP:n till. Finns med från start så att IDS-sidan i
+		// GUI:t kan förifylla objektet direkt — auto-block är fortfarande
+		// AVSTÄNGT tills användaren själv slår på det, och blockering kräver
+		// dessutom att man skapar en Deny-policy som refererar objektet.
+		Objects: []config.Object{
+			{
+				ID:          "obj-ips-autoblock",
+				Name:        "IPS - Auto block",
+				Type:        config.ObjectTypeIPList,
+				Values:      []string{},
+				Description: "Käll-IP:n som IDS auto-block lägger till automatiskt (Fas 9). Referera detta objekt från en Deny-policy för att faktiskt blockera dem.",
+			},
+		},
 		Policies: []config.Policy{
 			{
 				ID:          "sys-ssh-lan",
