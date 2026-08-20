@@ -12,6 +12,7 @@ import (
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/suricata"
@@ -183,6 +184,64 @@ func (e *Engine) loadDHCPLeases(cfg *config.Config) []dhcp.Lease {
 	return leases
 }
 
+// applyInterfaces tillämpar gränssnittskonfiguration på Linux (skapar
+// VLAN-subinterface, tar upp/ner länkar, sätter statisk IP eller kör DHCP)
+// men BARA för de gränssnitt som faktiskt ändrats jämfört med prevCfg, plus
+// VLAN som ännu inte finns på systemet. Precis det användaren begärde
+// 2026-08-20: en ändring på ETT gränssnitt ska aldrig påverka de andra —
+// ändrar man en VLAN rörs inte LAN/WAN, och tvärtom.
+//
+// prevCfg == nil (t.ex. vid boot) betyder "ingen jämförelse" → då rörs
+// INGET befintligt gränssnitt, bara VLAN som saknas på systemet skapas.
+// Det skyddar den externt konfigurerade management-IP:n (LAN) från att
+// flushas vid varje omstart.
+func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Config) {
+	if newCfg == nil {
+		return
+	}
+	netAdapter := network.NewAdapter()
+
+	prevByID := map[string]config.Interface{}
+	if prevCfg != nil {
+		for _, iface := range prevCfg.Interfaces {
+			prevByID[iface.ID] = iface
+		}
+	}
+
+	for _, iface := range newCfg.Interfaces {
+		prev, hadPrev := prevByID[iface.ID]
+		changed := hadPrev && interfaceConfigDiffers(prev, iface)
+
+		isVLAN := iface.VLANID > 0 && iface.Parent != ""
+		deviceMissing := false
+		if iface.Device != "" {
+			if _, err := net.InterfaceByName(iface.Device); err != nil {
+				deviceMissing = true
+			}
+		}
+
+		// Rör bara gränssnittet om det ändrats, ELLER om det är en VLAN som
+		// saknas på systemet (rent additivt — påverkar inga fysiska kort).
+		if !changed && !(isVLAN && deviceMissing) {
+			continue
+		}
+		if err := netAdapter.ApplyInterfaceConfig(ctx, iface); err != nil {
+			log.Printf("[NET] kunde inte tillämpa gränssnitt %s: %v", iface.Device, err)
+		}
+	}
+}
+
+// interfaceConfigDiffers jämför de fält som faktiskt påverkar Linux-
+// konfigurationen av ett gränssnitt.
+func interfaceConfigDiffers(a, b config.Interface) bool {
+	return a.Enabled != b.Enabled ||
+		a.Device != b.Device ||
+		a.Parent != b.Parent ||
+		a.VLANID != b.VLANID ||
+		a.AddressType != b.AddressType ||
+		a.IPv4 != b.IPv4
+}
+
 // GetDHCPLeases returnerar aktuella DHCP-utlåningar (Kea memfile) berikade
 // med vilket gränssnitt/zon varje klient hör till — matchat genom att se
 // vilket AKTIVERAT gränssnitts subnät klientens IP ligger i. WAN utesluts
@@ -238,7 +297,11 @@ func (e *Engine) GetDHCPLeases() ([]dhcp.LeaseDetail, error) {
 // startar). Går inte via Safe Apply/rollback-timern — det är bara att
 // återskapa det tillstånd som redan var bekräftat innan omstarten.
 func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
-	return e.applyBackends(ctx, e.store.GetRunningConfig(), false)
+	running := e.store.GetRunningConfig()
+	// prevCfg=nil → rör inga befintliga fysiska gränssnitt vid boot (deras
+	// IP är externt konfigurerad), skapa bara VLAN som saknas på systemet.
+	e.applyInterfaces(ctx, running, nil)
+	return e.applyBackends(ctx, running, false)
 }
 
 func (e *Engine) GetRunningConfig() *config.Config {
@@ -458,11 +521,18 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 	defer e.mu.Unlock()
 
 	candidate := e.store.GetCandidateConfig()
+	prevRunning := e.store.GetRunningConfig()
 
 	// Validera först
 	if err := e.ValidateCandidate(ctx, candidate); err != nil {
 		return fmt.Errorf("kan inte applicera ogiltig konfiguration: %w", err)
 	}
+
+	// Tillämpa gränssnittsändringar (skapa VLAN, IP/DHCP) — bara de
+	// gränssnitt som ändrats jämfört med running, så en VLAN-ändring aldrig
+	// rör LAN/WAN och tvärtom. Görs FÖRE brandväggsreglerna så nya VLAN-
+	// devices finns när reglerna refererar dem.
+	e.applyInterfaces(ctx, candidate, prevRunning)
 
 	// Applicera skarpt mot Linux-kärnan (nftables, Kea DHCP, WireGuard).
 	//

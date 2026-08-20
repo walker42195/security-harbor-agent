@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
@@ -179,9 +180,14 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 			return fmt.Errorf("misslyckades sätta IP %s på %s: %w - %s", iface.IPv4, iface.Device, err, string(out))
 		}
 	} else if iface.Enabled && iface.AddressType == "dhcp" {
-		// Om gränssnittet är satt till DHCP, trigga dhclient om ingen IP ännu erhållits
+		// Om gränssnittet är satt till DHCP, trigga dhclient. "-1" gör ETT
+		// försök och avslutar om ingen server svarar (annars hänger klienten
+		// kvar för evigt på t.ex. en VLAN utan DHCP-server), och en
+		// timeout-context ser till att processen aldrig blir kvarglömd.
 		go func(device string) {
-			_ = exec.Command("dhclient", "-v", device).Run()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
 		}(iface.Device)
 	}
 
