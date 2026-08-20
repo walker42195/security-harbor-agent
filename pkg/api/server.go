@@ -67,6 +67,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/vpn/openvpn/ca-info", s.authMiddleware(s.handleOpenVPNCAInfo))
 	mux.HandleFunc("/api/v1/policies/hit-counts", s.authMiddleware(s.handleHitCounts))
 	mux.HandleFunc("/api/v1/dns/blocklist-domains", s.authMiddleware(s.handleGetDNSBlocklistDomains))
+	mux.HandleFunc("/api/v1/dhcp/leases", s.authMiddleware(s.handleDHCPLeases))
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/auth/change-password", s.authMiddleware(s.handleChangePassword))
 
@@ -1344,6 +1345,19 @@ func (s *Server) handleRefreshDNSBlocklist(w http.ResponseWriter, r *http.Reques
 // handleGetDNSBlocklistDomains returnerar den cachade domänlistan för EN
 // blocklist-källa (Fas 6) — så att GUI:t faktiskt kan visa vad som är
 // blockerat, inte bara antalet poster.
+// handleDHCPLeases returnerar aktuella DHCP-klienter (Kea-utlåningar)
+// berikade med gränssnitt/zon (se Engine.GetDHCPLeases). Läsrättighet
+// räcker (admin+viewer) — det är ren diagnostik.
+func (s *Server) handleDHCPLeases(w http.ResponseWriter, r *http.Request) {
+	leases, err := s.engine.GetDHCPLeases()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(leases)
+}
+
 func (s *Server) handleGetDNSBlocklistDomains(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {

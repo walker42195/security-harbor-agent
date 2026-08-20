@@ -183,6 +183,56 @@ func (e *Engine) loadDHCPLeases(cfg *config.Config) []dhcp.Lease {
 	return leases
 }
 
+// GetDHCPLeases returnerar aktuella DHCP-utlåningar (Kea memfile) berikade
+// med vilket gränssnitt/zon varje klient hör till — matchat genom att se
+// vilket AKTIVERAT gränssnitts subnät klientens IP ligger i. WAN utesluts
+// (ingen DHCP-server körs där), liksom leases som inte matchar något
+// konfigurerat subnät.
+func (e *Engine) GetDHCPLeases() ([]dhcp.LeaseDetail, error) {
+	leases, err := dhcp.ParseLeasesDetailed(e.dhcpAdapter.LeaseDatabasePath())
+	if err != nil {
+		return nil, err
+	}
+	cfg := e.store.GetRunningConfig()
+	if cfg == nil {
+		return []dhcp.LeaseDetail{}, nil
+	}
+
+	type ifaceNet struct {
+		device string
+		zone   string
+		net    *net.IPNet
+	}
+	var nets []ifaceNet
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled || iface.Zone == "WAN" || iface.IPv4 == "" {
+			continue
+		}
+		_, n, perr := net.ParseCIDR(iface.IPv4)
+		if perr != nil || n == nil {
+			continue
+		}
+		nets = append(nets, ifaceNet{device: iface.Device, zone: iface.Zone, net: n})
+	}
+
+	out := make([]dhcp.LeaseDetail, 0, len(leases))
+	for _, l := range leases {
+		ip := net.ParseIP(l.IP)
+		if ip == nil {
+			continue
+		}
+		for _, n := range nets {
+			if n.net.Contains(ip) {
+				l.Interface = n.device
+				l.Zone = n.zone
+				out = append(out, l)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // ApplyRunningConfigAtBoot laddar den senast committade konfigurationen i
 // samtliga backends vid agentstart (kallas från main.go innan API-servern
 // startar). Går inte via Safe Apply/rollback-timern — det är bara att
