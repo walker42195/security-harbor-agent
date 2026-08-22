@@ -4,20 +4,21 @@ import "time"
 
 // Config representerar hela brandväggens deklarativa tillstånd.
 type Config struct {
-	Version    int              `json:"version"`             // Konfigurationsversion
-	Revision   int64            `json:"revision"`            // Inkrementeras vid varje commit
-	UpdatedAt  time.Time        `json:"updated_at"`          // Tidstämpel för senaste ändring
-	Interfaces []Interface      `json:"interfaces"`          // Fysiska nätverkskort & VLANs
-	Zones      []Zone           `json:"zones"`               // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
-	Objects    []Object         `json:"objects"`             // Objekt (Hosts, Subnets, IP-listor, GeoIP)
-	Services   []Service        `json:"services"`            // Tjänster (HTTP, HTTPS, SSH, Custom ports)
-	Policies   []Policy         `json:"policies"`            // Brandväggs- och NAT-regler
-	Settings   Settings         `json:"settings"`            // System- och management-inställningar
-	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"` // VPN-serverkonfiguration (Fas 3)
-	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`   // VPN-serverkonfiguration (Fas 4)
-	DNS        *DNSConfig       `json:"dns,omitempty"`       // DNS-resolver & domänfiltrering (Fas 6)
-	Syslog     *SyslogConfig    `json:"syslog,omitempty"`    // Centraliserad logg-vidarebefordran (Fas 8)
-	IDS        *IDSConfig       `json:"ids,omitempty"`       // Suricata IDS (Fas 9)
+	Version    int              `json:"version"`              // Konfigurationsversion
+	Revision   int64            `json:"revision"`             // Inkrementeras vid varje commit
+	UpdatedAt  time.Time        `json:"updated_at"`           // Tidstämpel för senaste ändring
+	Interfaces []Interface      `json:"interfaces"`           // Fysiska nätverkskort & VLANs
+	Zones      []Zone           `json:"zones"`                // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
+	Objects    []Object         `json:"objects"`              // Objekt (Hosts, Subnets, IP-listor, GeoIP)
+	Services   []Service        `json:"services"`             // Tjänster (HTTP, HTTPS, SSH, Custom ports)
+	Policies   []Policy         `json:"policies"`             // Brandväggs- och NAT-regler
+	Settings   Settings         `json:"settings"`             // System- och management-inställningar
+	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"`  // VPN-serverkonfiguration (Fas 3)
+	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`    // VPN-serverkonfiguration (Fas 4)
+	DNS        *DNSConfig       `json:"dns,omitempty"`        // DNS-resolver & domänfiltrering (Fas 6)
+	Syslog     *SyslogConfig    `json:"syslog,omitempty"`     // Centraliserad logg-vidarebefordran (Fas 8)
+	IDS        *IDSConfig       `json:"ids,omitempty"`        // Suricata IDS (Fas 9)
+	SNIRoutes  []SNIRoute       `json:"sni_routes,omitempty"` // Namnbaserad routning (SNI passthrough via HAProxy)
 }
 
 // IDSConfig styr Suricata i passivt IDS-läge (af-packet, INTE inline/
@@ -347,6 +348,80 @@ const (
 // — bakåtkompatibelt default.
 func (c *Config) IsHostMode() bool {
 	return c.Settings.Mode == ModeHost
+}
+
+// SNIRoute är EN lyssnarport (t.ex. 443) som via SNI-namnet i TLS
+// ClientHello dirigerar krypterad trafik vidare till OLIKA interna servrar
+// UTAN att terminera TLS (HAProxy mode tcp, req.ssl_sni — passthrough).
+// Certifikaten stannar därmed på de interna servrarna och änd-till-änd-
+// krypteringen bevaras. Varje aktiv rutt blir en egen HAProxy-frontend samt
+// en INPUT-accept-regel på sin ListenPort (HAProxy lyssnar på brandväggen
+// själv — det är alltså INTE DNAT/prerouting).
+type SNIRoute struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"` // Läsbart namn i GUI:t
+	Enabled    bool   `json:"enabled"`
+	ListenPort int    `json:"listen_port"` // valfri port; MÅSTE vara unik per aktiv rutt (två frontends kan inte binda samma port)
+	// ExternalIP (valfritt): binder frontend på en specifik WAN-IP i stället
+	// för alla adresser. Tomt = bind på :ListenPort (alla adresser).
+	ExternalIP string `json:"external_ip,omitempty"`
+	// Backends: varje post är ETT mål med ett eller flera SNI-namn.
+	Backends []SNIBackend `json:"backends"`
+	// DefaultBackend: fallback för trafik UTAN matchande SNI (inklusive
+	// SNI-lös trafik som OpenVPN). nil = sådan trafik släpps. Kan peka på en
+	// lokal brandväggstjänst (LocalService).
+	DefaultBackend *SNIBackend `json:"default_backend,omitempty"`
+}
+
+// SNIBackend är ETT vidarebefordringsmål: antingen en intern server
+// (TargetIP:TargetPort) ELLER en lokal brandväggstjänst (LocalService).
+// De två är ömsesidigt uteslutande.
+type SNIBackend struct {
+	// Hostnames: ett eller flera SNI-namn som riktas hit. Wildcard
+	// "*.exempel.se" stöds. Tom lista bara för DefaultBackend (matchar allt
+	// övrigt).
+	Hostnames []string `json:"hostnames,omitempty"`
+	// Målalternativ (a): intern server.
+	TargetIP   string `json:"target_ip,omitempty"`
+	TargetPort int    `json:"target_port,omitempty"`
+	// Målalternativ (b): lokal brandväggstjänst. Just nu bara "openvpn".
+	LocalService string `json:"local_service,omitempty"`
+}
+
+const (
+	// LocalServiceOpenVPN pekar en SNI-backend mot brandväggens egen
+	// OpenVPN-daemon (för port-delning på t.ex. 443).
+	LocalServiceOpenVPN = "openvpn"
+	// OpenVPNLoopbackPort är porten OpenVPN binder på 127.0.0.1 när den
+	// frontas av en SNI-rutt (i stället för sin publika ListenPort — HAProxy
+	// äger då den publika porten).
+	OpenVPNLoopbackPort = 11194
+)
+
+// OpenVPNFrontedBySNI returnerar true + den publika lyssnarporten om någon
+// AKTIV SNI-rutt frontar den lokala OpenVPN-tjänsten (som backend eller
+// default). Då binder OpenVPN loopback-TCP i stället för publik WAN-port,
+// och nftables-adaptern öppnar INTE OpenVPN:s egen ListenPort på WAN.
+// Delas av openvpn-, nftables- och haproxy-adaptrarna så ingen state
+// dupliceras.
+func (c *Config) OpenVPNFrontedBySNI() (fronted bool, publicPort int) {
+	isOVPN := func(b *SNIBackend) bool {
+		return b != nil && b.LocalService == LocalServiceOpenVPN
+	}
+	for _, r := range c.SNIRoutes {
+		if !r.Enabled {
+			continue
+		}
+		for i := range r.Backends {
+			if isOVPN(&r.Backends[i]) {
+				return true, r.ListenPort
+			}
+		}
+		if isOVPN(r.DefaultBackend) {
+			return true, r.ListenPort
+		}
+	}
+	return false, 0
 }
 
 // ConntrackEntry representerar en aktiv stateful nätverksanslutning för diagnostik.

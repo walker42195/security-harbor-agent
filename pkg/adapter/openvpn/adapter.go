@@ -58,8 +58,17 @@ func GenerateServerConfig(cfg *config.Config) (string, error) {
 	}
 
 	var b bytes.Buffer
-	fmt.Fprintf(&b, "port %d\n", ovpn.ListenPort)
-	fmt.Fprintf(&b, "proto %s\n", protocol)
+	// Om en SNI-rutt frontar OpenVPN (port-delning på t.ex. 443) äger HAProxy
+	// den publika porten — OpenVPN binder då loopback-TCP i stället, och
+	// HAProxy relayar SNI-lös trafik dit. Kräver TCP (valideras i engine).
+	if fronted, _ := cfg.OpenVPNFrontedBySNI(); fronted {
+		fmt.Fprintf(&b, "port %d\n", config.OpenVPNLoopbackPort)
+		fmt.Fprintf(&b, "proto tcp-server\n")
+		fmt.Fprintf(&b, "local 127.0.0.1\n")
+	} else {
+		fmt.Fprintf(&b, "port %d\n", ovpn.ListenPort)
+		fmt.Fprintf(&b, "proto %s\n", protocol)
+	}
 	fmt.Fprintf(&b, "dev tun\n")
 	fmt.Fprintf(&b, "ca ca.crt\n")
 	fmt.Fprintf(&b, "cert server.crt\n")
@@ -93,6 +102,12 @@ func GenerateClientConfig(cfg *config.Config, clientCertPEM, clientKeyPEM string
 	protocol := ovpn.Protocol
 	if protocol == "" {
 		protocol = "udp"
+	}
+	// När OpenVPN frontas av en SNI-rutt ansluter klienten mot HAProxy på den
+	// publika porten (ovpn.ListenPort, t.ex. 443) via TCP — HAProxy relayar
+	// transparent till den loopback-bundna OpenVPN-servern.
+	if fronted, _ := cfg.OpenVPNFrontedBySNI(); fronted {
+		protocol = "tcp"
 	}
 
 	var b bytes.Buffer

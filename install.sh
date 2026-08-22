@@ -113,6 +113,7 @@ else
     unbound \
     wireguard-tools \
     openvpn \
+    haproxy \
     tcpdump \
     suricata \
     suricata-update \
@@ -162,6 +163,22 @@ fi
 if [ -d /etc/rsyslog.d ]; then
   chgrp security-harbor /etc/rsyslog.d
   chmod g+ws /etc/rsyslog.d
+fi
+# HAProxy (SNI-routning): agenten skriver /etc/haproxy/haproxy.cfg. Group-
+# write på filen + traverserings-rätt på katalogen (samma mönster som
+# suricata.yaml ovan). Agenten äger start/stopp av tjänsten, så den
+# paket-aktiverade default-instansen inaktiveras nedan.
+if [ -d /etc/haproxy ]; then
+  chgrp security-harbor /etc/haproxy
+  chmod g+x /etc/haproxy
+  if [ -f /etc/haproxy/haproxy.cfg ]; then
+    chgrp security-harbor /etc/haproxy/haproxy.cfg
+    chmod g+w /etc/haproxy/haproxy.cfg
+  fi
+  # Agenten startar/stoppar haproxy.service via apply — den ska inte starta
+  # automatiskt med paketets default-config vid boot.
+  systemctl disable haproxy.service 2>/dev/null || true
+  systemctl stop haproxy.service 2>/dev/null || true
 fi
 
 echo "=== 4. Installerar binärer ==="

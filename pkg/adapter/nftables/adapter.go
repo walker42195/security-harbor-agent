@@ -550,7 +550,13 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 
 	// Input 2.6: Tillåt inkommande OpenVPN på WAN, om aktiverat (Fas 4).
 	// Måste ligga FÖRE Input 3 (HARD WAN DROP) annars är VPN:en meningslös.
-	if cfg.OpenVPN != nil && cfg.OpenVPN.Enabled && cfg.OpenVPN.ListenPort > 0 {
+	//
+	// Undantag: om OpenVPN frontas av en SNI-rutt (port-delning) lyssnar
+	// OpenVPN bara på loopback och HAProxy äger den publika porten — då ska
+	// ingen WAN-öppning för OpenVPN:s egen port skapas (SNI-ruttens
+	// ListenPort öppnas i stället, se Input 2.7 nedan).
+	ovpnFronted, _ := cfg.OpenVPNFrontedBySNI()
+	if cfg.OpenVPN != nil && cfg.OpenVPN.Enabled && cfg.OpenVPN.ListenPort > 0 && !ovpnFronted {
 		proto := cfg.OpenVPN.Protocol
 		if proto == "" {
 			proto = "udp"
@@ -575,6 +581,42 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 								"op":    "==",
 								"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
 								"right": cfg.OpenVPN.ListenPort,
+							},
+						},
+						map[string]interface{}{"accept": nil},
+					},
+				},
+			})
+		}
+	}
+
+	// Input 2.7: Tillåt inkommande SNI-rutt-portar på WAN (HAProxy lyssnar på
+	// brandväggen själv — INTE DNAT). Måste ligga FÖRE Input 3 (HARD WAN
+	// DROP). TLS-passthrough är alltid TCP.
+	for _, r := range cfg.SNIRoutes {
+		if !r.Enabled || !validPort(r.ListenPort) {
+			continue
+		}
+		for _, wanDev := range wanDevices {
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "input",
+					Comment: fmt.Sprintf("Allow SNI route %q (TCP %d) on WAN %s", r.Name, r.ListenPort, wanDev),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": wanDev,
+							},
+						},
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+								"right": r.ListenPort,
 							},
 						},
 						map[string]interface{}{"accept": nil},
@@ -728,6 +770,42 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					},
 				})
 			}
+		}
+	}
+
+	// Input 4c: Tillåt SNI-rutt-portar även på LAN/VLAN så interna klienter
+	// (och hairpin-fallet: en intern klient som slår upp ett namn som pekar
+	// på brandväggen) når HAProxy på samma port. Alltid TCP.
+	for _, r := range cfg.SNIRoutes {
+		if !r.Enabled || !validPort(r.ListenPort) {
+			continue
+		}
+		for _, lanDev := range lanDevices {
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "input",
+					Comment: fmt.Sprintf("Allow SNI route %q (TCP %d) on LAN %s", r.Name, r.ListenPort, lanDev),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": lanDev,
+							},
+						},
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+								"right": r.ListenPort,
+							},
+						},
+						map[string]interface{}{"accept": nil},
+					},
+				},
+			})
 		}
 	}
 

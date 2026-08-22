@@ -13,6 +13,7 @@ import (
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/haproxy"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/suricata"
@@ -53,7 +54,8 @@ func main() {
 	dnsAdapter := dns.NewAdapter("")
 	syslogAdapter := syslog.NewAdapter("")
 	suricataAdapter := suricata.NewAdapter("", "")
-	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter, syslogAdapter, suricataAdapter)
+	haproxyAdapter := haproxy.NewAdapter("")
+	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter, syslogAdapter, suricataAdapter, haproxyAdapter)
 	auth := api.NewAuthManager()
 
 	// Applicera initial konfiguration vid start (om ej dry-run)

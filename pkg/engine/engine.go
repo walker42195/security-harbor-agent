@@ -12,6 +12,7 @@ import (
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dns"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/haproxy"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
@@ -41,6 +42,7 @@ type Engine struct {
 	dnsAdapter      *dns.Adapter
 	syslogAdapter   *syslog.Adapter
 	suricataAdapter *suricata.Adapter
+	haproxyAdapter  *haproxy.Adapter
 	state           State
 	confirmTimer    *time.Timer
 	unconfirmedCfg  *config.Config
@@ -53,7 +55,7 @@ type Engine struct {
 	idsLastAlertTS string
 }
 
-func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter, syslogAdapter *syslog.Adapter, suricataAdapter *suricata.Adapter) *Engine {
+func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter, syslogAdapter *syslog.Adapter, suricataAdapter *suricata.Adapter, haproxyAdapter *haproxy.Adapter) *Engine {
 	return &Engine{
 		store:           st,
 		nftAdapter:      nftAdapter,
@@ -63,6 +65,7 @@ func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.
 		dnsAdapter:      dnsAdapter,
 		syslogAdapter:   syslogAdapter,
 		suricataAdapter: suricataAdapter,
+		haproxyAdapter:  haproxyAdapter,
 		state:           StateIdle,
 	}
 }
@@ -162,6 +165,12 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 		if err := e.suricataAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
 			return fmt.Errorf("suricata: %w", err)
 		}
+	}
+
+	// HAProxy (SNI-routning) körs i båda lägen — adaptern stoppar tjänsten
+	// när inga aktiva rutter finns, likt syslog.
+	if err := e.haproxyAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+		return fmt.Errorf("haproxy: %w", err)
 	}
 
 	return nil
@@ -377,6 +386,9 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 	if err := validatePolicies(cfg); err != nil {
 		return err
 	}
+	if err := validateSNIRoutes(cfg); err != nil {
+		return err
+	}
 
 	// Därefter backendarnas egen dry-run (nft -c, Kea, Unbound m.fl.), som
 	// fångar allt vi inte modellerar själva.
@@ -525,6 +537,133 @@ func validatePolicyZone(cfg *config.Config, policyName, label, zoneSpec string) 
 		}
 	}
 	return nil
+}
+
+// validateSNIRoutes kontrollerar de namnbaserade routnings-reglerna innan
+// HAProxy-adapterns egen `haproxy -c`-dry-run — så att modellfel ger ett
+// begripligt svar i stället för ett lågnivåfel från HAProxy.
+func validateSNIRoutes(cfg *config.Config) error {
+	usedPorts := map[int]bool{} // aktiva rutters ListenPort, för unikhetskontroll
+	dnatPorts := map[int]bool{} // aktiva DNAT-policyers ExternalPort
+	for _, pol := range cfg.Policies {
+		if pol.Enabled && pol.Action == config.ActionDNAT && pol.NAT != nil && pol.NAT.ExternalPort > 0 {
+			dnatPorts[pol.NAT.ExternalPort] = true
+		}
+	}
+
+	for _, r := range cfg.SNIRoutes {
+		if !r.Enabled {
+			continue
+		}
+		label := r.Name
+		if label == "" {
+			label = r.ID
+		}
+		if r.ListenPort < 1 || r.ListenPort > 65535 {
+			return fmt.Errorf("SNI-rutt %q: lyssnarporten %d ligger utanför giltigt intervall 1-65535", label, r.ListenPort)
+		}
+		if usedPorts[r.ListenPort] {
+			return fmt.Errorf("SNI-rutt %q: lyssnarporten %d används redan av en annan aktiv SNI-rutt (två kan inte lyssna på samma port)", label, r.ListenPort)
+		}
+		usedPorts[r.ListenPort] = true
+		if r.ListenPort == cfg.Settings.APIPort {
+			return fmt.Errorf("SNI-rutt %q: lyssnarporten %d används redan av administrations-API:t", label, r.ListenPort)
+		}
+		if dnatPorts[r.ListenPort] {
+			return fmt.Errorf("SNI-rutt %q: lyssnarporten %d krockar med en port forward (DNAT) på samma port — DNAT kapar porten före brandväggens egen tjänst", label, r.ListenPort)
+		}
+		if r.ExternalIP != "" && net.ParseIP(r.ExternalIP) == nil {
+			return fmt.Errorf("SNI-rutt %q: extern IP %q är inte en giltig IP-adress", label, r.ExternalIP)
+		}
+		if len(r.Backends) == 0 && r.DefaultBackend == nil {
+			return fmt.Errorf("SNI-rutt %q: regeln saknar både backends och fallback-mål — den gör ingenting", label)
+		}
+
+		// Hostnamn måste vara unika inom en rutt (annars tvetydig routning).
+		seenHost := map[string]bool{}
+		for i := range r.Backends {
+			be := r.Backends[i]
+			if err := validateSNIBackend(label, &be, false); err != nil {
+				return err
+			}
+			for _, h := range be.Hostnames {
+				key := strings.ToLower(strings.TrimSpace(h))
+				if key == "" {
+					continue
+				}
+				if seenHost[key] {
+					return fmt.Errorf("SNI-rutt %q: värdnamnet %q förekommer i flera backends — routningen blir tvetydig", label, h)
+				}
+				seenHost[key] = true
+			}
+		}
+		if r.DefaultBackend != nil {
+			if err := validateSNIBackend(label, r.DefaultBackend, true); err != nil {
+				return err
+			}
+		}
+
+		// OpenVPN-fallback kräver att OpenVPN är aktiverat och kör TCP
+		// (HAProxy tcp-passthrough fungerar inte mot en UDP-daemon).
+		if usesOpenVPN(r) {
+			if cfg.OpenVPN == nil || !cfg.OpenVPN.Enabled {
+				return fmt.Errorf("SNI-rutt %q: pekar på lokal OpenVPN som fallback, men OpenVPN är inte aktiverat", label)
+			}
+			if strings.ToLower(cfg.OpenVPN.Protocol) != "tcp" {
+				return fmt.Errorf("SNI-rutt %q: OpenVPN måste köra i TCP-läge för att kunna delas på samma port (ändra OpenVPN-protokollet till TCP)", label)
+			}
+		}
+	}
+	return nil
+}
+
+// validateSNIBackend kontrollerar att en backend har exakt ETT måltyp
+// (intern server ELLER lokal tjänst) och giltiga värden. isDefault=true
+// tillåter tomma hostnamn (fallback matchar allt övrigt).
+func validateSNIBackend(routeLabel string, b *config.SNIBackend, isDefault bool) error {
+	hasTarget := b.TargetIP != "" || b.TargetPort != 0
+	hasLocal := b.LocalService != ""
+	if hasTarget && hasLocal {
+		return fmt.Errorf("SNI-rutt %q: en backend kan inte ha både en intern server och en lokal tjänst", routeLabel)
+	}
+	if !hasTarget && !hasLocal {
+		return fmt.Errorf("SNI-rutt %q: en backend saknar mål (ange intern server IP:port eller en lokal tjänst)", routeLabel)
+	}
+	if hasLocal && b.LocalService != config.LocalServiceOpenVPN {
+		return fmt.Errorf("SNI-rutt %q: okänd lokal tjänst %q (stöds: openvpn)", routeLabel, b.LocalService)
+	}
+	if hasTarget {
+		if net.ParseIP(b.TargetIP) == nil {
+			return fmt.Errorf("SNI-rutt %q: intern server-IP %q är inte en giltig IP-adress", routeLabel, b.TargetIP)
+		}
+		if b.TargetPort < 1 || b.TargetPort > 65535 {
+			return fmt.Errorf("SNI-rutt %q: intern server-port %d ligger utanför giltigt intervall 1-65535", routeLabel, b.TargetPort)
+		}
+	}
+	if !isDefault {
+		hasName := false
+		for _, h := range b.Hostnames {
+			if strings.TrimSpace(h) != "" {
+				hasName = true
+				break
+			}
+		}
+		if !hasName {
+			return fmt.Errorf("SNI-rutt %q: en backend (som inte är fallback) saknar värdnamn", routeLabel)
+		}
+	}
+	return nil
+}
+
+// usesOpenVPN returnerar true om någon backend eller fallback i rutten
+// pekar på den lokala OpenVPN-tjänsten.
+func usesOpenVPN(r config.SNIRoute) bool {
+	for i := range r.Backends {
+		if r.Backends[i].LocalService == config.LocalServiceOpenVPN {
+			return true
+		}
+	}
+	return r.DefaultBackend != nil && r.DefaultBackend.LocalService == config.LocalServiceOpenVPN
 }
 
 // ApplyCandidate applicerar candidate-konfigurationen och startar 30-sekunders rollback-timern.

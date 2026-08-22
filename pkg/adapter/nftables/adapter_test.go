@@ -21,10 +21,10 @@ func TestRenderJSONFas2(t *testing.T) {
 		},
 		Policies: []config.Policy{
 			{
-				ID:       "pol1",
-				Name:     "Web Server DNAT",
-				Enabled:  true,
-				Action:   config.ActionDNAT,
+				ID:      "pol1",
+				Name:    "Web Server DNAT",
+				Enabled: true,
+				Action:  config.ActionDNAT,
 				NAT: &config.NATConfig{
 					Protocol:     "tcp",
 					ExternalPort: 443,
@@ -937,6 +937,113 @@ func TestRenderJSONDNATHasHairpinMasquerade(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("hittade ingen NAT-reflektion (hairpin) i postrouting: %s", string(data))
+	}
+}
+
+// inputRuleExists letar upp en INPUT-regel vars kommentar innehåller
+// substrängen och vars uttryck matchar iifname==dev och tcp dport==port.
+func inputRuleExists(t *testing.T, data []byte, commentSub, dev string, port int) bool {
+	t.Helper()
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("ogiltig JSON: %v", err)
+	}
+	elements, _ := root["nftables"].([]interface{})
+	for _, el := range elements {
+		m, _ := el.(map[string]interface{})
+		rule, _ := m["rule"].(map[string]interface{})
+		if rule == nil || rule["chain"] != "input" {
+			continue
+		}
+		comment, _ := rule["comment"].(string)
+		if !strings.Contains(comment, commentSub) {
+			continue
+		}
+		exprs, _ := rule["expr"].([]interface{})
+		hasIif, hasPort := false, false
+		for _, e := range exprs {
+			em, _ := e.(map[string]interface{})
+			match, _ := em["match"].(map[string]interface{})
+			if match == nil {
+				continue
+			}
+			left, _ := match["left"].(map[string]interface{})
+			if meta, _ := left["meta"].(map[string]interface{}); meta != nil && meta["key"] == "iifname" && match["right"] == dev {
+				hasIif = true
+			}
+			if payload, _ := left["payload"].(map[string]interface{}); payload != nil && payload["field"] == "dport" && payload["protocol"] == "tcp" && match["right"] == float64(port) {
+				hasPort = true
+			}
+		}
+		if hasIif && hasPort {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRenderJSONSNIRouteOpensInputPortsAndFrontsOpenVPN: en aktiv SNI-rutt
+// på 443 med OpenVPN som fallback ska (a) öppna tcp/443 på både WAN och LAN
+// i INPUT-kedjan, och (b) INTE generera OpenVPN:s egen WAN-öppning (den
+// lyssnar nu på loopback bakom HAProxy).
+func TestRenderJSONSNIRouteOpensInputPortsAndFrontsOpenVPN(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		OpenVPN: &config.OpenVPNConfig{Enabled: true, Protocol: "tcp", ListenPort: 443},
+		SNIRoutes: []config.SNIRoute{
+			{
+				ID: "r1", Name: "Delad443", Enabled: true, ListenPort: 443,
+				Backends:       []config.SNIBackend{{Hostnames: []string{"app.exempel.se"}, TargetIP: "10.0.0.24", TargetPort: 8006}},
+				DefaultBackend: &config.SNIBackend{LocalService: config.LocalServiceOpenVPN},
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	if !inputRuleExists(t, data, "SNI route", "ens18", 443) {
+		t.Errorf("saknar INPUT-accept för SNI-rutt tcp/443 på WAN ens18: %s", string(data))
+	}
+	if !inputRuleExists(t, data, "SNI route", "ens19", 443) {
+		t.Errorf("saknar INPUT-accept för SNI-rutt tcp/443 på LAN ens19: %s", string(data))
+	}
+	if strings.Contains(string(data), "Allow OpenVPN") {
+		t.Errorf("OpenVPN:s egen WAN-öppning ska INTE finnas när den frontas av en SNI-rutt: %s", string(data))
+	}
+}
+
+// TestRenderJSONOpenVPNKeepsWANWhenNotFronted: utan SNI-fronting ska
+// OpenVPN:s vanliga WAN-öppning finnas kvar oförändrad.
+func TestRenderJSONOpenVPNKeepsWANWhenNotFronted(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		OpenVPN: &config.OpenVPNConfig{Enabled: true, Protocol: "udp", ListenPort: 1194},
+		SNIRoutes: []config.SNIRoute{
+			{ID: "r1", Enabled: true, ListenPort: 8443, Backends: []config.SNIBackend{{Hostnames: []string{"x.se"}, TargetIP: "10.0.0.24", TargetPort: 8006}}},
+		},
+		Settings: config.Settings{APIPort: 9443},
+	}
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	if !strings.Contains(string(data), "Allow OpenVPN") {
+		t.Errorf("OpenVPN:s WAN-öppning ska finnas när ingen SNI-rutt frontar den: %s", string(data))
+	}
+	if !inputRuleExists(t, data, "SNI route", "ens18", 8443) {
+		t.Errorf("saknar INPUT-accept för SNI-rutt tcp/8443 på WAN: %s", string(data))
 	}
 }
 
