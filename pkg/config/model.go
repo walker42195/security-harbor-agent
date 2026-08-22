@@ -168,6 +168,7 @@ type OpenVPNClient struct {
 // Interface representerar ett nätverksgränssnitt eller VLAN.
 type Interface struct {
 	ID          string      `json:"id"`             // t.ex. "eth0", "eth1", "vlan10"
+	Name        string      `json:"name"`           // Läsbart visningsnamn satt av användaren (valfritt, faller tillbaka på Device i GUI:t)
 	Device      string      `json:"device"`         // Linux device name, t.ex. "eth0", "eth1.10"
 	Parent      string      `json:"parent"`         // För VLAN: föräldra-interface, t.ex. "eth1"
 	VLANID      int         `json:"vlan_id"`        // 0 för fysiska, 1-4094 för VLAN

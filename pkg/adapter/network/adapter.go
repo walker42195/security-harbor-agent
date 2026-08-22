@@ -194,6 +194,27 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 	return nil
 }
 
+// DeleteVLANInterface tar bort ett VLAN-subinterface från Linux (`ip link
+// del`). Används när en VLAN flyttas till ett annat fysiskt kort: det gamla
+// subinterfacet (t.ex. ens19.9) måste rivas innan det nya (ens20.9) skapas,
+// annars ligger det kvar och fångar trafik på fel kort. Ett redan
+// försvunnet interface är inte ett fel (idempotent).
+func (a *Adapter) DeleteVLANInterface(ctx context.Context, device string) error {
+	if device == "" {
+		return nil
+	}
+	if _, err := net.InterfaceByName(device); err != nil {
+		// Finns inte längre — inget att göra.
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, "ip", "link", "del", device)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("misslyckades ta bort VLAN %s: %w - %s", device, err, string(out))
+	}
+	return nil
+}
+
 // ApplyDNSConfig uppdaterar systemets DNS-resolvrar i /etc/resolv.conf baserat på inskrivna DNS-servrar.
 func (a *Adapter) ApplyDNSConfig(ctx context.Context, interfaces []config.Interface) error {
 	var dnsList []string

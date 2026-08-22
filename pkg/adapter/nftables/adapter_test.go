@@ -865,6 +865,81 @@ func TestRenderJSONDNATForwardIsPortRestricted(t *testing.T) {
 	}
 }
 
+// TestRenderJSONDNATHasHairpinMasquerade skyddar NAT-reflektionen: en
+// intern klient som via extern DNS ansluter till brandväggens WAN-IP och
+// DNAT:as in till en intern server måste få svaret tillbaka. Det kräver en
+// postrouting-maskerad som matchar internt ursprung (iifname != WAN) mot
+// serverns interna IP:port.
+func TestRenderJSONDNATHasHairpinMasquerade(t *testing.T) {
+	adapter := NewAdapter()
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-dnat", Name: "Webbserver", Enabled: true, Action: config.ActionDNAT,
+				NAT: &config.NATConfig{ExternalPort: 443, InternalIP: "192.168.10.10", InternalPort: 8443, Protocol: "tcp"},
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("ogiltig JSON: %v", err)
+	}
+	elements, _ := root["nftables"].([]interface{})
+
+	found := false
+	for _, el := range elements {
+		m, _ := el.(map[string]interface{})
+		rule, _ := m["rule"].(map[string]interface{})
+		if rule == nil || rule["chain"] != "postrouting" {
+			continue
+		}
+		comment, _ := rule["comment"].(string)
+		if !strings.Contains(comment, "hairpin") {
+			continue
+		}
+		found = true
+		exprs, _ := rule["expr"].([]interface{})
+		hasIifNeq, hasDaddr, hasMasq := false, false, false
+		for _, e := range exprs {
+			em, _ := e.(map[string]interface{})
+			if _, ok := em["masquerade"]; ok {
+				hasMasq = true
+			}
+			match, _ := em["match"].(map[string]interface{})
+			if match == nil {
+				continue
+			}
+			if match["op"] == "!=" {
+				left, _ := match["left"].(map[string]interface{})
+				if meta, _ := left["meta"].(map[string]interface{}); meta != nil && meta["key"] == "iifname" {
+					hasIifNeq = true
+				}
+			}
+			left, _ := match["left"].(map[string]interface{})
+			if payload, _ := left["payload"].(map[string]interface{}); payload != nil && payload["field"] == "daddr" && match["right"] == "192.168.10.10" {
+				hasDaddr = true
+			}
+		}
+		if !hasIifNeq || !hasDaddr || !hasMasq {
+			t.Errorf("hairpin-regeln saknar delar (iif!=WAN=%v, daddr=%v, masq=%v): %s", hasIifNeq, hasDaddr, hasMasq, string(data))
+		}
+	}
+	if !found {
+		t.Fatalf("hittade ingen NAT-reflektion (hairpin) i postrouting: %s", string(data))
+	}
+}
+
 // TestRenderJSONUnparseableServiceSkipsRule: en tjänstesträng som inte
 // gick att tolka gav tidigare en regel HELT UTAN portbegränsning — en
 // accept-regel avsedd för en enda port öppnade då tyst alla portar

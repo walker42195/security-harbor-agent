@@ -50,6 +50,10 @@ func NewServer(bindAddr string, eng *engine.Engine, auth *AuthManager, tlsCert *
 }
 
 func (s *Server) Start() error {
+	// Starta bakgrunds-CPU-samplaren (se startCPUSampler) så att
+	// /api/v1/system kan läsa ett cachat, stabilt belastningsvärde.
+	startCPUSampler()
+
 	mux := http.NewServeMux()
 
 	// Öppna endpoints
@@ -549,7 +553,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"hostname":        hostname,
 		"state":           st,
-		"version":         "0.13.0",
+		"version":         "0.14.0",
 		"uptime":          readUptime(),
 		"cpu":             readCPUPercent(),
 		"cpu_cores":       runtime.NumCPU(),
@@ -582,48 +586,85 @@ func readUptime() string {
 	return fmt.Sprintf("%dh %dm", hours, minutes)
 }
 
-// readCPUPercent tar ett kort (100ms) sample av /proc/stat före/efter för
-// att räkna ut aktuell total CPU-belastning i procent — ersätter den
-// tidigare hårdkodade platshållaren "14.5" som visades oavsett verklig
-// belastning.
-func readCPUPercent() float64 {
-	sample := func() (idle, total uint64, ok bool) {
-		data, err := os.ReadFile("/proc/stat")
+// cpuSample är den senast uträknade CPU-belastningen, uppdaterad av
+// startCPUSampler i bakgrunden. readCPUPercent (som anropas synkront i
+// varje /api/v1/system-anrop) läser bara det cachade värdet.
+var cpuSample struct {
+	mu     sync.RWMutex
+	value  float64
+	primed bool
+}
+
+// sampleCPUStat läser den aggregerade "cpu"-raden ur /proc/stat och
+// returnerar idle-jiffies (inkl. iowait, som också är overksam tid) och
+// totala jiffies. Skillnaden mellan två avlästa sample ger belastningen.
+func sampleCPUStat() (idle, total uint64, ok bool) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	line := strings.SplitN(string(data), "\n", 2)[0]
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0, false
+	}
+	for i := 1; i < len(fields); i++ {
+		v, err := strconv.ParseUint(fields[i], 10, 64)
 		if err != nil {
-			return 0, 0, false
+			continue
 		}
-		line := strings.SplitN(string(data), "\n", 2)[0]
-		fields := strings.Fields(line)
-		if len(fields) < 5 || fields[0] != "cpu" {
-			return 0, 0, false
+		total += v
+		// Fält 4 = idle, fält 5 = iowait (om det finns). Båda räknas
+		// som overksam tid, annars överskattas belastningen på en
+		// I/O-väntande värd.
+		if i == 4 || i == 5 {
+			idle += v
 		}
-		for i := 1; i < len(fields); i++ {
-			v, err := strconv.ParseUint(fields[i], 10, 64)
-			if err != nil {
-				continue
-			}
-			total += v
-			if i == 4 { // "idle"-fältet
-				idle = v
-			}
-		}
-		return idle, total, true
 	}
+	return idle, total, true
+}
 
-	idle1, total1, ok := sample()
-	if !ok {
-		return 0
-	}
-	time.Sleep(100 * time.Millisecond)
-	idle2, total2, ok := sample()
-	if !ok || total2 <= total1 {
-		return 0
-	}
+// startCPUSampler kör en bakgrundsloop som var 2:a sekund räknar ut
+// CPU-belastningen över HELA intervallet och cachar den.
+//
+// Ersätter det tidigare 100ms-samplet som togs synkront i varje
+// /api/v1/system-anrop: ett så kort fönster fångar bara ett fåtal jiffies
+// (kärnans jiffy-upplösning är ~10ms) på en nästan-idle brandvägg, så
+// idle-andelen dominerade och resultatet kvantiserades nästan alltid till
+// 0,0 % — därav "Dashboard visar nästan alltid 0 %". Ett 2s-fönster ger
+// ett stabilt, verkligt värde och lägger dessutom ingen fördröjning på
+// dashboard-anropet (som förut blockerade 100ms per hämtning).
+func startCPUSampler() {
+	go func() {
+		idlePrev, totalPrev, okPrev := sampleCPUStat()
+		for range time.Tick(2 * time.Second) {
+			idle, total, ok := sampleCPUStat()
+			if okPrev && ok && total > totalPrev {
+				idleDelta := float64(idle - idlePrev)
+				totalDelta := float64(total - totalPrev)
+				usage := (1.0 - idleDelta/totalDelta) * 100
+				if usage < 0 {
+					usage = 0
+				} else if usage > 100 {
+					usage = 100
+				}
+				cpuSample.mu.Lock()
+				cpuSample.value = math.Round(usage*10) / 10
+				cpuSample.primed = true
+				cpuSample.mu.Unlock()
+			}
+			idlePrev, totalPrev, okPrev = idle, total, ok
+		}
+	}()
+}
 
-	idleDelta := float64(idle2 - idle1)
-	totalDelta := float64(total2 - total1)
-	usage := (1.0 - idleDelta/totalDelta) * 100
-	return math.Round(usage*10) / 10
+// readCPUPercent returnerar det senast cachade CPU-belastningsvärdet.
+// Innan den första 2s-cykeln hunnit klart (precis efter boot) returneras
+// 0 — det stämmer i praktiken ändå, eftersom värden inte hunnit mätas.
+func readCPUPercent() float64 {
+	cpuSample.mu.RLock()
+	defer cpuSample.mu.RUnlock()
+	return cpuSample.value
 }
 
 // readMemInfoKB läser MemTotal/MemAvailable ur /proc/meminfo (i kB).

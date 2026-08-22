@@ -225,6 +225,18 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 		if !changed && !(isVLAN && deviceMissing) {
 			continue
 		}
+
+		// Om en VLAN flyttats till ett annat fysiskt kort (Parent/VLANID
+		// ändrats) ligger det GAMLA subinterfacet kvar på Linux och måste
+		// rivas — annars fortsätter det fånga trafik på fel kort. Görs
+		// FÖRE ApplyInterfaceConfig som skapar det nya subinterfacet.
+		if hadPrev && prev.VLANID > 0 && prev.Device != "" &&
+			(prev.Parent != iface.Parent || prev.VLANID != iface.VLANID) {
+			if err := netAdapter.DeleteVLANInterface(ctx, prev.Device); err != nil {
+				log.Printf("[NET] kunde inte ta bort gammalt VLAN %s: %v", prev.Device, err)
+			}
+		}
+
 		if err := netAdapter.ApplyInterfaceConfig(ctx, iface); err != nil {
 			log.Printf("[NET] kunde inte tillämpa gränssnitt %s: %v", iface.Device, err)
 		}

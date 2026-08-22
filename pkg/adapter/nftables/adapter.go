@@ -984,6 +984,69 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			})
 		}
 
+		// 4c. NAT-reflektion / hairpin (NAT loopback): en INTERN klient som
+		// slår upp en extern DNS-post som pekar på brandväggens WAN-IP och
+		// ansluter dit ska nå den DNAT:ade interna servern — och få svaret
+		// tillbaka. DNAT:en i prerouting (4) skriver redan om målet, men om
+		// klient och server ligger i SAMMA subnät svarar servern direkt till
+		// klienten (förbi brandväggen) med sin interna IP i stället för
+		// WAN-IP:n klienten anslöt mot → anslutningen bryts. Lösningen är att
+		// maskera den hairpinnade trafiken så servern svarar tillbaka via
+		// brandväggen (som då kan skriva tillbaka WAN-IP:n).
+		//
+		// Regeln matchar trafik som INTE kom in på WAN (iifname != wanDevices
+		// = internt ursprung) och är på väg till den interna serverns
+		// IP:internport — alltså exakt de hairpinnade paketen, inte äkta
+		// inkommande WAN-trafik (den lämnas omaskerad så servern ser
+		// klientens riktiga käll-IP). Kräver minst ett WAN-device för att
+		// "icke-WAN" ska vara meningsfullt.
+		if len(wanDevices) > 0 {
+			for _, pol := range cfg.Policies {
+				if !pol.Enabled || pol.Action != config.ActionDNAT || pol.NAT == nil || pol.NAT.InternalIP == "" {
+					continue
+				}
+				proto := "tcp"
+				if pol.NAT.Protocol != "" {
+					proto = pol.NAT.Protocol
+				}
+				expr := []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "!=",
+							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"right": map[string]interface{}{"set": wanDevices},
+						},
+					},
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+							"right": pol.NAT.InternalIP,
+						},
+					},
+				}
+				if pol.NAT.InternalPort > 0 {
+					expr = append(expr, map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
+							"right": pol.NAT.InternalPort,
+						},
+					})
+				}
+				expr = append(expr, map[string]interface{}{"masquerade": nil})
+				root.Nftables = append(root.Nftables, NFTElement{
+					Rule: &Rule{
+						Family:  a.family,
+						Table:   a.tableName,
+						Chain:   "postrouting",
+						Comment: fmt.Sprintf("NAT-reflektion (hairpin) för %s", pol.Name),
+						Expr:    expr,
+					},
+				})
+			}
+		}
+
 		// 5. NAT POSTROUTING CHAIN (Outbound Masquerade för alla interna nät mot WAN)
 		for _, wanDev := range wanDevices {
 			root.Nftables = append(root.Nftables, NFTElement{
