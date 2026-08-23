@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -82,7 +83,7 @@ func main() {
 	suricataAdapter := suricata.NewAdapter("", "")
 	haproxyAdapter := haproxy.NewAdapter("")
 	eng := engine.NewEngine(st, nftAdapter, dhcpAdapter, wgAdapter, ovpnAdapter, dnsAdapter, syslogAdapter, suricataAdapter, haproxyAdapter)
-	auth := api.NewAuthManager()
+	auth := api.NewAuthManager(filepath.Join(*configDir, "sessions.json"))
 
 	// Applicera initial konfiguration vid start (om ej dry-run)
 	if !*dryRun {

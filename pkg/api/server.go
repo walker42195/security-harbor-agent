@@ -62,6 +62,12 @@ func (s *Server) Start() error {
 
 	// Öppna endpoints
 	mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
+	// Öppen (oautentiserad) versions-endpoint — bara versionssträngen. Låter
+	// GUI:t upptäcka att agenten kommit tillbaka på den nya versionen efter en
+	// uppgradering ÄVEN om sessionen just då inte gäller (t.ex. en äldre agent
+	// som inte persisterade sin token över omstarten). Ingen känslig info;
+	// management-API:t är dessutom LAN-only via nftables.
+	mux.HandleFunc("/api/v1/version", s.handleVersion)
 
 	// Skyddade endpoints — läsande, tillgängliga för både admin och viewer
 	// (Fas 8). En "viewer" ska vara strikt skrivskyddad.
@@ -644,6 +650,13 @@ func restartSelfAfterResponse(w http.ResponseWriter) {
 		time.Sleep(500 * time.Millisecond)
 		os.Exit(0)
 	}()
+}
+
+// handleVersion returnerar bara agentens version, utan autentisering (se
+// route-registreringen). Används av GUI:ts uppgraderings-återkoppling.
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"version": s.version})
 }
 
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {

@@ -3,7 +3,7 @@ package api
 import "testing"
 
 func TestPerUsernameLockoutSurvivesIPRotation(t *testing.T) {
-	a := NewAuthManager()
+	a := NewAuthManager("")
 
 	// Simulera en angripare som roterar käll-IP mot SAMMA användarnamn -
 	// den gamla, rent IP-baserade spärren hade inte fångat detta alls.
@@ -25,7 +25,7 @@ func TestPerUsernameLockoutSurvivesIPRotation(t *testing.T) {
 }
 
 func TestPerIPLockoutStillWorks(t *testing.T) {
-	a := NewAuthManager()
+	a := NewAuthManager("")
 
 	for i := 0; i < 5; i++ {
 		a.RecordFailedAttempt("9.9.9.9", "user1")

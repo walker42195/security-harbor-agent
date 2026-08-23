@@ -3,7 +3,9 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -26,20 +28,73 @@ type AuthManager struct {
 	mu       sync.RWMutex
 	sessions map[string]TokenSession
 
+	// persistPath är filen (i data-dir) där aktiva sessioner sparas så att en
+	// inloggning ÖVERLEVER en omstart av agenten. Utan detta töms sessions-
+	// mappen vid varje omstart → alla tokens blir ogiltiga, vilket bl.a.
+	// loggade ut användaren vid varje uppgradering och fick GUI:ts
+	// uppgraderings-återkoppling att aldrig upptäcka att agenten kom tillbaka
+	// (getSystemStatus gav 401). Tom sträng = ingen persistens (t.ex. i tester).
+	persistPath string
+
 	ipAttempts   map[string]int
 	ipLockouts   map[string]time.Time
 	userAttempts map[string]int
 	userLockouts map[string]time.Time
 }
 
-func NewAuthManager() *AuthManager {
-	return &AuthManager{
+func NewAuthManager(persistPath string) *AuthManager {
+	a := &AuthManager{
 		sessions:     make(map[string]TokenSession),
+		persistPath:  persistPath,
 		ipAttempts:   make(map[string]int),
 		ipLockouts:   make(map[string]time.Time),
 		userAttempts: make(map[string]int),
 		userLockouts: make(map[string]time.Time),
 	}
+	a.loadSessions()
+	return a
+}
+
+// loadSessions läser in tidigare sparade, ej utgångna sessioner från disk.
+// Anropas en gång vid start. Fel (saknad/trasig fil) ignoreras — då börjar
+// agenten bara utan aktiva sessioner, precis som tidigare.
+func (a *AuthManager) loadSessions() {
+	if a.persistPath == "" {
+		return
+	}
+	data, err := os.ReadFile(a.persistPath)
+	if err != nil {
+		return
+	}
+	var stored map[string]TokenSession
+	if json.Unmarshal(data, &stored) != nil {
+		return
+	}
+	now := time.Now()
+	for tok, s := range stored {
+		if now.Before(s.ExpiresAt) {
+			a.sessions[tok] = s
+		}
+	}
+}
+
+// saveSessionsLocked skriver de aktiva sessionerna till disk (atomiskt via
+// temp + rename). Anroparen MÅSTE hålla a.mu. Filen innehåller aktiva
+// bearer-tokens och skrivs 0600 i den redan 0700-skyddade data-katalogen (som
+// dessutom innehåller master-nyckel och TLS-nyckel — ingen ny exponering).
+func (a *AuthManager) saveSessionsLocked() {
+	if a.persistPath == "" {
+		return
+	}
+	data, err := json.Marshal(a.sessions)
+	if err != nil {
+		return
+	}
+	tmp := a.persistPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, a.persistPath)
 }
 
 func isLockedOutLocked(lockouts map[string]time.Time, key string) bool {
@@ -135,6 +190,7 @@ func (a *AuthManager) CreateSession(user, role string, duration time.Duration) (
 		Role:      role,
 		ExpiresAt: time.Now().Add(duration),
 	}
+	a.saveSessionsLocked() // överlev en omstart av agenten
 
 	return token, nil
 }
