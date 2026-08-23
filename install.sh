@@ -268,9 +268,17 @@ if [ "$MODE" = "host" ] && ! grep -q -- '--mode=host' /etc/systemd/system/securi
 fi
 systemctl daemon-reload
 
-echo "=== 7. Startar tjänster ==="
-systemctl enable --now security-harbor-failsafe.service
-systemctl enable --now security-harbor-agent.service
+echo "=== 7. Startar (eller startar OM) tjänster ==="
+# `enable --now` startar bara en tjänst som INTE redan kör — vid en
+# OMinstallation/uppdatering ligger den gamla processen kvar med den gamla
+# binären i minnet (upptäckt 2026-08-23: en ny binär installerades men
+# 0.16.0-processen fortsatte köra med den hårdkodade 10.0.0.163-bindningen).
+# Använd därför enable + restart så att den nya binären och de nya
+# konfig-/failsafe-filerna faktiskt laddas.
+systemctl enable security-harbor-failsafe.service
+systemctl restart security-harbor-failsafe.service
+systemctl enable security-harbor-agent.service
+systemctl restart security-harbor-agent.service
 if [ "$MODE" = "gateway" ]; then
   systemctl enable --now security-harbor-suricata-update.timer
   echo "=== 8. Hämtar initialt Suricata-regelset (ET Open) ==="
