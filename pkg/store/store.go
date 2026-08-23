@@ -262,30 +262,52 @@ func ipsAutoBlockDenyPolicy() config.Policy {
 // lades till (så anroparen kan spara). Ändringen är säker att köra utan en
 // uttrycklig commit: policyn är avstängd och objektet tomt, så inget beteende
 // ändras förrän administratören själv slår på regeln.
+const ipsAutoBlockObjectName = "IPS - Auto block"
+
 func ensureDefaultAutoBlock(cfg *config.Config) bool {
 	if cfg == nil {
 		return false
 	}
 	changed := false
 
-	hasObj := false
+	// 1. Bestäm det KANONISKA auto-block-objektet, i prioordning:
+	//    a) det objekt IDS auto-block redan skriver till (ids.auto_block_object_id),
+	//       om det pekar på ett befintligt objekt,
+	//    b) annars ett befintligt objekt med namnet "IPS - Auto block",
+	//    c) annars skapa ett nytt med det stabila seed-ID:t.
+	// Att matcha på NAMN (inte bara på ett hårdkodat ID) är viktigt: en
+	// befintlig installation kan redan ha ett auto-block-objekt med ett
+	// GUI-genererat ID (obj_...), och en tidigare version av den här
+	// migrationen som bara letade på ID skapade då ett DUBBLETT-objekt.
+	existing := map[string]bool{}
+	firstNamed := ""
 	for _, o := range cfg.Objects {
-		if o.ID == ipsAutoBlockObjectID {
-			hasObj = true
-			break
+		existing[o.ID] = true
+		if o.Name == ipsAutoBlockObjectName && firstNamed == "" {
+			firstNamed = o.ID
 		}
 	}
-	if !hasObj {
+	canonicalID := ""
+	switch {
+	case cfg.IDS != nil && cfg.IDS.AutoBlockObjectID != "" && existing[cfg.IDS.AutoBlockObjectID]:
+		canonicalID = cfg.IDS.AutoBlockObjectID
+	case firstNamed != "":
+		canonicalID = firstNamed
+	default:
 		cfg.Objects = append(cfg.Objects, config.Object{
 			ID:          ipsAutoBlockObjectID,
-			Name:        "IPS - Auto block",
+			Name:        ipsAutoBlockObjectName,
 			Type:        config.ObjectTypeIPList,
 			Values:      []string{},
 			Description: "Käll-IP:n som IDS auto-block lägger till automatiskt. Referera detta objekt från en Deny-policy för att faktiskt blockera dem.",
 		})
+		canonicalID = ipsAutoBlockObjectID
 		changed = true
 	}
 
+	// 2. Säkerställ Deny-policyn och att den pekar på det kanoniska objektet
+	//    (annars skulle den kunna vakta ett tomt duplikat medan IDS fyller ett
+	//    annat objekt — regeln hade då aldrig blockerat något).
 	hasPolicy := false
 	for i := range cfg.Policies {
 		if cfg.Policies[i].ID == "sys-ips-autoblock-deny" {
@@ -296,15 +318,51 @@ func ensureDefaultAutoBlock(cfg *config.Config) bool {
 				cfg.Policies[i].SourceZone = ""
 				changed = true
 			}
+			if cfg.Policies[i].SourceObj != canonicalID {
+				cfg.Policies[i].SourceObj = canonicalID
+				changed = true
+			}
 			break
 		}
 	}
 	if !hasPolicy {
-		// Lägg den tidigt (efter en ev. Local/SSH-policy) så blockeringen
-		// vinner över senare Allow-policies. Enklast: först i listan.
-		cfg.Policies = append([]config.Policy{ipsAutoBlockDenyPolicy()}, cfg.Policies...)
+		// Lägg den tidigt (före ev. Allow-policies) så blockeringen vinner —
+		// första matchande regel vinner. Enklast: först i listan.
+		p := ipsAutoBlockDenyPolicy()
+		p.SourceObj = canonicalID
+		cfg.Policies = append([]config.Policy{p}, cfg.Policies...)
 		changed = true
 	}
+
+	// 3. Städa bort ev. duplicerade "IPS - Auto block"-objekt som inte är det
+	//    kanoniska (t.ex. det tomma duplikat en tidigare buggig migration la
+	//    till). Bara säkert när de är TOMMA och inget refererar dem.
+	referenced := map[string]bool{}
+	if cfg.IDS != nil && cfg.IDS.AutoBlockObjectID != "" {
+		referenced[cfg.IDS.AutoBlockObjectID] = true
+	}
+	for _, p := range cfg.Policies {
+		if p.SourceObj != "" && p.SourceObj != "ANY" {
+			referenced[p.SourceObj] = true
+		}
+		if p.DestObj != "" && p.DestObj != "ANY" {
+			referenced[p.DestObj] = true
+		}
+	}
+	kept := cfg.Objects[:0]
+	removedDuplicate := false
+	for _, o := range cfg.Objects {
+		if o.Name == ipsAutoBlockObjectName && o.ID != canonicalID && len(o.Values) == 0 && !referenced[o.ID] {
+			removedDuplicate = true
+			continue
+		}
+		kept = append(kept, o)
+	}
+	if removedDuplicate {
+		cfg.Objects = kept
+		changed = true
+	}
+
 	return changed
 }
 
