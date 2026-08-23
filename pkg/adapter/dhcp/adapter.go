@@ -176,7 +176,10 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 		return fmt.Errorf("misslyckades ersätta %s: %w", a.configPath, err)
 	}
 
-	// Starta om kea-dhcp4-server om tjänsten finns
-	_ = exec.CommandContext(ctx, "systemctl", "restart", "kea-dhcp4-server.service").Run()
+	// Starta om kea-dhcp4-server. Felet ytas nu upp (tidigare svalt med _ =) så
+	// att t.ex. en saknad polkit-regel inte tyst gör att DHCP inte startar om.
+	if out, err := exec.CommandContext(ctx, "systemctl", "restart", "kea-dhcp4-server.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart kea-dhcp4-server.service misslyckades: %w - output: %s", err, string(out))
+	}
 	return nil
 }

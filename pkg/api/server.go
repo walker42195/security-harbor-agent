@@ -92,6 +92,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/ping", s.authMiddlewareAdmin(s.handlePing))
 	mux.HandleFunc("/api/v1/diagnostics/traceroute", s.authMiddlewareAdmin(s.handleTraceroute))
 	mux.HandleFunc("/api/v1/diagnostics/nmap", s.authMiddlewareAdmin(s.handleNmap))
+	mux.HandleFunc("/api/v1/diagnostics/dig", s.authMiddlewareAdmin(s.handleDig))
+	mux.HandleFunc("/api/v1/diagnostics/arp", s.authMiddlewareAdmin(s.handleArp))
 	mux.HandleFunc("/api/v1/diagnostics/tcpdump", s.authMiddlewareAdmin(s.handleTcpdumpCapture))
 	mux.HandleFunc("/api/v1/vpn/wireguard/generate-peer-keys", s.authMiddlewareAdmin(s.handleWireGuardGeneratePeerKeys))
 	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddlewareAdmin(s.handleOpenVPNGenerateClient))
@@ -930,6 +932,60 @@ func (s *Server) handleTraceroute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, _ := exec.Command("traceroute", "-n", "-w", "1", "-m", "15", "--", req.Host).CombinedOutput()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
+}
+
+// handleDig slår upp ett DNS-namn med `dig`. Valfri record-typ (A/AAAA/MX/...)
+// och valfri server att fråga (@server). Kräver inte root; körs direkt som
+// tjänstekontot. Validering återanvänder validateDiagnosticHost så inga flaggor
+// kan smugglas in via host/server-fälten, och type begränsas till en vitlista.
+var digTypePattern = regexp.MustCompile(`^[A-Za-z]{1,10}$`)
+
+func (s *Server) handleDig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Host   string `json:"host"`
+		Type   string `json:"type"`
+		Server string `json:"server"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Host == "" {
+		http.Error(w, "Host saknas", http.StatusBadRequest)
+		return
+	}
+	if err := validateDiagnosticHost(req.Host); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	args := []string{"+noall", "+answer", "+comments", "+stats"}
+	if req.Type != "" {
+		if !digTypePattern.MatchString(req.Type) {
+			http.Error(w, "ogiltig record-typ", http.StatusBadRequest)
+			return
+		}
+		args = append(args, "-t", strings.ToUpper(req.Type))
+	}
+	if req.Server != "" {
+		if err := validateDiagnosticHost(req.Server); err != nil {
+			http.Error(w, "ogiltig server", http.StatusBadRequest)
+			return
+		}
+		args = append(args, "@"+req.Server)
+	}
+	args = append(args, "--", req.Host)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "dig", args...).CombinedOutput()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
+}
+
+// handleArp visar grannbords-/ARP-tabellen (IPv4 + IPv6) med `ip neigh`. Enbart
+// läsning, ingen root krävs. Ger IP↔MAC-mappningar för enheter brandväggen
+// nyligen pratat med — praktiskt för att hitta MAC att reservera i DHCP.
+func (s *Server) handleArp(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "ip", "neigh", "show").CombinedOutput()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"output": string(out)})
 }

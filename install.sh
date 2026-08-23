@@ -104,6 +104,8 @@ if [ "$MODE" = "host" ]; then
   apt-get install -y \
     nftables \
     tcpdump \
+    nmap \
+    bind9-dnsutils \
     rsyslog \
     polkitd
 else
@@ -115,6 +117,8 @@ else
     openvpn \
     haproxy \
     tcpdump \
+    nmap \
+    bind9-dnsutils \
     suricata \
     suricata-update \
     rsyslog \
@@ -190,7 +194,12 @@ fi
 # tjänstekontot grupp-skriv på katalogen (och ev. befintliga konfigfiler),
 # samma mönster som suricata/haproxy. Dessa kataloger finns efter paket-
 # installationen i gateway-läge (host-läge installerar dem inte).
-for d in /etc/kea /etc/unbound /etc/openvpn /etc/wireguard; do
+# OBS: unbound skriver INTE i /etc/unbound utan i underkatalogen
+# /etc/unbound/unbound.conf.d/ (defaultDir i pkg/adapter/dns/adapter.go) — den
+# ligger också root:root efter paketinstallationen. Missades 2026-08-23:
+# /etc/unbound blev grupp-skrivbar men conf.d inte, så DNS-applicering failade
+# med "open .../security-harbor.conf: permission denied". Ta med conf.d i loopen.
+for d in /etc/kea /etc/unbound /etc/unbound/unbound.conf.d /etc/openvpn /etc/wireguard; do
   if [ -d "$d" ]; then
     chgrp security-harbor "$d"
     chmod g+wx "$d"
