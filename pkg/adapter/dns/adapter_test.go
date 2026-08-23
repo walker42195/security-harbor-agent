@@ -70,17 +70,27 @@ func TestGenerateHostsConfigStaticRecords(t *testing.T) {
 			Enabled:     true,
 			LocalDomain: "lan",
 			StaticRecords: []config.DNSStaticRecord{
+				// Kortnamn: används EXAKT som angivet — inget "lan"-suffix
+				// hängs på en manuell post.
 				{Hostname: "server1", IP: "10.0.0.50"},
+				// FQDN mot en helt annan domän ska också stå kvar orörd.
+				{Hostname: "nx4.novabase.se", IP: "10.7.7.7"},
 			},
 		},
 	}
 
 	conf := GenerateHostsConfig(nil, cfg)
-	if !strings.Contains(conf, `local-data: "server1.lan. IN A 10.0.0.50"`) {
-		t.Errorf("förväntade A-post för server1.lan, men saknas: %s", conf)
+	if !strings.Contains(conf, `local-data: "server1. IN A 10.0.0.50"`) {
+		t.Errorf("förväntade verbatim A-post för server1 (utan suffix), men saknas: %s", conf)
 	}
-	if !strings.Contains(conf, `local-data-ptr: "10.0.0.50 server1.lan."`) {
-		t.Errorf("förväntade PTR-post, men saknas: %s", conf)
+	if strings.Contains(conf, "server1.lan") {
+		t.Errorf("manuell post ska INTE få lokalt suffix, men fick server1.lan: %s", conf)
+	}
+	if !strings.Contains(conf, `local-data: "nx4.novabase.se. IN A 10.7.7.7"`) {
+		t.Errorf("förväntade FQDN nx4.novabase.se orörd, men saknas: %s", conf)
+	}
+	if strings.Contains(conf, "novabase.se.lan") {
+		t.Errorf("FQDN ska INTE få lokalt suffix påhängt: %s", conf)
 	}
 }
 

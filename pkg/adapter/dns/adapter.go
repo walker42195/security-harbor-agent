@@ -195,14 +195,20 @@ func GenerateHostsConfig(leases []dhcp.Lease, cfg *config.Config) string {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "server:\n")
 
-	writeRecord := func(hostname, ip string) {
+	// appendSuffix styr om den lokala domänen (LocalDomain) ska hängas på ett
+	// namn utan eget suffix. Sant för DHCP-auto-registrering (korta värdnamn
+	// som ska hamna i den lokala zonen), FALSKT för manuella poster — där ska
+	// namnet användas EXAKT som administratören skrev det, oavsett domän. Vill
+	// man ha ett suffix på en manuell post skriver man hela namnet själv.
+	writeRecord := func(hostname, ip string, appendSuffix bool) {
 		hostname = strings.ToLower(strings.TrimSpace(hostname))
+		hostname = strings.TrimSuffix(hostname, ".") // ev. absolut FQDN "namn."
 		ip = strings.TrimSpace(ip)
 		if hostname == "" || ip == "" {
 			return
 		}
 		fqdn := hostname
-		if suffix != "" && !strings.HasSuffix(hostname, "."+suffix) && hostname != suffix {
+		if appendSuffix && suffix != "" && !strings.HasSuffix(hostname, "."+suffix) && hostname != suffix {
 			fqdn = hostname + "." + suffix
 		}
 		fmt.Fprintf(&b, "    local-data: \"%s. IN A %s\"\n", fqdn, ip)
@@ -211,11 +217,11 @@ func GenerateHostsConfig(leases []dhcp.Lease, cfg *config.Config) string {
 
 	if d.DHCPHostnameRegistration {
 		for _, l := range leases {
-			writeRecord(l.Hostname, l.IP)
+			writeRecord(l.Hostname, l.IP, true) // korta DHCP-värdnamn → lokala zonen
 		}
 	}
 	for _, rec := range d.StaticRecords {
-		writeRecord(rec.Hostname, rec.IP)
+		writeRecord(rec.Hostname, rec.IP, false) // manuella poster: exakt som angivet
 	}
 
 	return b.String()
