@@ -40,10 +40,28 @@ if [[ ! -x "$WORK/install.sh" ]]; then
     exit 1
 fi
 
-log "kör install.sh (idempotent uppdatering av binärer, webb-GUI, systemd)..."
-# Bevara nuvarande driftläge (gateway/host) - install.sh känner av redan
-# installerad maskin och rör inte /var/lib/security-harbor (config/db/nycklar).
-( cd "$WORK" && ./install.sh )
+# install.sh frågar annars interaktivt om driftläge/WAN-kort (läser /dev/tty),
+# vilket inte finns i en systemd-tjänst. Detektera nuvarande läge och WAN-kort
+# och skicka dem som flaggor så att inget prompt triggas. Läget avgörs av om
+# agent-tjänsten redan startas med --mode=host; WAN-kortet tas från den enda
+# default-rutten (WAN), med failsafe-regelsetet som reserv.
+MODE="gateway"
+if grep -q -- '--mode=host' /etc/systemd/system/security-harbor-agent.service 2>/dev/null; then
+    MODE="host"
+fi
+INSTALL_ARGS=("--mode=$MODE")
+if [ "$MODE" = "gateway" ]; then
+    WAN_DEV="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+    if [ -z "$WAN_DEV" ] && [ -f /etc/security-harbor/security-harbor-failsafe.nft ]; then
+        WAN_DEV="$(grep -oE 'iifname "[^"]+"' /etc/security-harbor/security-harbor-failsafe.nft 2>/dev/null | head -1 | sed -E 's/iifname "([^"]+)"/\1/')"
+    fi
+    [ -n "$WAN_DEV" ] && INSTALL_ARGS+=("--wan-device=$WAN_DEV")
+fi
+
+log "kör install.sh --mode=$MODE (idempotent uppdatering av binärer, webb-GUI, systemd)..."
+# install.sh känner av en redan installerad maskin och rör inte
+# /var/lib/security-harbor (config/db/nycklar).
+( cd "$WORK" && ./install.sh "${INSTALL_ARGS[@]}" )
 
 log "startar om agenten på den nya versionen..."
 systemctl restart security-harbor-agent.service
