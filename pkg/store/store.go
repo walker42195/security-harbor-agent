@@ -238,11 +238,14 @@ const ipsAutoBlockObjectID = "obj-ips-autoblock"
 // ingenting av misstag.
 func ipsAutoBlockDenyPolicy() config.Policy {
 	return config.Policy{
-		ID:          "sys-ips-autoblock-deny",
-		Name:        "Blockera auto-blockerade IP:n (IPS)",
-		Enabled:     false,
-		Priority:    2,
-		SourceZone:  "ANY",
+		ID:       "sys-ips-autoblock-deny",
+		Name:     "Blockera auto-blockerade IP:n (IPS)",
+		Enabled:  false,
+		Priority: 2,
+		// Tom källzon (inte "ANY") när källan anges via objekt — annars visar
+		// GUI:t både "ANY" och objektet i From-rutan. Tom zon = ingen
+		// zonbegränsning, precis som "ANY", men utan den dubbla posten.
+		SourceZone:  "",
 		DestZone:    "ANY",
 		SourceObj:   ipsAutoBlockObjectID,
 		DestObj:     "ANY",
@@ -284,9 +287,15 @@ func ensureDefaultAutoBlock(cfg *config.Config) bool {
 	}
 
 	hasPolicy := false
-	for _, p := range cfg.Policies {
-		if p.ID == "sys-ips-autoblock-deny" {
+	for i := range cfg.Policies {
+		if cfg.Policies[i].ID == "sys-ips-autoblock-deny" {
 			hasPolicy = true
+			// Rätta en tidigare injicerad variant som satte källzonen till
+			// "ANY" i stället för tom (gav en dubbel "ANY"+objekt-post i From).
+			if strings.EqualFold(cfg.Policies[i].SourceZone, "ANY") {
+				cfg.Policies[i].SourceZone = ""
+				changed = true
+			}
 			break
 		}
 	}
