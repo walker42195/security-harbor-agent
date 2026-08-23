@@ -181,6 +181,22 @@ if [ -d /etc/haproxy ]; then
   systemctl stop haproxy.service 2>/dev/null || true
 fi
 
+# Kea (DHCP), Unbound (DNS), OpenVPN och WireGuard: agenten SKAPAR/ersätter
+# konfigurationsfiler i dessa kataloger. På en FÄRSK installation är de
+# root:root, så tjänstekontot kan inte skriva där — upptäckt 2026-08-23 vid
+# installation på en ny server ("kea-dhcp4.conf: permission denied", initial
+# applicering failade). Kommentaren ovan noterade att dessa "råkade fungera"
+# på en tidigare maskin bara för att katalogerna chownats manuellt då. Ge
+# tjänstekontot grupp-skriv på katalogen (och ev. befintliga konfigfiler),
+# samma mönster som suricata/haproxy. Dessa kataloger finns efter paket-
+# installationen i gateway-läge (host-läge installerar dem inte).
+for d in /etc/kea /etc/unbound /etc/openvpn /etc/wireguard; do
+  if [ -d "$d" ]; then
+    chgrp security-harbor "$d"
+    chmod g+wx "$d"
+  fi
+done
+
 echo "=== 4. Installerar binärer ==="
 for bin in security-harbor-agent security-harbor-nmap-runner security-harbor-tcpdump-runner; do
   install -m 0755 -o root -g root "$SCRIPT_DIR/$bin" "$BIN_DIR/$bin"
@@ -215,6 +231,20 @@ if [ "$MODE" = "host" ]; then
 else
   if [ -z "$WAN_DEVICE" ]; then
     DETECTED="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+    # Lista nätverkskorten med namn, nuvarande IP och länkstatus så man ser
+    # vilket som är WAN (utsidan/internet). Ett WAN-kort utan inkopplad sladd
+    # syns som "down" / utan IP — praktiskt när man installerar innan WAN
+    # kopplas in.
+    echo ""
+    echo "Nätverkskort på den här servern:"
+    for IFACE in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
+      IPADDR="$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | paste -sd', ' -)"
+      STATE="$(cat "/sys/class/net/$IFACE/operstate" 2>/dev/null || echo '?')"
+      printf "  - %-12s %-20s [%s]\n" "$IFACE" "${IPADDR:-(ingen IP)}" "$STATE"
+    done
+    echo "(WAN = kortet mot internet/utsidan. Det som du administrerar brandväggen"
+    echo " genom, med serverns nuvarande IP, är LAN-sidan — välj INTE det som WAN.)"
+    echo ""
     if [ -r /dev/tty ]; then
       read -r -p "WAN-gränssnittets namn för failsafe-regelsetet [${DETECTED:-ens18}]: " WAN_DEVICE </dev/tty
     fi

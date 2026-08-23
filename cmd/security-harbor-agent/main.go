@@ -31,7 +31,7 @@ var version = "dev"
 
 func main() {
 	configDir := flag.String("data-dir", "/var/lib/security-harbor", "Sökväg till datakatalog")
-	bindAddr := flag.String("bind", "10.0.0.163:8443", "IP/Port för Management API (HTTPS)")
+	bindAddr := flag.String("bind", "0.0.0.0:8443", "IP/Port för Management API (HTTPS). Default 0.0.0.0 = alla gränssnitt (nftables håller porten LAN-only; se HARD WAN DROP), så API:t är nåbart på vilken LAN-IP servern än har.")
 	webUIDir := flag.String("webui-dir", "/var/lib/security-harbor/webui", "Sökväg till statiska filer för web-UI (flutter build web)")
 	dryRun := flag.Bool("dry-run", false, "Starta i dry-run läge utan att ändra nftables i kärnan")
 	seedMode := flag.String("mode", "", "Driftläge för EN HELT NY installation (\"\"/\"gateway\" eller \"host\", Fas 13) — rör bara den allra första uppstarten, ignoreras om running.json redan finns")
@@ -108,8 +108,14 @@ func main() {
 		log.Fatalf("Ogiltig --bind-adress %q: %v", *bindAddr, err)
 	}
 	tlsIPs := []net.IP{net.ParseIP("127.0.0.1")}
-	if ip := net.ParseIP(bindHost); ip != nil {
+	if ip := net.ParseIP(bindHost); ip != nil && !ip.IsUnspecified() {
 		tlsIPs = append(tlsIPs, ip)
+	} else {
+		// Bind på 0.0.0.0/:: (alla gränssnitt) — ta med maskinens faktiska
+		// icke-loopback-IPv4-adresser i certifikatet så klienter som ansluter
+		// via LAN-IP:n får en matchande SAN (annars misslyckas
+		// hostname-verifieringen mot en fast, kanske obefintlig, IP).
+		tlsIPs = append(tlsIPs, localIPv4s()...)
 	}
 	tlsCert, err := st.EnsureManagementTLSCert(tlsIPs, []string{"localhost"})
 	if err != nil {
@@ -194,4 +200,28 @@ func main() {
 	_ = server.Stop(ctx)
 
 	fmt.Println("[SHUTDOWN] Agenten avslutad säkert.")
+}
+
+// localIPv4s returnerar maskinens icke-loopback-IPv4-adresser. Används för att
+// fylla TLS-certifikatets SAN-lista när API:t binder på 0.0.0.0 (alla
+// gränssnitt), så att en klient som ansluter via serverns LAN-IP får ett
+// certifikat vars IP-SAN matchar — oavsett vilken IP just den servern har.
+func localIPv4s() []net.IP {
+	var out []net.IP
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return out
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil || ip4.IsLoopback() {
+			continue
+		}
+		out = append(out, ip4)
+	}
+	return out
 }
