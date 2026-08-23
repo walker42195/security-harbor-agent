@@ -146,9 +146,34 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 		return nil
 	}
 
-	_ = os.MkdirAll(filepath.Dir(a.configPath), 0755)
-	if err := os.WriteFile(a.configPath, data, 0644); err != nil {
-		return fmt.Errorf("misslyckades skriva %s: %w", a.configPath, err)
+	// Atomisk skrivning: skriv till en temp-fil i SAMMA katalog och byt namn
+	// över målet. Detta kräver bara skrivrätt på KATALOGEN (som install.sh ger
+	// tjänstekontot via grupp-skriv på /etc/kea), INTE på själva målfilen —
+	// kea-dhcp4.conf installeras av paketet som root:root, och en direkt
+	// os.WriteFile på den gav "permission denied" (upptäckt på ny server
+	// 2026-08-23 när LAN ändrades från DHCP till statisk). Rename ersätter
+	// dessutom filen atomiskt så kea aldrig läser en halvskriven config.
+	dir := filepath.Dir(a.configPath)
+	_ = os.MkdirAll(dir, 0755)
+	tmp, err := os.CreateTemp(dir, ".kea-dhcp4.conf.*")
+	if err != nil {
+		return fmt.Errorf("misslyckades skapa temp-fil i %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op om rename redan flyttat den
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("misslyckades skriva %s: %w", tmpName, err)
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		tmp.Close()
+		return fmt.Errorf("misslyckades sätta rättigheter på %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("misslyckades stänga %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, a.configPath); err != nil {
+		return fmt.Errorf("misslyckades ersätta %s: %w", a.configPath, err)
 	}
 
 	// Starta om kea-dhcp4-server om tjänsten finns
