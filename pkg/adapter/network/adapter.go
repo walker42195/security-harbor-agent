@@ -282,6 +282,31 @@ func (a *Adapter) DeleteVLANInterface(ctx context.Context, device string) error 
 	return nil
 }
 
+// DeconfigureInterface av-konfigurerar ett gränssnitt som tagits bort ur
+// konfigurationen: tar bort dess IP-adresser och ev. default-rutt, utan att
+// riva själva (fysiska) enheten — den kan ligga kvar i hypervisorn tills
+// användaren tar bort den där. Idempotent (ett redan försvunnet gränssnitt är
+// inget fel). Används av engine.applyInterfaces för borttagna icke-VLAN-kort;
+// borttagna VLAN-subinterface rivs helt via DeleteVLANInterface i stället.
+func (a *Adapter) DeconfigureInterface(ctx context.Context, device string) error {
+	if device == "" {
+		return nil
+	}
+	if _, err := net.InterfaceByName(device); err != nil {
+		// Finns inte längre — inget att göra.
+		return nil
+	}
+	_ = exec.CommandContext(ctx, "ip", "addr", "flush", "dev", device).Run()
+	// Ta bort ev. default-rutt(er) via kortet så det inte fortsätter påverka
+	// egress efter att det plockats bort ur configen.
+	for i := 0; i < 8; i++ {
+		if err := exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", device).Run(); err != nil {
+			break
+		}
+	}
+	return nil
+}
+
 // ApplyDNSConfig uppdaterar systemets DNS-resolvrar i /etc/resolv.conf baserat på inskrivna DNS-servrar.
 func (a *Adapter) ApplyDNSConfig(ctx context.Context, interfaces []config.Interface) error {
 	var dnsList []string

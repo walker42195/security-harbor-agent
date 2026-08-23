@@ -250,6 +250,31 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 			log.Printf("[NET] kunde inte tillämpa gränssnitt %s: %v", iface.Device, err)
 		}
 	}
+
+	// Gränssnitt som fanns i prevCfg men tagits bort ur den nya
+	// konfigurationen ska av-konfigureras — annars ligger IP och ev. rutt
+	// kvar tills nästa omstart (applyInterfaces-loopen ovan rör bara kort som
+	// finns KVAR i newCfg). Ett borttaget VLAN-subinterface rivs helt; ett
+	// borttaget fysiskt kort får sina adresser och default-rutt bortflushade
+	// (själva enheten kan ligga kvar i hypervisorn tills den tas bort där).
+	if prevCfg != nil {
+		newByID := map[string]bool{}
+		for _, iface := range newCfg.Interfaces {
+			newByID[iface.ID] = true
+		}
+		for _, prev := range prevCfg.Interfaces {
+			if newByID[prev.ID] || prev.Device == "" {
+				continue
+			}
+			if prev.VLANID > 0 && prev.Parent != "" {
+				if err := netAdapter.DeleteVLANInterface(ctx, prev.Device); err != nil {
+					log.Printf("[NET] kunde inte ta bort borttaget VLAN %s: %v", prev.Device, err)
+				}
+			} else if err := netAdapter.DeconfigureInterface(ctx, prev.Device); err != nil {
+				log.Printf("[NET] kunde inte av-konfigurera borttaget gränssnitt %s: %v", prev.Device, err)
+			}
+		}
+	}
 }
 
 // interfaceConfigDiffers jämför de fält som faktiskt påverkar Linux-
