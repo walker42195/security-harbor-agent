@@ -1,5 +1,7 @@
 # Security Harbor Agent
 
+> 🇬🇧 English version: [README.en.md](README.en.md)
+
 Brandväggs- och nätverksappliance-daemon för Linux, skriven i Go. Förvandlar
 en vanlig Linux-dator med flera nätverkskort till en brandvägg med
 router-, DHCP-, DNS-, VPN- och IDS-funktioner, administrerad från
@@ -22,7 +24,7 @@ Management API (pkg/api)       — autentisering, RBAC, Safe Apply
 Configuration Engine (pkg/engine) — deklarativ modell, candidate/running-state
         ↓
 Linux-backend (pkg/adapter/*)  — nftables, Kea DHCP, Unbound, WireGuard,
-                                  OpenVPN, rsyslog, Suricata
+                                  OpenVPN, rsyslog, Suricata, HAProxy (SNI)
 ```
 
 Konfigurationen (`pkg/config/model.go`) är en enda deklarativ struct som
@@ -46,26 +48,76 @@ go run ./cmd/security-harbor-agent --data-dir ./data --bind 0.0.0.0:8443
 ```
 
 Flaggor: `--data-dir` (default `/var/lib/security-harbor`), `--bind`
-(default `10.0.0.163:8443`), `--webui-dir` (default
-`/var/lib/security-harbor/webui`, statiska filer för webb-GUI:t), `--dry-run`.
+(default `0.0.0.0:8443` — alla gränssnitt; nftables håller porten LAN-only
+via HARD WAN DROP, så API:t är nåbart på vilken LAN-IP servern än har),
+`--webui-dir` (default `/var/lib/security-harbor/webui`, statiska filer för
+webb-GUI:t), `--dry-run`, `--version`.
 
 ## Installation
 
-En färdig, idempotent installer finns för Ubuntu/Debian-liknande system:
+Enrads-installation direkt från GitHub (self-bootstrap — hämtar den senaste
+signerade release-bunten och kör den):
 
 ```bash
-./build_release.sh          # cross-kompilerar allt till ./dist/
+curl -fsSL https://raw.githubusercontent.com/walker42195/security-harbor-agent/main/install.sh | sudo bash
+```
+
+Läget (router/gateway eller enkelkorts-/värddator) väljs interaktivt; lägg
+till `-s -- --mode=gateway` (eller `--mode=host`) för att hoppa över frågan.
+I gateway-läge listas nätverkskorten (namn, nuvarande IP, länkstatus) innan
+du väljer WAN-gränssnitt.
+
+Eller bygg en egen bunt och installera lokalt:
+
+```bash
+./build_release.sh          # cross-kompilerar allt + bygger webb-GUI:t till ./dist/
 scp -r dist/ user@brandvägg:/tmp/security-harbor-install
 ssh user@brandvägg
 cd /tmp/security-harbor-install && sudo ./install.sh
 ```
 
-`install.sh` installerar systempaket (nftables, Kea, Unbound, WireGuard,
-OpenVPN, Suricata, tcpdump), skapar det körande systemkontot
-`security-harbor`, systemd-enheterna och polkit-reglerna, samt startar
-agenten. Laddar INTE ner något från nätet självt utöver `apt`/
-`suricata-update` — ingen OTA-funktion finns i det här skedet, se
-`SECURITY.md`.
+`install.sh` är **idempotent** (kan köras om för att uppdatera). Den
+installerar systempaket (nftables, Kea, Unbound, WireGuard, OpenVPN,
+Suricata, tcpdump, HAProxy), skapar det körande systemkontot
+`security-harbor`, systemd-enheterna, polkit-reglerna och webb-GUI:t, och
+startar (eller startar om) agenten.
+
+## Uppdatering
+
+**Via GUI:t (rekommenderas):** Settings → Uppdateringar → **Kontrollera** →
+**Ladda ner** → **Uppgradera**. Agenten hämtar den senaste release-bunten,
+verifierar den med **SHA256 + Ed25519-signatur** mot en inbyggd publik nyckel,
+och en privilegierad root-installer (som om-verifierar signaturen som root)
+byter binärer + webb-GUI och startar om agenten. Konfiguration, databas och
+nycklar i `/var/lib/security-harbor` bevaras. Ta gärna en snapshot av VM:en
+före en uppgradering.
+
+**Manuellt:** kör om enrads-installationen ovan (self-bootstrap hämtar senaste
+releasen), eller `git pull` + `./build_release.sh` + `sudo ./dist/install.sh`.
+
+Release-signering: `build_release.sh` signerar tarbollen med `cmd/security-harbor-sign`
+(Ed25519). Den privata nyckeln hålls utanför repot; den publika är inbyggd i
+agenten (`pkg/updater`). Se `SECURITY.md` för hotmodellen bakom
+självuppdateringen.
+
+## Avinstallation
+
+Enrads-avinstallation direkt från GitHub:
+
+```bash
+# Ta bort agenten, tjänsterna, systemd-enheterna och polkit-reglerna
+# (config/nycklar i /var/lib/security-harbor och systempaketen lämnas kvar):
+curl -fsSL https://raw.githubusercontent.com/walker42195/security-harbor-agent/main/uninstall.sh | sudo bash
+
+# Fullständig rensning (--purge): tar DESSUTOM bort /var/lib/security-harbor
+# (all config, alla nycklar, alla användarkonton — kan inte ångras utan
+# backup), systemkontot security-harbor och de installerade systempaketen.
+# Ger en helt färsk maskin inför en ny installation:
+curl -fsSL https://raw.githubusercontent.com/walker42195/security-harbor-agent/main/uninstall.sh | sudo bash -s -- --purge
+```
+
+`--purge` frågar efter en `ja`-bekräftelse innan config/nycklar raderas. Har
+du redan bunten lokalt kan du köra `sudo ./uninstall.sh [--purge]` direkt.
 
 ## Delsystem (`cmd/`)
 
@@ -77,28 +129,23 @@ en operatör direkt:
 - `security-harbor-nmap-runner` / `security-harbor-tcpdump-runner` — körs
   som root via `systemctl start --wait` när huvuddaemonen (som saknar
   `NoNewPrivileges`-undantag) behöver en portscan/paketfångst.
-- `security-harbor-reset-password` / `security-harbor-emergency-restore` —
-  manuella "break glass"-verktyg, körs via SSH direkt på servern, aldrig
-  som en långlivad tjänst.
+- `security-harbor-sign` — signerar release-artefakter vid bygge (Ed25519).
+  Byggs och används lokalt av `build_release.sh`, ingår inte i den
+  installerade bunten.
 
-## Fas-status
+## Funktioner (urval)
 
-Projektet byggs enligt en 14-fasig plan. Status per 2026-08-19:
+- Zonbaserad brandvägg (nftables), Safe Apply med automatisk rollback.
+- VLAN, DHCP per VLAN (Kea), outbound NAT, port forwarding (DNAT), NAT-reflektion.
+- WireGuard + OpenVPN (egen PKI), lokal DNS (Unbound) med blocklistor/DoT,
+  hot-listor och GeoIP-landsblockering.
+- SNI-baserad routning (HAProxy, passthrough) — ta emot TLS på en valfri port
+  och dirigera till olika interna servrar efter efterfrågat värdnamn.
+- IDS (Suricata, passivt läge) med Säkerhetshändelser och valfri auto-blockering.
+- Loggning/diagnostik, centraliserad syslog, multianvändare/roller, HTTPS-GUI.
+- Signerad in-GUI-självuppdatering (SHA256 + Ed25519), backup/återställning,
+  fabriksåterställning, enkelkorts-/värddatorläge.
 
-| Fas | Namn | Status |
-|---|---|---|
-| 0–7 | Säkerhetsgrund t.o.m. Avancerad Firewall Engine | Klart |
-| 8 | Loggning, Övervakning & Diagnostics | Klart |
-| 9 | IDS/IPS & Security Events | Klart (MVP — passivt IDS-läge, ej inline) |
-| 10 | Appliance Lifecycle, Backup & Installation | Klart (utan OTA, se avgränsning nedan) |
-| 11 | IPv6, Multi-WAN & High Availability | Uppskjuten (kräver ny policy-routing-infrastruktur + en tredje testlänk för verklig failover-verifiering) |
-| 12 | Hårdning, Pentest & Release | Pågående |
-| 13 | Enkelkorts-läge (Host Firewall) | Ej påbörjad |
-
-**Explicit avgränsning:** ingen OTA/automatisk självuppdatering finns eller
-är planerad i nuvarande form — uppdatering sker manuellt (`git pull` +
-bygg + `install.sh`). Se `SECURITY.md` för varför.
-
-⚠️ **Inte pentestat av en oberoende tredje part ännu** — se
-`SECURITY.md` och security.novabase.se för aktuell status. Kör inte som
-enda skydd mot internet förrän en extern granskning genomförts.
+⚠️ **Inte pentestat av en oberoende tredje part ännu** — se `SECURITY.md`
+och security.novabase.se för aktuell status. Kör inte som enda skydd mot
+internet förrän en extern granskning genomförts.
