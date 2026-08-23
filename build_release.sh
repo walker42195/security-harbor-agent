@@ -22,8 +22,12 @@ fi
 # Privat signeringsnyckel (Ed25519, base64 av 64 bytes) - HÅLLS UTANFÖR REPOT.
 SIGN_KEY="${SIGN_KEY:-$HOME/.config/security-harbor/release-signing.key}"
 
-# Release-URL som stoppas in i manifestet (stabil "latest download"-URL).
-RELEASE_BASE="${RELEASE_BASE:-https://github.com/walker42195/security-harbor-agent/releases/latest/download}"
+# Tarboll-URL som stoppas in i manifestet. VERSIONERAD (releases/download/vX.Y.Z)
+# — INTE latest — så att manifestets url + sha256 ALLTID hör ihop. Med latest
+# kunde en ny release som landade mellan Kontrollera och Ladda ner göra att
+# klienten laddade ner en nyare tarboll och jämförde mot en äldre sha256 →
+# "SHA256 stämmer inte". Manifestet självt hämtas fortfarande från latest.
+RELEASE_BASE="${RELEASE_BASE:-https://github.com/walker42195/security-harbor-agent/releases/download/v$VERSION}"
 
 DIST_DIR="dist"
 rm -rf "$DIST_DIR"
