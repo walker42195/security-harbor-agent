@@ -93,6 +93,21 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 		if err := setIPForwarding(!cfg.IsHostMode()); err != nil {
 			return fmt.Errorf("ip-forwarding: %w", err)
 		}
+		// ARP-härdning: gör så att varje kort BARA svarar på ARP för de IP:n som
+		// faktiskt sitter på det kortet (arp_ignore=1) och alltid annonserar
+		// avsändar-IP från rätt kort (arp_announce=2). Utan detta svarar Linux
+		// på ARP för valfri lokal IP från valfritt kort ("ARP flux"): om WAN och
+		// LAN hamnar på samma L2-segment (t.ex. ett platt testnät) kan WAN-kortet
+		// då svara på ARP för LAN:s management-IP, varpå administratörens trafik
+		// går in på WAN-kortet och träffar HARD WAN DROP → man låser ut sig helt
+		// (upptäckt på .166 2026-08-23: lådan verkade hängd, ARP svarade men all
+		// IP-trafik nekades). Ofarligt i en korrekt topologi (WAN/LAN på olika
+		// nät). Sätts vid varje apply och vid boot, så det överlever omstart.
+		if err := setARPHardening(); err != nil {
+			// Inte fatalt — logga och fortsätt (en gammal kärna utan just dessa
+			// knappar ska inte stoppa hela appliceringen).
+			log.Printf("[NET] kunde inte sätta ARP-härdning: %v", err)
+		}
 	}
 
 	// DHCP och Suricata är gateway-/router-specifika roller (DHCP-server
@@ -1238,6 +1253,24 @@ func setIPForwarding(enabled bool) error {
 	}
 	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", val, 0644); err != nil {
 		return fmt.Errorf("kunde inte skriva net.ipv4.ip_forward: %w", err)
+	}
+	return nil
+}
+
+// setARPHardening sätter net.ipv4.conf.all.arp_ignore=1 och arp_announce=2 (se
+// applyBackends för motivering — förhindrar ARP-flux som annars kan låsa ut
+// administratören när WAN/LAN delar L2-segment). Skriver "all"-knapparna; de
+// gäller som en logisk ELLER/MAX med per-interface-värdena, så nya kort täcks
+// automatiskt.
+func setARPHardening() error {
+	writes := map[string]string{
+		"/proc/sys/net/ipv4/conf/all/arp_ignore":   "1\n",
+		"/proc/sys/net/ipv4/conf/all/arp_announce": "2\n",
+	}
+	for path, val := range writes {
+		if err := os.WriteFile(path, []byte(val), 0644); err != nil {
+			return fmt.Errorf("kunde inte skriva %s: %w", path, err)
+		}
 	}
 	return nil
 }
