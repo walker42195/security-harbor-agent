@@ -36,7 +36,8 @@ for unit in \
   security-harbor-suricata-update.timer \
   security-harbor-suricata-update.service \
   security-harbor-nmap.service \
-  security-harbor-tcpdump.service
+  security-harbor-tcpdump.service \
+  security-harbor-update.service
 do
   systemctl disable --now "$unit" 2>/dev/null || true
 done
@@ -47,10 +48,13 @@ rm -f /etc/systemd/system/security-harbor-*.timer
 rm -f /etc/polkit-1/rules.d/10-security-harbor-*.rules
 systemctl daemon-reload
 
-echo "=== 3. Tar bort binärer ==="
+echo "=== 3. Tar bort binärer och självuppdaterings-runnern ==="
 rm -f "$BIN_DIR/security-harbor-agent" \
       "$BIN_DIR/security-harbor-nmap-runner" \
       "$BIN_DIR/security-harbor-tcpdump-runner"
+# Självuppdaterings-runnern (installerad av install.sh, se
+# systemd/update-runner.sh) och dess katalog.
+rm -rf /usr/local/lib/security-harbor
 
 if [ "$PURGE" = true ]; then
   echo "=== 4. --purge: tar bort config/nycklar, systemkonto och paket ==="
