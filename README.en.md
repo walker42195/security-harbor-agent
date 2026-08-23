@@ -88,7 +88,8 @@ the polkit rules and the web GUI, and starts (or restarts) the agent.
 **SHA256 + an Ed25519 signature** against a built-in public key, and a
 privileged root installer (which re-verifies the signature as root) swaps the
 binaries + web GUI and restarts the agent. Configuration, database and keys in
-`/var/lib/security-harbor` are preserved. Take a VM snapshot before upgrading.
+`/var/lib/security-harbor` are preserved. If you can, take a snapshot of the
+machine before upgrading.
 
 **Manually:** re-run the one-line install above (self-bootstrap fetches the
 latest release), or `git pull` + `./build_release.sh` + `sudo ./dist/install.sh`.

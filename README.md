@@ -89,8 +89,8 @@ startar (eller startar om) agenten.
 verifierar den med **SHA256 + Ed25519-signatur** mot en inbyggd publik nyckel,
 och en privilegierad root-installer (som om-verifierar signaturen som root)
 byter binärer + webb-GUI och startar om agenten. Konfiguration, databas och
-nycklar i `/var/lib/security-harbor` bevaras. Ta gärna en snapshot av VM:en
-före en uppgradering.
+nycklar i `/var/lib/security-harbor` bevaras. Har du möjlighet, ta en snapshot
+av maskinen före en uppgradering.
 
 **Manuellt:** kör om enrads-installationen ovan (self-bootstrap hämtar senaste
 releasen), eller `git pull` + `./build_release.sh` + `sudo ./dist/install.sh`.
