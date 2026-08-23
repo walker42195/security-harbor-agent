@@ -211,7 +211,15 @@ func defaultSeedConfig(seedMode string) *config.Config {
 
 	base.Interfaces = []config.Interface{
 		{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
-		{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		// LAN i DHCP-läge vid seed: en färsk installation vet inte vilket
+		// subnät LAN-sidan har, och en hårdkodad statisk IP (tidigare
+		// 10.0.0.163/24 från dev-referensmiljön) är både förvirrande — den
+		// visas fast servern inte har den adressen — och en FÄLLA: ett Apply
+		// hade satt om LAN till den IP:n och kapat administratörens
+		// anslutning (och krockat med en annan låda på samma nät). DHCP håller
+		// i stället kvar den adress servern redan fått tills administratören
+		// själv sätter en statisk LAN-IP + DHCP-scope via GUI:t.
+		{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "dhcp"},
 	}
 	base.Zones = []config.Zone{
 		{Name: "WAN", Description: "Utsida / Internet"},
