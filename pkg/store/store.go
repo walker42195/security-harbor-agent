@@ -109,6 +109,16 @@ func (s *Store) loadOrInit(seedMode string) error {
 		return fmt.Errorf("misslyckades tolka running config: %w", err)
 	}
 
+	// Säkerställ att standard-policyer/-objekt som tillkommit efter att den här
+	// configen först skapades finns med även i en befintlig installation (seed
+	// gäller bara nya). Säker utan commit — den injicerade Deny-policyn är
+	// avstängd. Sparas direkt så den överlever omstart.
+	if ensureDefaultAutoBlock(&cfg) {
+		if err := s.saveConfigLocked(runningPath, &cfg); err != nil {
+			return fmt.Errorf("misslyckades spara migrerad config: %w", err)
+		}
+	}
+
 	s.runningCfg = &cfg
 	s.candidateCfg = cloneConfig(&cfg)
 	return nil
@@ -173,6 +183,9 @@ func defaultSeedConfig(seedMode string) *config.Config {
 				Critical:    true,
 				Description: "Tillåter SSH-inloggning till brandväggen själv från det interna nätverket. Om du inaktiverar denna behöver du en annan väg in (t.ex. tangentbord och skärm, eller seriekonsol) för att kunna administrera brandväggen.",
 			},
+			// Färdig (men AVSTÄNGD) Deny-policy som refererar auto-block-objektet
+			// ovan — se ipsAutoBlockDenyPolicy för motivering och detaljer.
+			ipsAutoBlockDenyPolicy(),
 		},
 		Settings: config.Settings{
 			HostName:           "security-harbor",
@@ -208,6 +221,82 @@ func defaultSeedConfig(seedMode string) *config.Config {
 		{Name: "VPN", Description: "VPN-klienter"},
 	}
 	return &base
+}
+
+// ipsAutoBlockObjectID är ID:t på det objekt som IDS auto-block fyller med
+// larmens käll-IP:n, och som ipsAutoBlockDenyPolicy refererar.
+const ipsAutoBlockObjectID = "obj-ips-autoblock"
+
+// ipsAutoBlockDenyPolicy är den färdiga men AVSTÄNGDA Deny-policyn som
+// refererar auto-block-objektet. Den finns med i regellistan från start så att
+// administratören bara behöver slå på den (och aktivera auto-block under
+// Säkerhetshändelser) för att larmens käll-IP:n faktiskt ska blockeras —
+// objektet i sig blockerar inget. Ligger tidigt i listan så att blockeringen
+// vinner över ev. senare Allow-policies (första matchande regel vinner).
+// SourceObj-uppslaget hoppar över regeln helt så länge objektet är tomt (se
+// objectMatchExpr i nftables-adaptern), så en påslagen men tom regel blockerar
+// ingenting av misstag.
+func ipsAutoBlockDenyPolicy() config.Policy {
+	return config.Policy{
+		ID:          "sys-ips-autoblock-deny",
+		Name:        "Blockera auto-blockerade IP:n (IPS)",
+		Enabled:     false,
+		Priority:    2,
+		SourceZone:  "ANY",
+		DestZone:    "ANY",
+		SourceObj:   ipsAutoBlockObjectID,
+		DestObj:     "ANY",
+		Service:     "ANY",
+		Action:      config.ActionDrop,
+		Logging:     true,
+		Description: "Släpper (drop) all trafik från IP:n som IDS auto-block lagt i objektet \"IPS - Auto block\". Avstängd som standard — slå på den, och aktivera auto-block under Säkerhetshändelser, för att faktiskt blockera larmens käll-IP:n.",
+	}
+}
+
+// ensureDefaultAutoBlock injicerar den avstängda auto-block-Deny-policyn (och
+// vid behov själva auto-block-objektet) i en BEFINTLIG config som saknar dem —
+// seed-configen gäller ju bara nya installationer. Returnerar true om något
+// lades till (så anroparen kan spara). Ändringen är säker att köra utan en
+// uttrycklig commit: policyn är avstängd och objektet tomt, så inget beteende
+// ändras förrän administratören själv slår på regeln.
+func ensureDefaultAutoBlock(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	changed := false
+
+	hasObj := false
+	for _, o := range cfg.Objects {
+		if o.ID == ipsAutoBlockObjectID {
+			hasObj = true
+			break
+		}
+	}
+	if !hasObj {
+		cfg.Objects = append(cfg.Objects, config.Object{
+			ID:          ipsAutoBlockObjectID,
+			Name:        "IPS - Auto block",
+			Type:        config.ObjectTypeIPList,
+			Values:      []string{},
+			Description: "Käll-IP:n som IDS auto-block lägger till automatiskt. Referera detta objekt från en Deny-policy för att faktiskt blockera dem.",
+		})
+		changed = true
+	}
+
+	hasPolicy := false
+	for _, p := range cfg.Policies {
+		if p.ID == "sys-ips-autoblock-deny" {
+			hasPolicy = true
+			break
+		}
+	}
+	if !hasPolicy {
+		// Lägg den tidigt (efter en ev. Local/SSH-policy) så blockeringen
+		// vinner över senare Allow-policies. Enklast: först i listan.
+		cfg.Policies = append([]config.Policy{ipsAutoBlockDenyPolicy()}, cfg.Policies...)
+		changed = true
+	}
+	return changed
 }
 
 func (s *Store) saveConfigLocked(path string, cfg *config.Config) error {
