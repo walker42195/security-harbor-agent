@@ -408,6 +408,9 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 	if len(cfg.Interfaces) == 0 {
 		return fmt.Errorf("konfigurationen måste ha minst ett gränssnitt")
 	}
+	if err := validateUniqueNames(cfg); err != nil {
+		return err
+	}
 	if err := validatePolicies(cfg); err != nil {
 		return err
 	}
@@ -421,6 +424,38 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 		return fmt.Errorf("validering misslyckades: %w", err)
 	}
 
+	return nil
+}
+
+// validateUniqueNames säkerställer att objekt respektive zoner inte har
+// duplicerade namn. Namnet är det administratören ser och väljer i GUI:t
+// (Policy-editorns From/To, DHCP/DNS m.m.) — det tekniskt unika i datamodellen
+// är ID:t, men användaren ser bara namnet, så två med samma namn är tvetydigt.
+// Jämförelsen är skiftlägesokänslig och trimmar blanksteg. (Objekt kontra zon
+// får dela namn — de väljs i olika sammanhang och lagras separat.)
+func validateUniqueNames(cfg *config.Config) error {
+	seenObj := map[string]string{}
+	for _, o := range cfg.Objects {
+		key := strings.ToLower(strings.TrimSpace(o.Name))
+		if key == "" {
+			continue
+		}
+		if prev, dup := seenObj[key]; dup {
+			return fmt.Errorf("två objekt har samma namn %q — namn måste vara unika (byt namn på det ena)", prev)
+		}
+		seenObj[key] = o.Name
+	}
+	seenZone := map[string]string{}
+	for _, z := range cfg.Zones {
+		key := strings.ToLower(strings.TrimSpace(z.Name))
+		if key == "" {
+			continue
+		}
+		if prev, dup := seenZone[key]; dup {
+			return fmt.Errorf("två zoner har samma namn %q — namn måste vara unika (byt namn på det ena)", prev)
+		}
+		seenZone[key] = z.Name
+	}
 	return nil
 }
 
