@@ -1,1 +1,5 @@
 dist/
+security-harbor-dist.tar.gz
+security-harbor-dist.tar.gz.sig
+manifest.json
+security-harbor-sign

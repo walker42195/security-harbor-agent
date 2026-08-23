@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
+	"github.com/walker42195/security-harbor-agent/pkg/updater"
 )
 
 type Server struct {
@@ -36,9 +38,10 @@ type Server struct {
 	netAdapt *network.Adapter
 	tlsCert  *pki.KeyPair
 	webUIDir string
+	version  string
 }
 
-func NewServer(bindAddr string, eng *engine.Engine, auth *AuthManager, tlsCert *pki.KeyPair, webUIDir string) *Server {
+func NewServer(bindAddr string, eng *engine.Engine, auth *AuthManager, tlsCert *pki.KeyPair, webUIDir, version string) *Server {
 	return &Server{
 		bindAddr: bindAddr,
 		engine:   eng,
@@ -46,6 +49,7 @@ func NewServer(bindAddr string, eng *engine.Engine, auth *AuthManager, tlsCert *
 		netAdapt: network.NewAdapter(),
 		tlsCert:  tlsCert,
 		webUIDir: webUIDir,
+		version:  version,
 	}
 }
 
@@ -100,6 +104,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/system/backup", s.authMiddlewareAdmin(s.handleBackup))
 	mux.HandleFunc("/api/v1/system/restore", s.authMiddlewareAdmin(s.handleRestore))
 	mux.HandleFunc("/api/v1/system/factory-reset", s.authMiddlewareAdmin(s.handleFactoryReset))
+	mux.HandleFunc("/api/v1/system/update/check", s.authMiddlewareAdmin(s.handleUpdateCheck))
+	mux.HandleFunc("/api/v1/system/update/download", s.authMiddlewareAdmin(s.handleUpdateDownload))
+	mux.HandleFunc("/api/v1/system/update/apply", s.authMiddlewareAdmin(s.handleUpdateApply))
 
 	// Web-UI (Fas 8+) — statiska filer (flutter build web), t.ex. driftsatta
 	// via rsync till --webui-dir. Registreras SIST men ServeMux matchar
@@ -526,6 +533,103 @@ func (s *Server) handleFactoryReset(w http.ResponseWriter, r *http.Request) {
 	restartSelfAfterResponse(w)
 }
 
+// handleUpdateCheck hämtar releasens manifest och jämför mot den körande
+// agent- och webb-GUI-versionen. Returnerar vad som finns att uppgradera till.
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	m, err := updater.FetchManifest(ctx)
+	if err != nil {
+		http.Error(w, "kunde inte hämta uppdateringsinfo: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	webNow := updater.ReadWebUIVersion(s.webUIDir)
+	resp := map[string]interface{}{
+		"agent":  map[string]string{"current": s.version},
+		"webui":  map[string]string{"current": webNow},
+		"staged": readStagedVersion(),
+	}
+	updateAvailable := false
+	if m.Firewall != nil {
+		resp["agent"].(map[string]string)["available"] = m.Firewall.Version
+		resp["webui"].(map[string]string)["available"] = m.Firewall.WebUIVersion
+		if updater.IsNewer(m.Firewall.Version, s.version) || updater.IsNewer(m.Firewall.WebUIVersion, webNow) {
+			updateAvailable = true
+		}
+	}
+	resp["update_available"] = updateAvailable
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleUpdateDownload laddar ner och verifierar (SHA256 + Ed25519) firewall-
+// bunten och stagear den. Uppgradera-knappen i GUI:t låses upp först när detta
+// svarar verified:true.
+func (s *Server) handleUpdateDownload(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	m, err := updater.FetchManifest(ctx)
+	if err != nil {
+		http.Error(w, "kunde inte hämta manifest: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if m.Firewall == nil {
+		http.Error(w, "manifestet saknar en firewall-bunt", http.StatusBadGateway)
+		return
+	}
+	if err := updater.DownloadAndStage(ctx, m.Firewall); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"verified": true,
+		"version":  m.Firewall.Version,
+	})
+}
+
+// handleUpdateApply triggar den privilegierade root-installern (systemd
+// oneshot). Kräver att en verifierad bunt redan stagats. Startas med
+// --no-block så att API-svaret hinner skickas innan agenten startas om.
+func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
+	tarball := filepath.Join(updater.StagingDir, updater.StagedTarball)
+	sig := filepath.Join(updater.StagingDir, updater.StagedSig)
+	if _, err := os.Stat(tarball); err != nil {
+		http.Error(w, "ingen nedladdad uppdatering att installera — ladda ner först", http.StatusBadRequest)
+		return
+	}
+	if _, err := os.Stat(sig); err != nil {
+		http.Error(w, "signaturfil saknas för den stagade bunten", http.StatusBadRequest)
+		return
+	}
+	// Extra spärr: verifiera signaturen igen här innan vi ens triggar
+	// installern (root-runnern verifierar dessutom en tredje gång som root).
+	if err := updater.VerifyFile(tarball, sig); err != nil {
+		http.Error(w, "den stagade bunten kan inte verifieras: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	out, err := exec.Command("systemctl", "start", "--no-block", "security-harbor-update.service").CombinedOutput()
+	if err != nil {
+		http.Error(w, "kunde inte starta installern: "+string(out), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":      true,
+		"message": "Installationen startad. Agenten startar om på den nya versionen om en liten stund.",
+	})
+}
+
+// readStagedVersion returnerar den verifierade, nedladdade version som väntar
+// på installation (tom sträng om ingen).
+func readStagedVersion() string {
+	data, err := os.ReadFile(filepath.Join(updater.StagingDir, "staged-version.txt"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // restartSelfAfterResponse avslutar processen strax efter att svaret
 // hunnit skickas — systemd (Restart=always, se
 // systemd/security-harbor-agent.service) startar om agenten rent med de
@@ -553,7 +657,8 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"hostname":        hostname,
 		"state":           st,
-		"version":         "0.15.0",
+		"version":         s.version,
+		"webui_version":   updater.ReadWebUIVersion(s.webUIDir),
 		"uptime":          readUptime(),
 		"cpu":             readCPUPercent(),
 		"cpu_cores":       runtime.NumCPU(),

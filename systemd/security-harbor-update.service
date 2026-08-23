@@ -1,0 +1,15 @@
+[Unit]
+Description=Security Harbor självuppdatering (privilegierad installer)
+
+[Service]
+Type=oneshot
+# Kör den privilegierade installern som root. Den oprivilegierade agenten
+# (security-harbor-agent.service, NoNewPrivileges=true m.m.) triggar den här
+# tjänsten via `systemctl start --no-block` i stället för att röra
+# /usr/local/bin själv — privilegiehöjningen isoleras till denna minimala
+# engångskörning. Runnern OM-verifierar Ed25519-signaturen som root (via den
+# redan installerade, betrodda agent-binären) INNAN den installerar, så en
+# ev. komprometterad agent inte kan installera en osignerad bunt.
+ExecStart=/usr/local/lib/security-harbor/update-runner.sh
+# Skyddsnät ifall install.sh skulle hänga (t.ex. apt utan nät).
+TimeoutStartSec=900

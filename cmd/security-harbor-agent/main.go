@@ -22,7 +22,12 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/api"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
+	"github.com/walker42195/security-harbor-agent/pkg/updater"
 )
+
+// version sätts vid bygget via -ldflags "-X main.version=<v>" (se
+// build_release.sh, som läser VERSION-filen). "dev" i en obyggd binär.
+var version = "dev"
 
 func main() {
 	configDir := flag.String("data-dir", "/var/lib/security-harbor", "Sökväg till datakatalog")
@@ -30,10 +35,31 @@ func main() {
 	webUIDir := flag.String("webui-dir", "/var/lib/security-harbor/webui", "Sökväg till statiska filer för web-UI (flutter build web)")
 	dryRun := flag.Bool("dry-run", false, "Starta i dry-run läge utan att ändra nftables i kärnan")
 	seedMode := flag.String("mode", "", "Driftläge för EN HELT NY installation (\"\"/\"gateway\" eller \"host\", Fas 13) — rör bara den allra första uppstarten, ignoreras om running.json redan finns")
+	showVersion := flag.Bool("version", false, "Skriv ut versionen och avsluta")
+	verifyTarball := flag.String("verify-update", "", "Verifiera en release-bunt (Ed25519) mot den inbyggda publika nyckeln och avsluta (0=ok). Används av root-installern.")
+	verifySig := flag.String("verify-sig", "", "Signaturfil till --verify-update")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
+
+	// Verifieringsläge: root-oneshoten (update-runner.sh) anropar den REDAN
+	// INSTALLERADE (betrodda) agent-binären för att verifiera den nedladdade
+	// buntens signatur som root INNAN installation — den nya, ännu overifierade
+	// binären i bunten får aldrig verifiera sig själv.
+	if *verifyTarball != "" {
+		if err := updater.VerifyFile(*verifyTarball, *verifySig); err != nil {
+			fmt.Fprintf(os.Stderr, "verifiering misslyckades: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("OK")
+		return
+	}
+
 	fmt.Println("=====================================================")
-	fmt.Println(" SECURITY HARBOR FIREWALL AGENT v0.12.0 (Fas 12)     ")
+	fmt.Printf(" SECURITY HARBOR FIREWALL AGENT v%s\n", version)
 	fmt.Println("=====================================================")
 	if *dryRun {
 		fmt.Println("[MODE] DRY-RUN AKTIVT - inga ändringar görs i kärnan!")
@@ -90,7 +116,7 @@ func main() {
 		log.Fatalf("Kunde inte skapa/läsa TLS-certifikat för Management-API: %v", err)
 	}
 
-	server := api.NewServer(*bindAddr, eng, auth, tlsCert, *webUIDir)
+	server := api.NewServer(*bindAddr, eng, auth, tlsCert, *webUIDir, version)
 
 	// Fas 5: periodisk uppdatering av hot-listor/GeoIP-objekt (Spamhaus,
 	// Tor-exit-noder, anpassade URL:er, landsblock). Körs var 15:e minut;

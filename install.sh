@@ -186,6 +186,29 @@ for bin in security-harbor-agent security-harbor-nmap-runner security-harbor-tcp
   install -m 0755 -o root -g root "$SCRIPT_DIR/$bin" "$BIN_DIR/$bin"
 done
 
+# Privilegierad självuppdaterings-runner (körs som root av
+# security-harbor-update.service, se systemd/update-runner.sh).
+install -d -m 0755 /usr/local/lib/security-harbor
+if [ -f "$SCRIPT_DIR/systemd/update-runner.sh" ]; then
+  install -m 0755 -o root -g root "$SCRIPT_DIR/systemd/update-runner.sh" \
+    /usr/local/lib/security-harbor/update-runner.sh
+fi
+
+# Webb-GUI:t (flutter build web) buntas med releasen och deployas till
+# agentens --webui-dir. Följer därmed alltid med agentuppdateringen. Ägs av
+# tjänstekontot (agenten läser filerna; katalogen ligger i ReadWritePaths).
+if [ -d "$SCRIPT_DIR/webui" ]; then
+  echo "-> Deployar webb-GUI till $DATA_DIR/webui"
+  install -d -m 0755 "$DATA_DIR/webui"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "$SCRIPT_DIR/webui/" "$DATA_DIR/webui/"
+  else
+    rm -rf "$DATA_DIR/webui"/*
+    cp -a "$SCRIPT_DIR/webui/." "$DATA_DIR/webui/"
+  fi
+  chown -R security-harbor:security-harbor "$DATA_DIR/webui"
+fi
+
 echo "=== 5. Genererar failsafe-regelsetet ==="
 if [ "$MODE" = "host" ]; then
   cp "$SCRIPT_DIR/systemd/security-harbor-failsafe-host.nft.tmpl" "$CONF_DIR/security-harbor-failsafe.nft"
