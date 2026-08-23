@@ -107,7 +107,11 @@ func (a *Adapter) PopulateDynamicIPs(cfg *config.Config) {
 				}
 			}
 		}
-		if iface.AddressType == "dhcp" {
+		// Bara WAN-gränssnittet har en meningsfull default-gateway. Interna
+		// gränssnitt (LAN/VLAN) ska aldrig visa/registrera en gateway även om
+		// de av misstag råkat plocka upp en från en intern DHCP-server —
+		// brandväggens väg ut går uteslutande via WAN (se applyInterface).
+		if iface.AddressType == "dhcp" && strings.EqualFold(iface.Zone, "WAN") {
 			if gw := defaultGatewayFor(iface.Device); gw != "" {
 				iface.Gateway = gw
 			}
@@ -184,14 +188,77 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 		// försök och avslutar om ingen server svarar (annars hänger klienten
 		// kvar för evigt på t.ex. en VLAN utan DHCP-server), och en
 		// timeout-context ser till att processen aldrig blir kvarglömd.
-		go func(device string) {
+		//
+		// ENDAST WAN-gränssnittet ska ta emot en default-rutt (och DNS) från
+		// DHCP. Interna gränssnitt (LAN/VLAN/servrar) i DHCP-läge ska bara
+		// hämta sin IP-adress — aldrig installera en default-rutt, för då får
+		// brandväggen flera konkurrerande default-rutter och egress-valet blir
+		// slumpartat: trafik kan lämna fel kort, förbi masquerade och
+		// LAN→WAN-policyn (som matchar oifname = WAN-kortet), och fastnar då på
+		// Default Deny. Interna gränssnitt kör därför en begränsad
+		// dhclient-konfig som inte begär routers/DNS, och en ev. default-rutt
+		// via kortet tas bort direkt efteråt (bälte och hängslen, ifall
+		// DHCP-servern skickar routers ändå).
+		isWAN := strings.EqualFold(iface.Zone, "WAN")
+		go func(device string, isWAN bool) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
-		}(iface.Device)
+			if isWAN {
+				_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
+				return
+			}
+			if confPath, cleanup, err := writeInternalDHClientConf(); err == nil {
+				defer cleanup()
+				_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", "-cf", confPath, device).Run()
+			} else {
+				_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
+			}
+			_ = exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", device).Run()
+		}(iface.Device, isWAN)
+	}
+
+	// En brandvägg får ha default-rutt ENDAST via WAN. Ett internt gränssnitt
+	// kan ha en kvarglömd default-rutt — t.ex. ett kort som tidigare var DHCP
+	// och nu är statiskt (den gamla "proto dhcp"-rutten flushas inte av `ip
+	// addr flush`). Ta bort ev. default-rutt via icke-WAN-gränssnitt synkront
+	// här; DHCP-fallet hanteras dessutom inne i goroutinen ovan efter att
+	// dhclient hunnit installera sin rutt.
+	if iface.Enabled && !strings.EqualFold(iface.Zone, "WAN") {
+		// Kan finnas flera default-rutter via samma kort; loopa tills slut.
+		for i := 0; i < 8; i++ {
+			if err := exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", iface.Device).Run(); err != nil {
+				break
+			}
+		}
 	}
 
 	return nil
+}
+
+// writeInternalDHClientConf skriver en tillfällig dhclient-konfiguration som
+// bara begär adressrelaterade optioner (subnätmask, broadcast, MTU, hostname)
+// — INTE routers eller domän/DNS. Används för interna DHCP-gränssnitt så att
+// de hämtar en IP-adress utan att installera en default-rutt eller skriva
+// över brandväggens /etc/resolv.conf. Anroparen kör cleanup() när dhclient är
+// klar för att ta bort filen.
+func writeInternalDHClientConf() (string, func(), error) {
+	f, err := os.CreateTemp("", "sh-dhclient-internal-*.conf")
+	if err != nil {
+		return "", nil, err
+	}
+	// När en egen `request`-lista anges ERSÄTTER den dhclients default-lista,
+	// så routers och domain-name-servers utelämnas helt.
+	const conf = "request subnet-mask, broadcast-address, time-offset, interface-mtu, host-name;\n"
+	if _, err := f.WriteString(conf); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", nil, err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", nil, err
+	}
+	return f.Name(), func() { _ = os.Remove(f.Name()) }, nil
 }
 
 // DeleteVLANInterface tar bort ett VLAN-subinterface från Linux (`ip link
