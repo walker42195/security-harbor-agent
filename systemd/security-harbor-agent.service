@@ -11,7 +11,13 @@ Group=security-harbor
 # rw-r----- ägd av _kea:_kea) — används för DNS.DHCPHostnameRegistration.
 # Utan den här gruppen misslyckas läsningen tyst med "permission denied" så
 # fort funktionen slås på, även om resten av agenten fungerar normalt.
-SupplementaryGroups=_kea
+# systemd-journal: krävs för att läsa KÄRNLOGGEN (`journalctl -k`) där
+# nftables loggar accepterad/nekad trafik (SH-ACCEPT-/SH-DENY-prefixen) — det
+# är källan till trafikloggen i GUI:t (se parseFirewallLog i pkg/api). Utan
+# den här gruppen får det oprivilegierade tjänstekontot tomt svar och GUI-
+# loggen visar ingen trafik alls, trots att kärnan loggar den (upptäckt på ny
+# server 2026-08-23: paketfångst visade trafik men loggen var tom).
+SupplementaryGroups=_kea systemd-journal
 ExecStart=/usr/local/bin/security-harbor-agent --data-dir /var/lib/security-harbor
 Restart=always
 RestartSec=5s
