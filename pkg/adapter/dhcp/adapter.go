@@ -53,6 +53,7 @@ type LeaseDatabase struct {
 }
 
 type Subnet4 struct {
+	ID           int           `json:"id"`
 	Subnet       string        `json:"subnet"`
 	Pools        []Pool        `json:"pools"`
 	OptionData   []OptionData  `json:"option-data"`
@@ -88,7 +89,15 @@ func (a *Adapter) GenerateKeaConfig(cfg *config.Config) ([]byte, error) {
 
 		// Hitta nätverksadress från IPv4 (t.ex. 192.168.10.1/24)
 
+		// Kea kräver ett unikt "id" per subnet4-post (upptäckt live
+		// 2026-08-24: "DHCP4_PARSER_FAIL ... subnet configuration failed:
+		// missing parameter 'id'" — fältet saknades helt i den genererade
+		// configen, vilket fick Kea att vägra starta så fort mer än en
+		// DHCP-aktiverad zon fanns/reservations-uppslag först var påslaget).
+		// Index+1 räcker: Kea kräver bara att det är unikt INOM den
+		// aktuella configen, inte att det är stabilt mellan omgenereringar.
 		subnet4 := Subnet4{
+			ID:     len(subnets) + 1,
 			Subnet: iface.IPv4,
 			Pools: []Pool{
 				{Pool: fmt.Sprintf("%s - %s", iface.DHCP.RangeStart, iface.DHCP.RangeEnd)},
