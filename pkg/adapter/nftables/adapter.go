@@ -22,33 +22,59 @@ func logSlug(name string) string {
 	return strings.ReplaceAll(name, ":", "-")
 }
 
-// portMatchExpr bygger ett dport-matchningsuttryck för ETT portnummer
-// eller ett portintervall ("8000-8100"). Returnerar ok=false för allt
-// annat, så anroparen kan skilja "kunde inte tolkas" från "ANY".
+// portMatchExpr bygger ett dport-matchningsuttryck för ETT portnummer, ett
+// portintervall ("8000-8100"), eller en kommaseparerad lista av valfri
+// blandning av båda ("80,443,8000-8100") — då byggs en nftables anonym
+// mängd (`{"set": [...]}`), som stöder blandade enskilda portar och
+// intervall i samma mängd. Returnerar ok=false för allt annat, så
+// anroparen kan skilja "kunde inte tolkas" från "ANY".
 func portMatchExpr(proto, spec string) (expr map[string]interface{}, ok bool) {
 	left := map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}}
 
-	if lo, hi, isRange := strings.Cut(spec, "-"); isRange {
-		loNum, errLo := strconv.Atoi(strings.TrimSpace(lo))
-		hiNum, errHi := strconv.Atoi(strings.TrimSpace(hi))
-		if errLo != nil || errHi != nil || !validPort(loNum) || !validPort(hiNum) || loNum > hiNum {
+	parsePart := func(part string) (interface{}, bool) {
+		part = strings.TrimSpace(part)
+		if lo, hi, isRange := strings.Cut(part, "-"); isRange {
+			loNum, errLo := strconv.Atoi(strings.TrimSpace(lo))
+			hiNum, errHi := strconv.Atoi(strings.TrimSpace(hi))
+			if errLo != nil || errHi != nil || !validPort(loNum) || !validPort(hiNum) || loNum > hiNum {
+				return nil, false
+			}
+			return map[string]interface{}{"range": []int{loNum, hiNum}}, true
+		}
+		portNum, err := strconv.Atoi(part)
+		if err != nil || !validPort(portNum) {
+			return nil, false
+		}
+		return portNum, true
+	}
+
+	if strings.Contains(spec, ",") {
+		parts := strings.Split(spec, ",")
+		elements := make([]interface{}, 0, len(parts))
+		for _, part := range parts {
+			if strings.TrimSpace(part) == "" {
+				continue
+			}
+			el, valid := parsePart(part)
+			if !valid {
+				return nil, false
+			}
+			elements = append(elements, el)
+		}
+		if len(elements) == 0 {
 			return nil, false
 		}
 		return map[string]interface{}{
-			"match": map[string]interface{}{
-				"op":    "==",
-				"left":  left,
-				"right": map[string]interface{}{"range": []int{loNum, hiNum}},
-			},
+			"match": map[string]interface{}{"op": "==", "left": left, "right": map[string]interface{}{"set": elements}},
 		}, true
 	}
 
-	portNum, err := strconv.Atoi(spec)
-	if err != nil || !validPort(portNum) {
+	el, valid := parsePart(spec)
+	if !valid {
 		return nil, false
 	}
 	return map[string]interface{}{
-		"match": map[string]interface{}{"op": "==", "left": left, "right": portNum},
+		"match": map[string]interface{}{"op": "==", "left": left, "right": el},
 	}, true
 }
 

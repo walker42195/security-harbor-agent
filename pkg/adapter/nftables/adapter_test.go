@@ -1060,6 +1060,12 @@ func TestRenderJSONOpenVPNKeepsWANWhenNotFronted(t *testing.T) {
 // gick att tolka gav tidigare en regel HELT UTAN portbegränsning — en
 // accept-regel avsedd för en enda port öppnade då tyst alla portar
 // (fail-open). Regeln ska hoppas över istället.
+//
+// "80,443" (kommaseparerad lista) användes tidigare som exempel här, men
+// är sedan 2026-08-24 en GILTIG tjänstesträng (se portMatchExpr) — en
+// administratör frågade om flera portar samtidigt gick att ange i en
+// policy, vilket den nu gör. Bytt till "80,abc" (en riktigt otolkbar
+// del i listan) för att fortsätta skydda mot samma fail-open-bugg.
 func TestRenderJSONUnparseableServiceSkipsRule(t *testing.T) {
 	adapter := NewAdapter()
 	cfg := &config.Config{
@@ -1069,7 +1075,7 @@ func TestRenderJSONUnparseableServiceSkipsRule(t *testing.T) {
 			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.1/24"},
 		},
 		Policies: []config.Policy{
-			{ID: "pol-bad", Name: "Trasig tjänst", Enabled: true, SourceObj: "ANY", DestObj: "ANY", Service: "80,443", Action: config.ActionAccept},
+			{ID: "pol-bad", Name: "Trasig tjänst", Enabled: true, SourceObj: "ANY", DestObj: "ANY", Service: "80,abc", Action: config.ActionAccept},
 		},
 		Settings: config.Settings{APIPort: 8443},
 	}
@@ -1098,5 +1104,34 @@ func TestServiceMatchExprPortRange(t *testing.T) {
 	}
 	if expr, ok := serviceMatchExpr("ANY"); !ok || expr != nil {
 		t.Errorf("ANY ska ge (nil, true) = medvetet ingen begränsning")
+	}
+}
+
+// TestServiceMatchExprCommaSeparatedPorts: flera portar (och/eller
+// intervall) i EN policy, t.ex. "80,443" eller "7201,8000-8100" — en
+// administratör efterfrågade 2026-08-24 möjligheten att slippa skapa en
+// separat policy per port.
+func TestServiceMatchExprCommaSeparatedPorts(t *testing.T) {
+	expr, ok := serviceMatchExpr("80,443")
+	if !ok {
+		t.Fatalf("80,443 ska kunna tolkas")
+	}
+	m, isMap := expr[0].(map[string]interface{})["match"].(map[string]interface{})
+	if !isMap {
+		t.Fatalf("förväntade ett match-uttryck, fick %v", expr)
+	}
+	set, isSet := m["right"].(map[string]interface{})["set"].([]interface{})
+	if !isSet || len(set) != 2 {
+		t.Fatalf("förväntade en mängd med 2 element, fick %v", m["right"])
+	}
+
+	if _, ok := serviceMatchExpr("UDP:5000,5001,6000-6010"); !ok {
+		t.Errorf("blandad lista av enskilda portar och intervall ska kunna tolkas")
+	}
+	if _, ok := serviceMatchExpr("80,99999"); ok {
+		t.Errorf("en lista där EN del är ogiltig (99999) ska avvisas i sin helhet, inte tyst hoppa över den delen")
+	}
+	if _, ok := serviceMatchExpr("80,abc"); ok {
+		t.Errorf("en lista med en otolkbar del ska avvisas")
 	}
 }

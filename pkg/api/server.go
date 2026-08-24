@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -343,6 +344,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// kan en angripare kringgå en ren IP-spärr genom att rotera käll-IP
 	// mot samma användarnamn.
 	if s.auth.IsLockedOut(ip, creds.Username) {
+		log.Printf("[LOGIN] SPÄRRAD: käll-IP=%s användarnamn=%q", ip, creds.Username)
 		http.Error(w, "Spärrad p.g.a. för många misslyckade försök", http.StatusTooManyRequests)
 		return
 	}
@@ -351,14 +353,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		token, tokenErr := s.auth.CreateSession(user.Username, string(user.Role), 24*time.Hour)
 		if tokenErr != nil {
+			log.Printf("[LOGIN] MISSLYCKADES (kunde inte skapa session): käll-IP=%s användarnamn=%q fel=%v", ip, creds.Username, tokenErr)
 			http.Error(w, tokenErr.Error(), http.StatusInternalServerError)
 			return
 		}
+		log.Printf("[LOGIN] LYCKADES: käll-IP=%s användarnamn=%q roll=%s", ip, user.Username, user.Role)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"token": token, "user": user.Username, "role": string(user.Role)})
 		return
 	}
 
+	log.Printf("[LOGIN] FEL LÖSENORD/ANVÄNDARNAMN: käll-IP=%s användarnamn=%q fel=%v", ip, creds.Username, err)
 	s.auth.RecordFailedAttempt(ip, creds.Username)
 	http.Error(w, "Felaktigt användarnamn eller lösenord", http.StatusUnauthorized)
 }
