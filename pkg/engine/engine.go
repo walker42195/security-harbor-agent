@@ -644,7 +644,7 @@ func validatePolicyService(cfg *config.Config, pol config.Policy) error {
 		return nil
 	}
 	return fmt.Errorf(
-		"policy %q: tjänsten/porten %q går inte att tolka (använd t.ex. \"443\", \"TCP:443\", \"UDP:53\", \"TCP:8000-8100\", \"ICMP\" eller \"ANY\" — en lista som \"80,443\" måste läggas upp som en Tjänst med flera portar under Tjänster)",
+		"policy %q: tjänsten/porten %q går inte att tolka (använd t.ex. \"443\", \"TCP:443\", \"UDP:53\", \"TCP:8000-8100\", \"ICMP\", \"ANY\", eller en kommaseparerad lista som \"80,443,TCP:8000-8100,UDP:53\" — varje del utan eget tcp:/udp:-prefix ärver protokollet från föregående del, eller tcp om inget angetts alls)",
 		pol.Name, pol.Service)
 }
 

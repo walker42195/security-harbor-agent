@@ -22,31 +22,39 @@ func logSlug(name string) string {
 	return strings.ReplaceAll(name, ":", "-")
 }
 
+// parsePortOrRange tolkar ETT portnummer eller ETT portintervall
+// ("8000-8100") till dess nftables-representation (ett rått int för en
+// enskild port, {"range": [lo, hi]} för ett intervall). Delas mellan
+// portMatchExpr (en enda port/intervall, eller flera av SAMMA protokoll i
+// en mängd) och parseMultiProtocolServiceSets (flera portar/intervall som
+// kan spänna över BÅDE TCP och UDP i samma policy).
+func parsePortOrRange(part string) (interface{}, bool) {
+	part = strings.TrimSpace(part)
+	if lo, hi, isRange := strings.Cut(part, "-"); isRange {
+		loNum, errLo := strconv.Atoi(strings.TrimSpace(lo))
+		hiNum, errHi := strconv.Atoi(strings.TrimSpace(hi))
+		if errLo != nil || errHi != nil || !validPort(loNum) || !validPort(hiNum) || loNum > hiNum {
+			return nil, false
+		}
+		return map[string]interface{}{"range": []int{loNum, hiNum}}, true
+	}
+	portNum, err := strconv.Atoi(part)
+	if err != nil || !validPort(portNum) {
+		return nil, false
+	}
+	return portNum, true
+}
+
 // portMatchExpr bygger ett dport-matchningsuttryck för ETT portnummer, ett
 // portintervall ("8000-8100"), eller en kommaseparerad lista av valfri
 // blandning av båda ("80,443,8000-8100") — då byggs en nftables anonym
 // mängd (`{"set": [...]}`), som stöder blandade enskilda portar och
-// intervall i samma mängd. Returnerar ok=false för allt annat, så
-// anroparen kan skilja "kunde inte tolkas" från "ANY".
+// intervall i samma mängd, men bara för ETT protokoll (proto-parametern
+// gäller alla). Se parseMultiProtocolServiceSets för TCP+UDP blandat i
+// samma policy. Returnerar ok=false för allt annat, så anroparen kan
+// skilja "kunde inte tolkas" från "ANY".
 func portMatchExpr(proto, spec string) (expr map[string]interface{}, ok bool) {
 	left := map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}}
-
-	parsePart := func(part string) (interface{}, bool) {
-		part = strings.TrimSpace(part)
-		if lo, hi, isRange := strings.Cut(part, "-"); isRange {
-			loNum, errLo := strconv.Atoi(strings.TrimSpace(lo))
-			hiNum, errHi := strconv.Atoi(strings.TrimSpace(hi))
-			if errLo != nil || errHi != nil || !validPort(loNum) || !validPort(hiNum) || loNum > hiNum {
-				return nil, false
-			}
-			return map[string]interface{}{"range": []int{loNum, hiNum}}, true
-		}
-		portNum, err := strconv.Atoi(part)
-		if err != nil || !validPort(portNum) {
-			return nil, false
-		}
-		return portNum, true
-	}
 
 	if strings.Contains(spec, ",") {
 		parts := strings.Split(spec, ",")
@@ -55,7 +63,7 @@ func portMatchExpr(proto, spec string) (expr map[string]interface{}, ok bool) {
 			if strings.TrimSpace(part) == "" {
 				continue
 			}
-			el, valid := parsePart(part)
+			el, valid := parsePortOrRange(part)
 			if !valid {
 				return nil, false
 			}
@@ -69,13 +77,81 @@ func portMatchExpr(proto, spec string) (expr map[string]interface{}, ok bool) {
 		}, true
 	}
 
-	el, valid := parsePart(spec)
+	el, valid := parsePortOrRange(spec)
 	if !valid {
 		return nil, false
 	}
 	return map[string]interface{}{
 		"match": map[string]interface{}{"op": "==", "left": left, "right": el},
 	}, true
+}
+
+// parseMultiProtocolServiceSets tolkar en kommaseparerad tjänstesträng där
+// OLIKA delar kan höra till OLIKA protokoll, t.ex.
+// "tcp:53,tcp:80,udp:53,udp:5353" eller "80,443,udp:53" (en del utan eget
+// protokollprefix ärver det SENAST angivna protokollet i listan, eller
+// "tcp" om inget angetts alls — samma regel som "en bar siffra = tcp" i
+// serviceMatchExpr). TCP och UDP kan INTE blandas i EN nftables-matchning
+// (protokollet är en del av själva matchningsvillkoret,
+// payload.protocol) — varje protokoll blir därför en EGEN uppsättning
+// (ett eget element i den returnerade listan), som adaptern sedan
+// renderar som en EGEN regel per element (OR-semantik via flera regler,
+// se anropsstället i RenderJSON).
+//
+// Efterfrågat av en administratör 2026-08-24: "TCP:53,TCP:80,TCP:433,UDP:53"
+// gav tidigare bara ett obegripligt "går inte att tolka", eftersom
+// portMatchExpr antog ETT protokoll för hela listan.
+func parseMultiProtocolServiceSets(spec string) (sets [][]interface{}, ok bool) {
+	segments := strings.Split(spec, ",")
+	var protoOrder []string
+	byProto := map[string][]interface{}{}
+	currentProto := ""
+	for _, seg := range segments {
+		seg = strings.ToUpper(strings.TrimSpace(seg))
+		if seg == "" {
+			continue
+		}
+		proto := currentProto
+		rest := seg
+		for _, p := range []string{"TCP", "UDP"} {
+			if after, found := strings.CutPrefix(seg, p+":"); found {
+				proto = strings.ToLower(p)
+				rest = after
+				break
+			}
+		}
+		if proto == "" {
+			proto = "tcp"
+		}
+		currentProto = proto
+
+		el, valid := parsePortOrRange(rest)
+		if !valid {
+			return nil, false
+		}
+		if _, seen := byProto[proto]; !seen {
+			protoOrder = append(protoOrder, proto)
+		}
+		byProto[proto] = append(byProto[proto], el)
+	}
+	if len(protoOrder) == 0 {
+		return nil, false
+	}
+
+	for _, proto := range protoOrder {
+		elements := byProto[proto]
+		left := map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}}
+		var right interface{}
+		if len(elements) == 1 {
+			right = elements[0]
+		} else {
+			right = map[string]interface{}{"set": elements}
+		}
+		sets = append(sets, []interface{}{
+			map[string]interface{}{"match": map[string]interface{}{"op": "==", "left": left, "right": right}},
+		})
+	}
+	return sets, true
 }
 
 // validPort: 1-65535. Den gamla koden kollade bara > 0, så t.ex. port
@@ -238,6 +314,19 @@ func resolveServiceMatchExprSets(cfg *config.Config, serviceRef string, visited 
 
 	// Inget Service-ID matchade -> tolka som en preset-sträng direkt
 	// (bakåtkompatibelt med hur GUI:t sparade Policy.Service innan Fas 7).
+	//
+	// En kommaseparerad lista kan blanda TCP- och UDP-delar
+	// ("TCP:53,TCP:80,UDP:53") - det kräver parseMultiProtocolServiceSets
+	// (flera regler, en per protokoll) i stället för serviceMatchExpr
+	// (som bara kan producera EN regel och därför bara stödjer en lista
+	// av SAMMA protokoll).
+	if strings.Contains(trimmed, ",") {
+		multiSets, multiOK := parseMultiProtocolServiceSets(trimmed)
+		if !multiOK {
+			return nil, false
+		}
+		return multiSets, true
+	}
 	expr, exprOK := serviceMatchExpr(trimmed)
 	if !exprOK {
 		return nil, false

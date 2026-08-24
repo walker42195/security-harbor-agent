@@ -1135,3 +1135,44 @@ func TestServiceMatchExprCommaSeparatedPorts(t *testing.T) {
 		t.Errorf("en lista med en otolkbar del ska avvisas")
 	}
 }
+
+// TestParseMultiProtocolServiceSets: TCP och UDP i SAMMA policy — kräver
+// TVÅ separata regler (payload.protocol är en del av själva matchningen,
+// kan inte blandas i EN matchning). Efterfrågat av en administratör
+// 2026-08-24 som fick "går inte att tolka" på "TCP:53,TCP:80,UDP:53".
+func TestParseMultiProtocolServiceSets(t *testing.T) {
+	sets, ok := parseMultiProtocolServiceSets("TCP:53,TCP:80,UDP:53")
+	if !ok {
+		t.Fatalf("TCP:53,TCP:80,UDP:53 ska kunna tolkas")
+	}
+	if len(sets) != 2 {
+		t.Fatalf("förväntade 2 regler (en per protokoll), fick %d: %v", len(sets), sets)
+	}
+	// Första regeln: tcp dport {53, 80}
+	m0 := sets[0][0].(map[string]interface{})["match"].(map[string]interface{})
+	if proto := m0["left"].(map[string]interface{})["payload"].(map[string]interface{})["protocol"]; proto != "tcp" {
+		t.Errorf("förväntade tcp som första protokollet, fick %v", proto)
+	}
+	set0, isSet := m0["right"].(map[string]interface{})["set"].([]interface{})
+	if !isSet || len(set0) != 2 {
+		t.Errorf("förväntade en tcp-mängd med 2 portar, fick %v", m0["right"])
+	}
+	// Andra regeln: udp dport 53 (enstaka port, inget set-omslag behövs)
+	m1 := sets[1][0].(map[string]interface{})["match"].(map[string]interface{})
+	if proto := m1["left"].(map[string]interface{})["payload"].(map[string]interface{})["protocol"]; proto != "udp" {
+		t.Errorf("förväntade udp som andra protokollet, fick %v", proto)
+	}
+	if right := m1["right"]; right != 53 {
+		t.Errorf("förväntade en enstaka udp-port (53), fick %v", right)
+	}
+
+	// Delar utan eget prefix ärver närmast föregående protokoll.
+	sets2, ok2 := parseMultiProtocolServiceSets("80,443,udp:53,5353")
+	if !ok2 || len(sets2) != 2 {
+		t.Fatalf("80,443,udp:53,5353 ska ge 2 regler (tcp {80,443}, udp {53,5353}), fick %d, ok=%v", len(sets2), ok2)
+	}
+
+	if _, ok := parseMultiProtocolServiceSets("TCP:53,udp:abc"); ok {
+		t.Errorf("en lista med en otolkbar del ska avvisas i sin helhet")
+	}
+}
