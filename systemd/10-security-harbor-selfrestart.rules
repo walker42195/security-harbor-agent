@@ -1,0 +1,17 @@
+// Tillåter ENDAST security-harbor-tjänstekontot att starta om EXAKT sin
+// EGEN enhet, security-harbor-agent.service (inget annat systemd-anrop,
+// ingen annan användare) — se pkg/api/services.go (tjänstepanelen,
+// 2026-08-24). Detta ger INGEN ytterligare behörighet utöver vad
+// processen redan har: den kör som samma opriviligierade konto både före
+// och efter en omstart (Restart=always i security-harbor-agent.service
+// startar den om automatiskt). Till skillnad från en riktig
+// versionsuppgradering (som sker i den separata root-oneshoten
+// security-harbor-update.service, se 10-security-harbor-update.rules) är
+// detta bara en "kicka processen"-knapp för en administratör.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "security-harbor-agent.service" &&
+        subject.user == "security-harbor") {
+        return polkit.Result.YES;
+    }
+});

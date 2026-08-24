@@ -1,0 +1,17 @@
+// Tillåter ENDAST security-harbor-tjänstekontot att starta/stoppa/starta om
+// EXAKT openvpn@sh-server.service (inget annat systemd-anrop, ingen annan
+// användare) — se pkg/adapter/openvpn/adapter.go. Precis som suricata/
+// unbound/kea körs anropet direkt av agentprocessen (D-Bus-anropet
+// exekveras av systemd/PID1 med systemds egna rättigheter, ingen egen
+// privilegiehöjning krävs i agentprocessen) — men utan denna polkit-regel
+// avvisas anropet ändå, eftersom security-harbor-tjänstekontot saknar
+// admin-grupp. Saknades sedan OpenVPN-stödet infördes (Fas 4) — upptäckt
+// 2026-08-24 vid arbetet med tjänstepanelen (pkg/api/services.go), som
+// skulle ha exponerat samma "Access denied"-fel för OpenVPN-omstart.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "openvpn@sh-server.service" &&
+        subject.user == "security-harbor") {
+        return polkit.Result.YES;
+    }
+});
