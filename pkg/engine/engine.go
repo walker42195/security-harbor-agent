@@ -427,6 +427,7 @@ func (e *Engine) UpdateCandidate(cfg *config.Config) error {
 	// "senast uppdaterad" och objektet visade "Aldrig uppdaterad" trots att
 	// listan var hämtad). Återställ dem från den nu kända serversidan.
 	preserveObjectSourceStatus(cfg, e.store.GetRunningConfig())
+	preserveDNSBlocklistStatus(cfg, e.store.GetRunningConfig())
 	return e.store.SetCandidateConfig(cfg)
 }
 
@@ -452,6 +453,31 @@ func preserveObjectSourceStatus(incoming, prev *config.Config) {
 			src.LastUpdated = old.LastUpdated
 			src.LastError = old.LastError
 			src.EntryCount = old.EntryCount
+		}
+	}
+}
+
+// preserveDNSBlocklistStatus är samma fix som preserveObjectSourceStatus
+// ovan, men för DNS.Blocklists (Fas 6) — samma bugg, aldrig fixad här.
+// Upptäckt 2026-08-24: en administratör hade StevenBlack hosts-listan
+// korrekt uppdaterad på servern (82561 domäner, running.json), men GUI:t
+// visade "0 domäner" — kandidaten hade nollställts av en HELT OREL-
+// ATERAD sparning (t.ex. en DHCP-ändring) eftersom klientens egen kopia av
+// blocklistans status var förlegad när den PUT:ade hela configen.
+// RefreshHours, Kind och URL rörs INTE — klient-ägda inställningar.
+func preserveDNSBlocklistStatus(incoming, prev *config.Config) {
+	if incoming == nil || prev == nil || incoming.DNS == nil || prev.DNS == nil {
+		return
+	}
+	prevByID := map[string]config.DNSBlocklistSource{}
+	for _, b := range prev.DNS.Blocklists {
+		prevByID[b.ID] = b
+	}
+	for i := range incoming.DNS.Blocklists {
+		if old, ok := prevByID[incoming.DNS.Blocklists[i].ID]; ok {
+			incoming.DNS.Blocklists[i].LastUpdated = old.LastUpdated
+			incoming.DNS.Blocklists[i].LastError = old.LastError
+			incoming.DNS.Blocklists[i].EntryCount = old.EntryCount
 		}
 	}
 }
