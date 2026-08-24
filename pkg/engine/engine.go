@@ -494,6 +494,9 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 	if len(cfg.Interfaces) == 0 {
 		return fmt.Errorf("konfigurationen måste ha minst ett gränssnitt")
 	}
+	if err := validateInterfaces(cfg); err != nil {
+		return err
+	}
 	if err := validateUniqueNames(cfg); err != nil {
 		return err
 	}
@@ -513,6 +516,33 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 		return fmt.Errorf("validering misslyckades: %w", err)
 	}
 
+	return nil
+}
+
+// validateInterfaces kontrollerar att ett aktiverat, statiskt gränssnitts
+// IPv4-fält är en giltig CIDR-adress ("10.13.13.1/24"), inte bara en bar
+// IP ("10.13.13.1"). Upptäckt live 2026-08-24: en administratörs VLAN
+// hade tappat sin /24-suffix i running.json (GUI:t skickar fältet
+// oredigerat, ingen validering fångade det) — net.ParseCIDR i
+// GetDHCPLeases (matchar en DHCP-lease mot vilket gränssnitts subnät den
+// hör till) misslyckas tyst för en sådan sträng och HELA gränssnittets
+// leases försvann då ur DHCP-vyn, utan felmeddelande någonstans. Kördes
+// interfacet ändå fortsatte fungera på nätverksnivå (en tidigare korrekt
+// applicerad adress ligger kvar på kortet), vilket gjorde felet extra
+// förvirrande — allt såg ut att fungera utom just lease-listan.
+func validateInterfaces(cfg *config.Config) error {
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled || iface.AddressType != "static" || iface.IPv4 == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(iface.IPv4); err != nil {
+			label := iface.Name
+			if label == "" {
+				label = iface.Device
+			}
+			return fmt.Errorf("gränssnitt %q: IPv4-adressen %q måste anges med prefix (t.ex. \"10.13.13.1/24\"), inte bara en bar IP-adress", label, iface.IPv4)
+		}
+	}
 	return nil
 }
 
