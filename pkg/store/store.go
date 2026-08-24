@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -124,8 +125,54 @@ func (s *Store) loadOrInit(seedMode string) error {
 	}
 
 	s.runningCfg = &cfg
-	s.candidateCfg = cloneConfig(&cfg)
+
+	// Ladda tillbaka en tidigare sparad, ännu inte applicerad kandidat
+	// (candidate.json) om en sådan finns — INNAN den här fixen (2026-08-24)
+	// skrevs candidate.json visserligen till disk vid varje SetCandidateConfig,
+	// men lästes ALDRIG tillbaka här: candidateCfg sattes ovillkorligen till en
+	// klon av running.json, vilket tyst kastade bort osparade GUI-ändringar vid
+	// varje agentomstart — inklusive varje självuppdatering. Upptäckt
+	// 2026-08-24 när en administratör inte förstod varför en klient-refresh
+	// inte visade en nymigrerad policy men en full app-omstart gjorde det:
+	// det var faktiskt bara timing (agenten hann starta om mellan de två
+	// försöken), men letandet avslöjade att den ordningen hade kunnat radera
+	// riktiga ändringar.
+	candidatePath := filepath.Join(s.baseDir, "candidate.json")
+	s.candidateCfg = s.loadCandidateOrFallback(candidatePath, &cfg)
 	return nil
+}
+
+// loadCandidateOrFallback läser candidate.json om den finns och går att
+// tolka, annars (ingen fil — normalt vid första uppstarten efter en
+// installation eller efter en Confirm/Rollback som synkat kandidaten mot
+// running — eller en trasig fil) faller den tillbaka till en klon av
+// running (samma beteende som tidigare, se loadOrInit).
+//
+// Samma migreringar som running.json (ensureDefaultAutoBlock,
+// ensureDefaultMgmtAPIPolicy) körs även på en inläst kandidat: en gammal,
+// osparad kandidat kan sakna en policy/objekt som tillkommit sedan den
+// sparades, vilket annars skulle få validatePolicies att avvisa en Apply
+// av den (t.ex. saknad Management API-policy) med ett obegripligt fel.
+func (s *Store) loadCandidateOrFallback(candidatePath string, running *config.Config) *config.Config {
+	data, err := os.ReadFile(candidatePath)
+	if err != nil {
+		return cloneConfig(running)
+	}
+	var cand config.Config
+	if err := json.Unmarshal(data, &cand); err != nil {
+		log.Printf("[STORE] kunde inte tolka %s (%v) - återställer kandidaten till körande konfiguration", candidatePath, err)
+		return cloneConfig(running)
+	}
+	changed := ensureDefaultAutoBlock(&cand)
+	if ensureDefaultMgmtAPIPolicy(&cand) {
+		changed = true
+	}
+	if changed {
+		if err := s.saveConfigLocked(candidatePath, &cand); err != nil {
+			log.Printf("[STORE] kunde inte spara migrerad kandidat %s: %v", candidatePath, err)
+		}
+	}
+	return &cand
 }
 
 // cloneConfig gör en djup kopia via JSON-serialisering. Configen är ren
