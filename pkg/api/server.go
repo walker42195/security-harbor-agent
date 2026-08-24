@@ -1002,11 +1002,12 @@ func (s *Server) handleArp(w http.ResponseWriter, r *http.Request) {
 // manuellt från master-harbor-desktop.
 func (s *Server) handleNmap(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Host     string `json:"host"`
-		SYNScan  bool   `json:"syn_scan"`  // -sS
-		FullTCP  bool   `json:"full_tcp"`  // -p- -sV
-		UDPScan  bool   `json:"udp_scan"`  // -sU
-		OSDetect bool   `json:"os_detect"` // -O
+		Host       string `json:"host"`
+		SYNScan    bool   `json:"syn_scan"`    // -sS
+		FullTCP    bool   `json:"full_tcp"`    // -p- -sV
+		UDPScan    bool   `json:"udp_scan"`    // -sU
+		OSDetect   bool   `json:"os_detect"`   // -O
+		FastTiming bool   `json:"fast_timing"` // -T4 - kombinerbar med valfri scanningstyp ovan
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Host == "" {
 		http.Error(w, "Host saknas", http.StatusBadRequest)
@@ -1037,6 +1038,15 @@ func (s *Server) handleNmap(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.OSDetect {
 		args = append(args, "-O")
+	}
+	// -T4 ("aggressive") - snabbare parallellisering/timeouts än nmaps
+	// default -T3. Kombinerbar med vilken scanningstyp som helst ovan,
+	// styr bara HUR snabbt nmap kör, inte VAD den skannar. -T5 ("insane")
+	// undviks medvetet - den offrar tillförlitlighet (missade portar) på
+	// ett sätt -T4 inte gör, olämpligt som standardval för ett
+	// administrationsverktyg.
+	if req.FastTiming {
+		args = append(args, "-T4")
 	}
 	args = append(args, req.Host)
 
