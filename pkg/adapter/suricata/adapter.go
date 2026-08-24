@@ -66,7 +66,26 @@ func SetInterface(yamlContent []byte, iface string) ([]byte, error) {
 // privilegiehöjning krävs i agentprocessen) — se
 // systemd/10-security-harbor-suricata.rules för polkit-auktorisationen.
 func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bool) error {
-	if cfg.IDS == nil || !cfg.IDS.Enabled || cfg.IDS.Interface == "" {
+	// Om det gränssnitt IDS ska sniffa är AVSTÄNGT (Interface.Enabled=false,
+	// t.ex. en administratör som stängde av WAN som en nödåtgärd), behandlas
+	// det som "ingen IDS" i stället för att försöka starta om Suricata mot
+	// ett nedstängt kort — af-packet-bindning mot ett kort utan LOWER_UP
+	// misslyckas då med ett obegripligt "exit status 1", vilket dessutom
+	// (upptäckt 2026-08-24) kunde få HELA Safe Apply att fastna: både
+	// själva applyn OCH efterföljande rollback-försök körde samma
+	// omstart och misslyckades likadant, tills gränssnittet manuellt togs
+	// upp igen. En administratör som stänger av ett gränssnitt förväntar
+	// sig att DET lyckas, inte att IDS-konfigurationen ska blockera det.
+	ifaceDisabled := false
+	if cfg.IDS != nil {
+		for _, iface := range cfg.Interfaces {
+			if iface.Device == cfg.IDS.Interface && !iface.Enabled {
+				ifaceDisabled = true
+				break
+			}
+		}
+	}
+	if cfg.IDS == nil || !cfg.IDS.Enabled || cfg.IDS.Interface == "" || ifaceDisabled {
 		if dryRun {
 			return nil
 		}

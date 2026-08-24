@@ -918,6 +918,19 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 	// känt tillstånd.
 	if err := e.applyBackends(ctx, candidate, false); err != nil {
 		applyErr := err
+		// applyInterfaces MÅSTE köras även vid återställning, inte bara
+		// applyBackends — annars återställs bara nftables/DNS/DHCP/
+		// Suricata-KONFIGURATIONEN, medan gränssnittens FAKTISKA länkstatus
+		// (ip link up/down, satt av applyInterfaces ovan) blir kvar i det
+		// misslyckade candidate-tillståndet. Upptäckt 2026-08-24: en
+		// administratör stängde av WAN-gränssnittet (ip link ... down),
+		// vilket fick Suricata (konfigurerad att sniffa just det kortet)
+		// att vägra starta om — apply misslyckades, och ÅTERSTÄLLNINGEN
+		// misslyckades DÄRFÖR OCKSÅ (Suricata försökte starta om mot ett
+		// kort som running.json sa var uppe men som fysiskt fortfarande var
+		// nere), och lämnade brandväggen med running.json som sa
+		// "WAN aktiverat" medan kortet i verkligheten var nedstängt.
+		e.applyInterfaces(ctx, e.store.GetRunningConfig(), candidate)
 		if rbErr := e.applyBackends(ctx, e.store.GetRunningConfig(), false); rbErr != nil {
 			log.Printf("[SAFE APPLY] KRITISKT: apply misslyckades (%v) OCH återställningen till running config misslyckades (%v) — systemet kan vara halvapplicerat", applyErr, rbErr)
 			return fmt.Errorf("misslyckades applicera konfiguration: %w (återställningen misslyckades också: %v)", applyErr, rbErr)
@@ -993,6 +1006,12 @@ func (e *Engine) rollbackLocked(ctx context.Context, user string) error {
 	}
 
 	running := e.store.GetRunningConfig()
+	// Samma fix som i ApplyCandidate ovan: e.unconfirmedCfg är den
+	// konfiguration som faktiskt applicerades skarpt (och nu ska rullas
+	// tillbaka) — applyInterfaces måste jämföra MOT den för att veta vilka
+	// gränssnitts länkstatus (ip link up/down) som faktiskt behöver
+	// återställas, annars återställs bara backend-konfigurationen.
+	e.applyInterfaces(ctx, running, e.unconfirmedCfg)
 	if err := e.applyBackends(ctx, running, false); err != nil {
 		fmt.Printf("[SAFE APPLY] fel vid återställning till running config: %v\n", err)
 	}
