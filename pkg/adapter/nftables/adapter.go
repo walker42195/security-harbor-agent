@@ -648,14 +648,25 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		})
 	}
 
-	// Input 4: Lokala åtkomstpolicies (t.ex. SSH) mot brandväggen själv,
-	// ENDAST på LAN/VLAN-gränssnitt. Dessa är vanliga, konfigurerbara
-	// Policy-objekt (pol.Local == true) och kan alltså stängas av i GUI:t —
-	// se cfg.Policies i store.go för default-policyn "sys-ssh-lan".
+	// Input 4: Lokala åtkomstpolicies (t.ex. SSH, Management API) mot
+	// brandväggen själv, ENDAST på LAN/VLAN-gränssnitt. Dessa är
+	// konfigurerbara Policy-objekt (pol.Local == true) — se cfg.Policies i
+	// store.go för default-policyerna "sys-ssh-lan" och
+	// config.MgmtAPIPolicyID ("sys-mgmt-api-lan").
+	//
+	// Management API-policyn är dessutom Protected: den kan stängas av i
+	// GUI:t (Enabled/Action) i en gammal/manuellt redigerad running.json som
+	// slunkit förbi valideringen, men Apply blockeras alltid av
+	// validatePolicies om den skulle vara inaktiverad eller saknas — se den
+	// kommentaren för resonemanget. Renderingen här litar därför på
+	// Enabled/Action som vanligt (ingen tyst override), men PORTEN hämtas
+	// alltid från Settings.APIPort istället för Service-fältet, eftersom det
+	// är den faktiska lyssningsporten och inte får komma ur synk med den.
 	for _, pol := range cfg.Policies {
 		if !pol.Local || !pol.Enabled {
 			continue
 		}
+		isMgmtAPI := pol.ID == config.MgmtAPIPolicyID
 		// Verdiktet MÅSTE följa pol.Action — se actionVerdictExpr för den
 		// bugg som gjorde att en lokal drop-policy renderades som accept.
 		// Ett tomt Action-fält på en LOKAL policy behandlas som accept —
@@ -673,7 +684,21 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		if !ok {
 			continue
 		}
-		svcSets, svcOK := resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{})
+		var svcSets [][]interface{}
+		svcOK := true
+		if isMgmtAPI {
+			svcSets = [][]interface{}{{
+				map[string]interface{}{
+					"match": map[string]interface{}{
+						"op":    "==",
+						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+						"right": cfg.Settings.APIPort,
+					},
+				},
+			}}
+		} else {
+			svcSets, svcOK = resolveServiceMatchExprSets(cfg, pol.Service, map[string]bool{})
+		}
 		if !svcOK {
 			continue
 		}
@@ -702,38 +727,6 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			}
 		}
-	}
-
-	// Management API: alltid nåbar på LAN/VLAN — detta är INTE en
-	// konfigurerbar policy (till skillnad från SSH ovan), eftersom det är
-	// den enda vägen in i GUI:t. Att kunna stänga av den skulle riskera att
-	// låsa ute administratören helt, utan en text-baserad reservväg som SSH.
-	for _, lanDev := range lanDevices {
-		root.Nftables = append(root.Nftables, NFTElement{
-			Rule: &Rule{
-				Family:  a.family,
-				Table:   a.tableName,
-				Chain:   "input",
-				Comment: fmt.Sprintf("Allow Management API on LAN %s", lanDev),
-				Expr: []interface{}{
-					map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
-							"right": lanDev,
-						},
-					},
-					map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
-							"right": cfg.Settings.APIPort,
-						},
-					},
-					map[string]interface{}{"accept": nil},
-				},
-			},
-		})
 	}
 
 	// Input 4b: Tillåt DNS (UDP+TCP 53) till brandväggen själv från LAN/VLAN

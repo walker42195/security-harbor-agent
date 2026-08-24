@@ -292,6 +292,50 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 	}
 }
 
+// applyStaticRoutes tillämpar (respektive tar bort) statiska IP-rutter på
+// Linux via "ip route replace"/"ip route del" (se pkg/adapter/network). Till
+// skillnad från applyInterfaces ovan är "replace" idempotent, så alla
+// AKTIVERADE rutter i newCfg appliceras om vid varje anrop utan att man
+// först behöver avgöra om de ändrats — det är billigt och riskfritt (ingen
+// flush inblandad). Bara borttagning kräver en jämförelse mot prevCfg: en
+// rutt som funnits men försvunnit ur configen (borttagen, inaktiverad, eller
+// fått ett nytt Network så att den gamla CIDR:en inte längre täcks) måste
+// rivas explicit, annars ligger den kvar i kärnans routingtabell för evigt.
+//
+// prevCfg == nil (boot) betyder "ingen jämförelse" → bara applicera,
+// samma mönster som applyInterfaces.
+func (e *Engine) applyStaticRoutes(ctx context.Context, newCfg, prevCfg *config.Config) {
+	if newCfg == nil {
+		return
+	}
+	netAdapter := network.NewAdapter()
+
+	for _, r := range newCfg.StaticRoutes {
+		if !r.Enabled {
+			continue
+		}
+		if err := netAdapter.ApplyStaticRoute(ctx, r); err != nil {
+			log.Printf("[NET] kunde inte sätta rutt %s: %v", r.Network, err)
+		}
+	}
+
+	if prevCfg == nil {
+		return
+	}
+	newByID := map[string]config.StaticRoute{}
+	for _, r := range newCfg.StaticRoutes {
+		newByID[r.ID] = r
+	}
+	for _, prev := range prevCfg.StaticRoutes {
+		cur, stillEnabled := newByID[prev.ID]
+		if !stillEnabled || !cur.Enabled || cur.Network != prev.Network {
+			if err := netAdapter.DeleteStaticRoute(ctx, prev); err != nil {
+				log.Printf("[NET] kunde inte ta bort rutt %s: %v", prev.Network, err)
+			}
+		}
+	}
+}
+
 // interfaceConfigDiffers jämför de fält som faktiskt påverkar Linux-
 // konfigurationen av ett gränssnitt.
 func interfaceConfigDiffers(a, b config.Interface) bool {
@@ -362,6 +406,7 @@ func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
 	// prevCfg=nil → rör inga befintliga fysiska gränssnitt vid boot (deras
 	// IP är externt konfigurerad), skapa bara VLAN som saknas på systemet.
 	e.applyInterfaces(ctx, running, nil)
+	e.applyStaticRoutes(ctx, running, nil)
 	return e.applyBackends(ctx, running, false)
 }
 
@@ -432,6 +477,9 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 	if err := validateSNIRoutes(cfg); err != nil {
 		return err
 	}
+	if err := validateStaticRoutes(cfg); err != nil {
+		return err
+	}
 
 	// Därefter backendarnas egen dry-run (nft -c, Kea, Unbound m.fl.), som
 	// fångar allt vi inte modellerar själva.
@@ -483,6 +531,15 @@ func validateUniqueNames(cfg *config.Config) error {
 // finns för tomma objekt-listor — vilket utan kontrollen bara syns som att
 // "regeln aldrig gör något", obegripligt för en administratör som skrivit
 // fel zonnamn.
+func findPolicyByID(policies []config.Policy, id string) (config.Policy, bool) {
+	for _, p := range policies {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return config.Policy{}, false
+}
+
 func validatePolicies(cfg *config.Config) error {
 	// 3. Validera att varje policys zon-val faktiskt matchar något
 	// konfigurerat gränssnitt — annars hoppar nftables-adaptern (se
@@ -496,6 +553,21 @@ func validatePolicies(cfg *config.Config) error {
 	// falska valideringsfel för DNAT-regler skapade innan den här
 	// kontrollen fanns (upptäckt skarpt 2026-08-19, samma dag kontrollen
 	// lades till).
+	// 2b. Skyddade (Protected) policyer — just nu bara Management API-
+	// åtkomsten (config.MgmtAPIPolicyID) — får varken inaktiveras eller tas
+	// bort. Kontrollen körs här, vid Apply, eftersom det är ögonblicket en
+	// ändring faktiskt slår igenom på den riktiga brandväggen: en
+	// administratör som (avsiktligt eller via ett GUI-fel) stänger av eller
+	// raderar den skulle annars kunna låsa sig ute ur webb-GUI:t helt, utan
+	// en text-baserad reservväg som SSH har.
+	mgmtPol, mgmtFound := findPolicyByID(cfg.Policies, config.MgmtAPIPolicyID)
+	if !mgmtFound {
+		return fmt.Errorf("policyn för Management API (%s) saknas — den kan inte tas bort, eftersom det är den enda vägen in i GUI:t", config.MgmtAPIPolicyID)
+	}
+	if !mgmtPol.Enabled {
+		return fmt.Errorf("policyn %q är skyddad och kan inte inaktiveras — det skulle låsa ute administratören ur GUI:t", mgmtPol.Name)
+	}
+
 	for _, pol := range cfg.Policies {
 		if !pol.Enabled {
 			continue
@@ -692,6 +764,45 @@ func validateSNIRoutes(cfg *config.Config) error {
 	return nil
 }
 
+// validateStaticRoutes kontrollerar att varje aktiverad statisk rutt (se
+// config.StaticRoute) går att applicera på Linux — ett format-fel här skulle
+// annars bara synas som ett obegripligt lågnivåfel från "ip route replace"
+// (t.ex. "Error: an inet prefix is expected rather than ...") långt från
+// orsaken, samma motivering som validatePolicyService har för brandväggs-
+// reglerna.
+func validateStaticRoutes(cfg *config.Config) error {
+	seenNetwork := map[string]bool{}
+	knownDevices := map[string]bool{}
+	for _, iface := range cfg.Interfaces {
+		if iface.Device != "" {
+			knownDevices[iface.Device] = true
+		}
+	}
+	for _, r := range cfg.StaticRoutes {
+		if !r.Enabled {
+			continue
+		}
+		label := r.Name
+		if label == "" {
+			label = r.ID
+		}
+		if _, _, err := net.ParseCIDR(r.Network); err != nil {
+			return fmt.Errorf("rutt %q: nätet %q är inte en giltig CIDR-adress (t.ex. 192.168.113.0/24)", label, r.Network)
+		}
+		if net.ParseIP(r.Gateway) == nil {
+			return fmt.Errorf("rutt %q: gatewayen %q är inte en giltig IP-adress", label, r.Gateway)
+		}
+		if seenNetwork[r.Network] {
+			return fmt.Errorf("rutt %q: nätet %s har redan en annan aktiv rutt — två rutter kan inte peka på samma nät", label, r.Network)
+		}
+		seenNetwork[r.Network] = true
+		if r.Interface != "" && !knownDevices[r.Interface] {
+			return fmt.Errorf("rutt %q: gränssnittet %q finns inte bland konfigurerade gränssnitt", label, r.Interface)
+		}
+	}
+	return nil
+}
+
 // validateSNIBackend kontrollerar att en backend har exakt ETT måltyp
 // (intern server ELLER lokal tjänst) och giltiga värden. isDefault=true
 // tillåter tomma hostnamn (fallback matchar allt övrigt).
@@ -759,6 +870,12 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 	// rör LAN/WAN och tvärtom. Görs FÖRE brandväggsreglerna så nya VLAN-
 	// devices finns när reglerna refererar dem.
 	e.applyInterfaces(ctx, candidate, prevRunning)
+	// Statiska rutter måste också finnas INNAN nftables-reglerna nedan
+	// appliceras — annars kan en policy som beror på att ett nät faktiskt
+	// är nåbart (t.ex. en Allow-regel mot 192.168.113.0/24) verka trasig
+	// trots att regeln i sig är korrekt, bara för att paketen aldrig hittar
+	// dit i första hand.
+	e.applyStaticRoutes(ctx, candidate, prevRunning)
 
 	// Applicera skarpt mot Linux-kärnan (nftables, Kea DHCP, WireGuard).
 	//

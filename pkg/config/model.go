@@ -4,21 +4,48 @@ import "time"
 
 // Config representerar hela brandväggens deklarativa tillstånd.
 type Config struct {
-	Version    int              `json:"version"`              // Konfigurationsversion
-	Revision   int64            `json:"revision"`             // Inkrementeras vid varje commit
-	UpdatedAt  time.Time        `json:"updated_at"`           // Tidstämpel för senaste ändring
-	Interfaces []Interface      `json:"interfaces"`           // Fysiska nätverkskort & VLANs
-	Zones      []Zone           `json:"zones"`                // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
-	Objects    []Object         `json:"objects"`              // Objekt (Hosts, Subnets, IP-listor, GeoIP)
-	Services   []Service        `json:"services"`             // Tjänster (HTTP, HTTPS, SSH, Custom ports)
-	Policies   []Policy         `json:"policies"`             // Brandväggs- och NAT-regler
-	Settings   Settings         `json:"settings"`             // System- och management-inställningar
-	WireGuard  *WireGuardConfig `json:"wireguard,omitempty"`  // VPN-serverkonfiguration (Fas 3)
-	OpenVPN    *OpenVPNConfig   `json:"openvpn,omitempty"`    // VPN-serverkonfiguration (Fas 4)
-	DNS        *DNSConfig       `json:"dns,omitempty"`        // DNS-resolver & domänfiltrering (Fas 6)
-	Syslog     *SyslogConfig    `json:"syslog,omitempty"`     // Centraliserad logg-vidarebefordran (Fas 8)
-	IDS        *IDSConfig       `json:"ids,omitempty"`        // Suricata IDS (Fas 9)
-	SNIRoutes  []SNIRoute       `json:"sni_routes,omitempty"` // Namnbaserad routning (SNI passthrough via HAProxy)
+	Version      int              `json:"version"`                 // Konfigurationsversion
+	Revision     int64            `json:"revision"`                // Inkrementeras vid varje commit
+	UpdatedAt    time.Time        `json:"updated_at"`              // Tidstämpel för senaste ändring
+	Interfaces   []Interface      `json:"interfaces"`              // Fysiska nätverkskort & VLANs
+	Zones        []Zone           `json:"zones"`                   // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
+	Objects      []Object         `json:"objects"`                 // Objekt (Hosts, Subnets, IP-listor, GeoIP)
+	Services     []Service        `json:"services"`                // Tjänster (HTTP, HTTPS, SSH, Custom ports)
+	Policies     []Policy         `json:"policies"`                // Brandväggs- och NAT-regler
+	Settings     Settings         `json:"settings"`                // System- och management-inställningar
+	WireGuard    *WireGuardConfig `json:"wireguard,omitempty"`     // VPN-serverkonfiguration (Fas 3)
+	OpenVPN      *OpenVPNConfig   `json:"openvpn,omitempty"`       // VPN-serverkonfiguration (Fas 4)
+	DNS          *DNSConfig       `json:"dns,omitempty"`           // DNS-resolver & domänfiltrering (Fas 6)
+	Syslog       *SyslogConfig    `json:"syslog,omitempty"`        // Centraliserad logg-vidarebefordran (Fas 8)
+	IDS          *IDSConfig       `json:"ids,omitempty"`           // Suricata IDS (Fas 9)
+	SNIRoutes    []SNIRoute       `json:"sni_routes,omitempty"`    // Namnbaserad routning (SNI passthrough via HAProxy)
+	StaticRoutes []StaticRoute    `json:"static_routes,omitempty"` // Statiska IP-rutter (t.ex. ett internt nät nåbart via en annan gateway)
+}
+
+// StaticRoute representerar en statisk IP-rutt (`ip route add <Network> via
+// <Gateway> [dev <Interface>]`) — för nät som inte nås via brandväggens
+// vanliga default-rutt utan kräver en specifik gateway, t.ex. ett internt
+// nät bakom en annan router på LAN-sidan. Skiljer sig från Policy: en Policy
+// styr om trafik TILLÅTS, en StaticRoute styr VART den skickas för att nå
+// dit överhuvudtaget — brandväggen behöver båda för att nå ett sådant nät
+// (utan rutten hittar den aldrig dit; utan en Allow-policy stoppas trafiken
+// ändå av Default Deny).
+type StaticRoute struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// Network är målnätet i CIDR-form, t.ex. "192.168.113.0/24". En enskild
+	// host går också bra som /32.
+	Network string `json:"network"`
+	// Gateway är IP-adressen trafik till Network ska skickas via.
+	Gateway string `json:"gateway"`
+	// Interface är valfritt gränssnittsnamn (Interface.Device, t.ex.
+	// "ens19") — anges bara om gatewayen är tvetydig (nås via flera
+	// gränssnitt) eller för att tvinga rutten via ett specifikt kort. Tomt
+	// värde = låt kärnan välja gränssnitt utifrån gatewayens adress, vilket
+	// räcker i de allra flesta fall.
+	Interface   string `json:"interface,omitempty"`
+	Description string `json:"description"`
 }
 
 // IDSConfig styr Suricata i passivt IDS-läge (af-packet, INTE inline/
@@ -293,10 +320,24 @@ type Policy struct {
 	Description string       `json:"description"`
 	Local       bool         `json:"local,omitempty"`    // Om true gäller policyn åtkomst till brandväggen själv (INPUT-kedjan, t.ex. SSH/Management API) istället för vidarebefordrad trafik (FORWARD-kedjan).
 	Critical    bool         `json:"critical,omitempty"` // Om true måste GUI:t be om en uttrycklig bekräftelse innan policyn inaktiveras eller tas bort, eftersom den styr åtkomst som kan behövas för att administrera brandväggen.
+	// Protected är ett strängare skydd än Critical: en sådan policy går
+	// inte att inaktivera eller ta bort ens med bekräftelse — bara GUI:t
+	// (och validatePolicies vid Apply, som stoppar det oavsett vad klienten
+	// skickar in) hindrar det. Används för Management API-åtkomsten
+	// (MgmtAPIPolicyID), där en avstängning skulle låsa ute administratören
+	// ur webb-GUI:t helt utan text-baserad reservväg som SSH har.
+	Protected bool `json:"protected,omitempty"`
 	// Schedule gör policyn tidsstyrd (Fas 7 — Schema/tidsbaserade regler).
 	// nil/Enabled=false betyder att policyn gäller alltid, som tidigare.
 	Schedule *PolicySchedule `json:"schedule,omitempty"`
 }
+
+// MgmtAPIPolicyID är ID:t för den skyddade (Protected) Local-policyn som
+// styr åtkomst till Management API (GUI:t) på LAN/VLAN. Den genereras
+// speciellt av nftables-adaptern (som läser porten från Settings.APIPort,
+// inte från Policy.Service — se resolveMgmtAPIPort) och kontrolleras
+// explicit av validatePolicies vid Apply.
+const MgmtAPIPolicyID = "sys-mgmt-api-lan"
 
 // PolicySchedule begränsar när en Policy är aktiv, matchat i nftables via
 // `meta day`/`meta hour` (Fas 7). Days är en lista av engelska veckodags-

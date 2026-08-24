@@ -656,7 +656,16 @@ func TestRenderJSONZoneRestrictsForwardTraffic(t *testing.T) {
 			{
 				ID: "pol-servers-to-lan", Name: "Servers till LAN RDP", Enabled: true,
 				SourceZone: "SERVERS", DestZone: "LAN", SourceObj: "ANY", DestObj: "ANY",
-				Service: "RDP", Action: config.ActionAccept,
+				// "RDP" är inte en giltig service-sträng (varken ett känt preset i
+				// serviceMatchExpr eller ett cfg.Services-ID i denna test-config),
+				// så resolveServiceMatchExprSets skulle hoppa över hela policyn
+				// tyst. Upptäckt 2026-08-24: testet råkade ändå passera eftersom
+				// den då hårdkodade (nu Policy-styrda) Management API-regeln
+				// slumpmässigt innehöll samma "iifname"/"ens19.10" och
+				// "ens19"-strängar testet letade efter, utan koppling till den
+				// här policyn alls. TCP:3389 är en riktig RDP-port och testar
+				// därmed faktiskt det zon-beteende kommentaren ovan beskriver.
+				Service: "TCP:3389", Action: config.ActionAccept,
 			},
 		},
 		Settings: config.Settings{APIPort: 8443},

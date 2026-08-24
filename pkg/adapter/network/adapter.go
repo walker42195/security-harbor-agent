@@ -307,6 +307,49 @@ func (a *Adapter) DeconfigureInterface(ctx context.Context, device string) error
 	return nil
 }
 
+// ApplyStaticRoute installerar (eller uppdaterar) en statisk rutt på Linux.
+// Använder "ip route replace" i stället för "add" — idempotent, så samma
+// rutt kan appliceras om vid varje Apply utan att först behöva kontrollera
+// om den redan finns (skiljer sig från interface-adresser ovan, som flushas
+// explicit före "addr add" av samma anledning).
+func (a *Adapter) ApplyStaticRoute(ctx context.Context, r config.StaticRoute) error {
+	if r.Network == "" || r.Gateway == "" {
+		return fmt.Errorf("rutt saknar nät eller gateway")
+	}
+	args := []string{"route", "replace", r.Network, "via", r.Gateway}
+	if r.Interface != "" {
+		args = append(args, "dev", r.Interface)
+	}
+	cmd := exec.CommandContext(ctx, "ip", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("misslyckades sätta rutt %s via %s: %w - %s", r.Network, r.Gateway, err, string(out))
+	}
+	return nil
+}
+
+// DeleteStaticRoute tar bort en statisk rutt. Idempotent: en rutt som redan
+// saknas (t.ex. för att gränssnittet den gick via försvann, eller den redan
+// togs bort av ett tidigare anrop) är inte ett fel.
+func (a *Adapter) DeleteStaticRoute(ctx context.Context, r config.StaticRoute) error {
+	if r.Network == "" {
+		return nil
+	}
+	args := []string{"route", "del", r.Network}
+	if r.Gateway != "" {
+		args = append(args, "via", r.Gateway)
+	}
+	if r.Interface != "" {
+		args = append(args, "dev", r.Interface)
+	}
+	cmd := exec.CommandContext(ctx, "ip", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "No such process") {
+		return fmt.Errorf("misslyckades ta bort rutt %s: %w - %s", r.Network, err, string(out))
+	}
+	return nil
+}
+
 // ApplyDNSConfig uppdaterar systemets DNS-resolvrar i /etc/resolv.conf baserat på inskrivna DNS-servrar.
 func (a *Adapter) ApplyDNSConfig(ctx context.Context, interfaces []config.Interface) error {
 	var dnsList []string

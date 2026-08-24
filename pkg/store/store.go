@@ -113,7 +113,11 @@ func (s *Store) loadOrInit(seedMode string) error {
 	// configen först skapades finns med även i en befintlig installation (seed
 	// gäller bara nya). Säker utan commit — den injicerade Deny-policyn är
 	// avstängd. Sparas direkt så den överlever omstart.
-	if ensureDefaultAutoBlock(&cfg) {
+	changed := ensureDefaultAutoBlock(&cfg)
+	if ensureDefaultMgmtAPIPolicy(&cfg) {
+		changed = true
+	}
+	if changed {
 		if err := s.saveConfigLocked(runningPath, &cfg); err != nil {
 			return fmt.Errorf("misslyckades spara migrerad config: %w", err)
 		}
@@ -183,6 +187,7 @@ func defaultSeedConfig(seedMode string) *config.Config {
 				Critical:    true,
 				Description: "Tillåter SSH-inloggning till brandväggen själv från det interna nätverket. Om du inaktiverar denna behöver du en annan väg in (t.ex. tangentbord och skärm, eller seriekonsol) för att kunna administrera brandväggen.",
 			},
+			mgmtAPIPolicy("LAN"),
 			// Färdig (men AVSTÄNGD) Deny-policy som refererar auto-block-objektet
 			// ovan — se ipsAutoBlockDenyPolicy för motivering och detaljer.
 			ipsAutoBlockDenyPolicy(),
@@ -202,10 +207,11 @@ func defaultSeedConfig(seedMode string) *config.Config {
 		base.Zones = []config.Zone{
 			{Name: "HOST", Description: "Denna dators enda gränssnitt"},
 		}
-		// SSH-policyn ovan pekar på SourceZone "LAN" — i host-läge finns
-		// ingen "LAN"-zon (bara "HOST"), så peka om den till den faktiska
-		// zonen.
+		// SSH- och Management API-policyerna ovan pekar på SourceZone "LAN"
+		// — i host-läge finns ingen "LAN"-zon (bara "HOST"), så peka om dem
+		// till den faktiska zonen.
 		base.Policies[0].SourceZone = "HOST"
+		base.Policies[1].SourceZone = "HOST"
 		return &base
 	}
 
@@ -233,6 +239,63 @@ func defaultSeedConfig(seedMode string) *config.Config {
 
 // ipsAutoBlockObjectID är ID:t på det objekt som IDS auto-block fyller med
 // larmens käll-IP:n, och som ipsAutoBlockDenyPolicy refererar.
+// mgmtAPIPolicy bygger den skyddade (Protected) Local-policyn för Management
+// API-åtkomst (GUI:t). Fram till 2026-08-24 var den här regeln en helt
+// hårdkodad rad i nftables-adaptern, osynlig och oredigerbar i Policies-vyn.
+// Den är nu en riktig Policy — synlig, och SourceZone/Schema/Description går
+// att redigera — men Protected=true gör att varken GUI eller
+// validatePolicies (vid Apply) tillåter att den inaktiveras eller tas bort:
+// det är fortfarande den enda vägen in i GUI:t utan en text-baserad
+// reservväg som SSH. Själva porten styrs alltid av Settings.APIPort, inte av
+// Service-fältet här (se resolveMgmtAPIPort i nftables-adaptern) — annars
+// hade regeln kunnat komma ur synk med den faktiska lyssningsporten.
+func mgmtAPIPolicy(sourceZone string) config.Policy {
+	return config.Policy{
+		ID:          config.MgmtAPIPolicyID,
+		Name:        "Tillåt Management API (GUI) till brandväggen",
+		Enabled:     true,
+		Priority:    1,
+		SourceZone:  sourceZone,
+		DestZone:    "SELF",
+		Service:     "ANY", // Ignoreras av adaptern för denna policy — porten kommer alltid från Settings.APIPort.
+		Action:      config.ActionAccept,
+		Local:       true,
+		Critical:    true,
+		Protected:   true,
+		Description: "Tillåter åtkomst till administrationsgränssnittet (GUI:t) på brandväggens Management API-port. Kan inte inaktiveras eller tas bort — det är den enda vägen in i GUI:t, utan en text-baserad reservväg som SSH. Ändra porten under Inställningar.",
+	}
+}
+
+// ensureDefaultMgmtAPIPolicy injicerar mgmtAPIPolicy i en BEFINTLIG config
+// som saknar den — seed-configen gäller ju bara nya installationer. Fram
+// till 2026-08-24 fanns ingen sådan Policy alls; åtkomsten genererades helt
+// dolt av nftables-adaptern. Säker att köra utan uttrycklig commit: den
+// injicerade policyn är Enabled=true och Action=accept, dvs. exakt samma
+// beteende brandväggen redan hade (adaptern genererade samma regel
+// hårdkodat) — ingenting öppnas eller stängs som inte redan var öppet.
+// Returnerar true om något lades till (så anroparen kan spara).
+func ensureDefaultMgmtAPIPolicy(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, p := range cfg.Policies {
+		if p.ID == config.MgmtAPIPolicyID {
+			return false
+		}
+	}
+	sourceZone := "LAN"
+	if cfg.Settings.Mode == config.ModeHost {
+		sourceZone = "HOST"
+	}
+	// Läggs sist i listan (inte först, som i seed-configen) för att inte
+	// rubba matchningsordningen för policyer som redan finns i en
+	// befintlig installation — första matchande regel vinner, och den här
+	// migrationen ska bara TILLFÖRA synlighet/redigerbarhet, inte ändra
+	// vilken regel som vinner för befintlig trafik.
+	cfg.Policies = append(cfg.Policies, mgmtAPIPolicy(sourceZone))
+	return true
+}
+
 const ipsAutoBlockObjectID = "obj-ips-autoblock"
 
 // ipsAutoBlockDenyPolicy är den färdiga men AVSTÄNGDA Deny-policyn som
