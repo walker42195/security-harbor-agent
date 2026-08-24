@@ -78,7 +78,11 @@ type Reservation struct {
 // GenerateKeaConfig omvandlar alla aktiva DHCP-scopes från `cfg.Interfaces` till Kea-format.
 func (a *Adapter) GenerateKeaConfig(cfg *config.Config) ([]byte, error) {
 	var listeningIfaces []string
-	var subnets []Subnet4
+	// Initieras som tom slice (inte nil): en nil-slice marshalas till JSON
+	// "null" av encoding/json, men Kea kräver att subnet4 är en array (även
+	// tom) - annars vägrar Kea starta med "syntax error, unexpected null,
+	// expecting [" så fort DHCP är helt avaktiverat (0 aktiva scopes).
+	subnets := []Subnet4{}
 
 	for _, iface := range cfg.Interfaces {
 		if !iface.Enabled || iface.Zone == "WAN" || iface.DHCP == nil || !iface.DHCP.Enabled {

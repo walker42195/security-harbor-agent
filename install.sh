@@ -138,6 +138,16 @@ fi
 if getent group _kea >/dev/null; then
   usermod -a -G _kea security-harbor
 fi
+# ... och omvänt: kea-dhcp4-server körs som _kea, men /etc/kea chgrupas
+# nedan till security-harbor (för att agenten ska kunna skriva configen dit)
+# med läge 770 - utan att _kea är MEDLEM i den gruppen kan den inte ens
+# traversera katalogen för att öppna kea-dhcp4.conf, även om filen själv är
+# världsläsbar. Upptäckt skarpt 2026-08-24: Kea-tjänsten fastnade i
+# "failed" med "Unable to open file /etc/kea/kea-dhcp4.conf" trots att
+# filen fanns och innehöll giltig JSON.
+if id -u _kea >/dev/null 2>&1; then
+  usermod -a -G security-harbor _kea
+fi
 
 echo "=== 3. Skapar kataloger ==="
 mkdir -p "$DATA_DIR" "$CONF_DIR"
