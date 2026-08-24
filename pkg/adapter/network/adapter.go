@@ -203,17 +203,7 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 		go func(device string, isWAN bool) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if isWAN {
-				_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
-				return
-			}
-			if confPath, cleanup, err := writeInternalDHClientConf(); err == nil {
-				defer cleanup()
-				_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", "-cf", confPath, device).Run()
-			} else {
-				_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
-			}
-			_ = exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", device).Run()
+			runDHClientOnce(ctx, device, isWAN)
 		}(iface.Device, isWAN)
 	}
 
@@ -232,6 +222,40 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 		}
 	}
 
+	return nil
+}
+
+// runDHClientOnce kör dhclient EN gång mot ett gränssnitt — utbruten ur
+// ApplyInterfaceConfig (Fas 13-arvet) så att samma logik även kan triggas
+// manuellt via RenewDHCP (en "förnya"-knapp i GUI:t, 2026-08-24) utan att
+// gå via en hel gränssnittsapplicering. Anroparen ansvarar för context/
+// timeout och ev. att köra detta i en egen goroutine.
+func runDHClientOnce(ctx context.Context, device string, isWAN bool) {
+	if isWAN {
+		_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
+		return
+	}
+	if confPath, cleanup, err := writeInternalDHClientConf(); err == nil {
+		defer cleanup()
+		_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", "-cf", confPath, device).Run()
+	} else {
+		_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
+	}
+	_ = exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", device).Run()
+}
+
+// RenewDHCP kör om DHCP-förhandlingen för ETT gränssnitt på begäran (en
+// "förnya IP"-knapp i GUI:t) — samma dhclient-anrop som redan görs
+// automatiskt när ett gränssnitt sätts till DHCP-läge, men körs SYNKRONT
+// här (anroparen väntar på svaret) i stället för i en bakgrunds-goroutine,
+// eftersom det här är en explicit, av administratören begärd åtgärd som
+// ska ge tydlig återkoppling (lyckades/misslyckades), inte en tyst
+// bakgrundsprocess.
+func (a *Adapter) RenewDHCP(ctx context.Context, device string, isWAN bool) error {
+	if device == "" {
+		return fmt.Errorf("gränssnittsenhet saknas")
+	}
+	runDHClientOnce(ctx, device, isWAN)
 	return nil
 }
 

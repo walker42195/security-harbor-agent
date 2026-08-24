@@ -100,6 +100,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/vpn/openvpn/generate-client", s.authMiddlewareAdmin(s.handleOpenVPNGenerateClient))
 	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddlewareAdmin(s.handleRefreshObjectSource))
 	mux.HandleFunc("/api/v1/dns/refresh-blocklist", s.authMiddlewareAdmin(s.handleRefreshDNSBlocklist))
+	mux.HandleFunc("/api/v1/interfaces/renew-dhcp", s.authMiddlewareAdmin(s.handleRenewDHCP))
 	mux.HandleFunc("/api/v1/services/status", s.authMiddleware(s.handleServicesStatus))
 	mux.HandleFunc("/api/v1/services/restart", s.authMiddlewareAdmin(s.handleServiceRestart))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig)) // GET=alla, POST/PUT kräver admin internt (se handlern)
@@ -842,6 +843,54 @@ func readMemoryTotals() (totalGB float64, freePercent float64) {
 	totalGB = math.Round(float64(total)/1024/1024*10) / 10
 	freePercent = math.Round(float64(available)/float64(total)*1000) / 10
 	return totalGB, freePercent
+}
+
+// handleRenewDHCP kör om DHCP-förhandlingen för ETT gränssnitt i
+// DHCP-läge (t.ex. WAN) på begäran — en "förnya IP"-knapp i GUI:t,
+// 2026-08-24. Slår upp gränssnittet i RUNNING-configen (den faktiskt
+// applicerade, inte kandidaten) eftersom det är det som faktiskt finns på
+// systemet just nu.
+func (s *Server) handleRenewDHCP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	cfg := s.engine.GetRunningConfig()
+	if cfg == nil {
+		http.Error(w, "Ingen körande konfiguration", http.StatusInternalServerError)
+		return
+	}
+	var target *config.Interface
+	for i := range cfg.Interfaces {
+		if cfg.Interfaces[i].ID == req.ID {
+			target = &cfg.Interfaces[i]
+			break
+		}
+	}
+	if target == nil {
+		http.Error(w, "Gränssnittet hittades inte", http.StatusBadRequest)
+		return
+	}
+	if !target.Enabled || target.AddressType != "dhcp" {
+		http.Error(w, "Gränssnittet är inte aktiverat i DHCP-läge", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer cancel()
+	if err := s.netAdapt.RenewDHCP(ctx, target.Device, strings.EqualFold(target.Zone, "WAN")); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 func (s *Server) handleDiscoverInterfaces(w http.ResponseWriter, r *http.Request) {
