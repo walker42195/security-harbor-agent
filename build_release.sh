@@ -57,8 +57,8 @@ fi
 echo "=== 3. Kopierar systemd-enheter, polkit-regler, failsafe-mallar och runner ==="
 mkdir -p "$DIST_DIR/systemd"
 cp systemd/*.service systemd/*.timer systemd/*.rules systemd/*.nft.tmpl "$DIST_DIR/systemd/"
-cp systemd/update-runner.sh "$DIST_DIR/systemd/"
-chmod +x "$DIST_DIR/systemd/update-runner.sh"
+cp systemd/update-runner.sh systemd/rollback-runner.sh systemd/lib-archive-version.sh "$DIST_DIR/systemd/"
+chmod +x "$DIST_DIR/systemd/update-runner.sh" "$DIST_DIR/systemd/rollback-runner.sh"
 
 echo "=== 4. Kopierar install.sh och uninstall.sh ==="
 cp install.sh "$DIST_DIR/install.sh"

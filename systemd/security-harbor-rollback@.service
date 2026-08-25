@@ -1,0 +1,21 @@
+[Unit]
+Description=Security Harbor rollback till sparad version %I (privilegierad installer)
+# OBS: ömsesidig uteslutning mot en samtidig security-harbor-update.service
+# görs INTE via systemd Conflicts= här (Conflicts stoppar en redan körande
+# oneshot mitt i en filkopiering, vilket är farligare än att bara vägra
+# starta) - se flock-spärren i rollback-runner.sh/update-runner.sh istället.
+
+[Service]
+Type=oneshot
+# Kör den privilegierade rollback-installern som root. Den oprivilegierade
+# agenten (security-harbor-agent.service, NoNewPrivileges=true m.m.) triggar
+# den här mall-tjänsten via `systemctl start --no-block
+# security-harbor-rollback@<version>.service` i stället för att röra
+# /usr/local/bin själv - privilegiehöjningen isoleras till denna minimala
+# engångskörning. %I (instansnamnet, dvs versionssträngen) valideras strikt
+# mot ett siffer/punkt-mönster både i API-lagret (pkg/api/server.go) och i
+# rollback-runner.sh självt innan den används.
+ExecStart=/usr/local/lib/security-harbor/rollback-runner.sh %I
+# Kort timeout - detta är bara filkopiering, inget apt/nätverk (jfr
+# security-harbor-update.service som behöver upp till 900s).
+TimeoutStartSec=120

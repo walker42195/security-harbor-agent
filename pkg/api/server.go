@@ -119,6 +119,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/system/update/check", s.authMiddlewareAdmin(s.handleUpdateCheck))
 	mux.HandleFunc("/api/v1/system/update/download", s.authMiddlewareAdmin(s.handleUpdateDownload))
 	mux.HandleFunc("/api/v1/system/update/apply", s.authMiddlewareAdmin(s.handleUpdateApply))
+	mux.HandleFunc("/api/v1/system/versions", s.authMiddlewareAdmin(s.handleListVersions))
+	mux.HandleFunc("/api/v1/system/versions/rollback", s.authMiddlewareAdmin(s.handleRollbackVersion))
 
 	// Web-UI (Fas 8+) — statiska filer (flutter build web), t.ex. driftsatta
 	// via rsync till --webui-dir. Registreras SIST men ServeMux matchar
@@ -644,6 +646,73 @@ func readStagedVersion() string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// rollbackVersionPattern styr vilka versionssträngar som accepteras av
+// handleRollbackVersion INNAN de någonsin används för att bygga ett
+// systemd-enhetsnamn (security-harbor-rollback@<version>.service) eller
+// skickas vidare till exec.Command — stänger kommandoinjektions-ytan helt,
+// oavsett vad som råkar stå i versions/index.json.
+var rollbackVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// handleListVersions returnerar de senast installerade versionerna som
+// fortfarande finns sparade på disk (se systemd/lib-archive-version.sh) och
+// går att rulla tillbaka till, samt vilken som är den nu körande.
+func (s *Server) handleListVersions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"current":  s.version,
+		"versions": updater.ListRetainedVersions(),
+	})
+}
+
+// handleRollbackVersion triggar den privilegierade root-rollback-installern
+// (systemd mall-enhet) för en tidigare sparad version. Till skillnad från
+// handleUpdateApply görs ingen ny signaturverifiering — den arkiverade
+// binären har redan körts betrott på den här maskinen tidigare.
+func (s *Server) handleRollbackVersion(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "ogiltig begäran", http.StatusBadRequest)
+		return
+	}
+	version := strings.TrimSpace(body.Version)
+	if !rollbackVersionPattern.MatchString(version) {
+		http.Error(w, "ogiltig versionssträng", http.StatusBadRequest)
+		return
+	}
+	if version == s.version {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":      true,
+			"message": "redan på version " + version,
+		})
+		return
+	}
+	found := false
+	for _, v := range updater.ListRetainedVersions() {
+		if v.Version == version {
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.Error(w, "versionen finns inte bland sparade versioner", http.StatusBadRequest)
+		return
+	}
+	unit := "security-harbor-rollback@" + version + ".service"
+	out, err := exec.Command("systemctl", "start", "--no-block", unit).CombinedOutput()
+	if err != nil {
+		http.Error(w, "kunde inte starta rollback-installern: "+string(out), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":      true,
+		"message": "Återställningen startad. Agenten startar om på version " + version + " om en liten stund.",
+	})
 }
 
 // restartSelfAfterResponse avslutar processen strax efter att svaret

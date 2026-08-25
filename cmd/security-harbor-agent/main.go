@@ -88,7 +88,16 @@ func main() {
 	// Applicera initial konfiguration vid start (om ej dry-run)
 	if !*dryRun {
 		fmt.Println("[INIT] Applicerar initial konfiguration (nftables, DHCP, WireGuard)...")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// 10s räckte när detta bara rörde nftables (se git-historik), men
+		// ApplyRunningConfigAtBoot kör numera ALLA backends sekventiellt under
+		// samma budget (nftables, DHCP, WireGuard, OpenVPN, DNS, syslog,
+		// Suricata, HAProxy) utan att timeouten någonsin följde med. Upptäckt
+		// 2026-08-25: Suricata med det fulla ET Open-regelsetet (~68 500
+		// regler) hinner inte starta om innan ctx går ut, `systemctl restart
+		// suricata.service` dödas mitt i ("signal: killed") och boot-
+		// applieringen loggar ett VARNING på i princip varje omstart av
+		// agenten i gateway-läge.
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		err := eng.ApplyRunningConfigAtBoot(ctx)
 		cancel()
 		if err != nil {

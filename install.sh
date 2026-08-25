@@ -107,7 +107,8 @@ if [ "$MODE" = "host" ]; then
     nmap \
     bind9-dnsutils \
     rsyslog \
-    polkitd
+    polkitd \
+    jq
 else
   apt-get install -y \
     nftables \
@@ -122,7 +123,8 @@ else
     suricata \
     suricata-update \
     rsyslog \
-    polkitd
+    polkitd \
+    jq
 fi
 
 echo "=== 2. Skapar systemanvändare/grupp 'security-harbor' ==="
@@ -217,16 +219,36 @@ for d in /etc/kea /etc/unbound /etc/unbound/unbound.conf.d /etc/openvpn /etc/wir
 done
 
 echo "=== 4. Installerar binärer ==="
+# Arkivera den UTGÅENDE versionen (om någon) innan den skrivs över, så att
+# man kan rulla tillbaka till en av de senaste 3 via GUI:t/API:t om den nya
+# versionen visar sig trasig. Delas med rollback-runner.sh - se den filen
+# för hur en arkiverad version installeras tillbaka.
+if [ -f "$SCRIPT_DIR/systemd/lib-archive-version.sh" ]; then
+  # shellcheck source=systemd/lib-archive-version.sh
+  . "$SCRIPT_DIR/systemd/lib-archive-version.sh"
+  NEW_VERSION="$("$SCRIPT_DIR/security-harbor-agent" --version 2>/dev/null || true)"
+  archive_current_version "$NEW_VERSION"
+fi
+
 for bin in security-harbor-agent security-harbor-nmap-runner security-harbor-tcpdump-runner; do
   install -m 0755 -o root -g root "$SCRIPT_DIR/$bin" "$BIN_DIR/$bin"
 done
 
-# Privilegierad självuppdaterings-runner (körs som root av
-# security-harbor-update.service, se systemd/update-runner.sh).
+# Privilegierade root-runners (körs av security-harbor-update.service resp.
+# security-harbor-rollback@.service, se systemd/update-runner.sh och
+# systemd/rollback-runner.sh).
 install -d -m 0755 /usr/local/lib/security-harbor
 if [ -f "$SCRIPT_DIR/systemd/update-runner.sh" ]; then
   install -m 0755 -o root -g root "$SCRIPT_DIR/systemd/update-runner.sh" \
     /usr/local/lib/security-harbor/update-runner.sh
+fi
+if [ -f "$SCRIPT_DIR/systemd/rollback-runner.sh" ]; then
+  install -m 0755 -o root -g root "$SCRIPT_DIR/systemd/rollback-runner.sh" \
+    /usr/local/lib/security-harbor/rollback-runner.sh
+fi
+if [ -f "$SCRIPT_DIR/systemd/lib-archive-version.sh" ]; then
+  install -m 0644 -o root -g root "$SCRIPT_DIR/systemd/lib-archive-version.sh" \
+    /usr/local/lib/security-harbor/lib-archive-version.sh
 fi
 
 # Webb-GUI:t (flutter build web) buntas med releasen och deployas till

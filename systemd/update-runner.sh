@@ -16,6 +16,17 @@ AGENT_BIN="/usr/local/bin/security-harbor-agent"
 
 log() { echo "[sh-update] $*"; }
 
+# Ömsesidig uteslutning mot en samtidig security-harbor-rollback@.service (se
+# samma spärr och motivering där) - icke-blockerande, vägrar starta hellre än
+# att riskera en halvfärdig filkopiering.
+LOCK_FILE="$STAGING_DIR/.install.lock"
+mkdir -p "$STAGING_DIR"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "en annan uppdatering/rollback pågår redan - avbryter."
+    exit 1
+fi
+
 if [[ ! -f "$TARBALL" || ! -f "$SIG" ]]; then
     log "ingen stagad bunt att installera ($TARBALL) - avbryter."
     exit 1

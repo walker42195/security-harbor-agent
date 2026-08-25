@@ -50,6 +50,39 @@ const (
 	StagedSig     = "security-harbor-dist.tar.gz.sig"
 )
 
+// VersionsDir är där de senast installerade versionerna arkiveras (av
+// install.sh/rollback-runner.sh, se systemd/lib-archive-version.sh) så att
+// man kan rulla tillbaka. Ligger i agentens ReadWritePaths.
+const VersionsDir = "/var/lib/security-harbor/versions"
+
+// RetainedVersion är en post i versions/index.json - en tidigare
+// installerad version som fortfarande finns kvar på disk och går att
+// rulla tillbaka till.
+type RetainedVersion struct {
+	Version    string `json:"version"`
+	ArchivedAt string `json:"archived_at"`
+	SizeBytes  int64  `json:"size_bytes"`
+}
+
+// ListRetainedVersions läser versions/index.json (skriven av install.sh/
+// rollback-runner.sh) och returnerar de sparade versionerna, nyast
+// arkiverad först. En saknad eller trasig indexfil tolkas som "inga
+// sparade versioner" snarare än ett fel, i samma stil som
+// readStagedVersion/ReadWebUIVersion.
+func ListRetainedVersions() []RetainedVersion {
+	data, err := os.ReadFile(filepath.Join(VersionsDir, "index.json"))
+	if err != nil {
+		return nil
+	}
+	var parsed struct {
+		Versions []RetainedVersion `json:"versions"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil
+	}
+	return parsed.Versions
+}
+
 // Component beskriver en uppdaterbar del i manifestet.
 type Component struct {
 	Version      string `json:"version"`
