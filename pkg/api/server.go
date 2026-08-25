@@ -832,6 +832,11 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		"memory":          readMemoryPercent(),
 		"memory_total_gb": memTotalGB,
 		"memory_free_pct": memFreePercent,
+		// Backends som inte kunde appliceras men som inte är trafikstyrande
+		// (i praktiken IDS) — appliceringen gick igenom, men funktionen är
+		// inte igång och det ska synas i GUI:t i stället för att tyst
+		// försvinna i agentloggen.
+		"degraded_backends": s.engine.DegradedBackends(),
 	})
 }
 

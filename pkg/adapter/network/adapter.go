@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -184,6 +185,21 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 			return fmt.Errorf("misslyckades sätta IP %s på %s: %w - %s", iface.IPv4, iface.Device, err, string(out))
 		}
 	} else if iface.Enabled && iface.AddressType == "dhcp" {
+		// Ta bort kvarglömda STATISKA adresser innan dhclient körs.
+		//
+		// Buggen (rapporterad skarpt 2026-08-25): `ip addr flush` kördes BARA
+		// i static-grenen ovan. Gick ett kort från statiskt till DHCP låg den
+		// gamla statiska adressen kvar för alltid, och DHCP-adressen lades
+		// till som en ANDRA adress på kortet. Administratören såg då sin
+		// "gamla" IP fortsätta svara trots att den bytts i GUI:t.
+		//
+		// Vi flushar medvetet INTE allt: den nuvarande DHCP-leasen ska leva
+		// kvar tills dhclient (som körs asynkront nedan) hunnit svara,
+		// annars står kortet utan adress i flera sekunder och en
+		// administratör som sitter på det kortet tappar sin session. Därför
+		// tas bara PERMANENTA (icke-dynamiska) adresser bort — det är exakt
+		// de statiska rester som inte hör hemma på ett DHCP-kort.
+		removeStaticAddresses(ctx, iface.Device)
 		// Om gränssnittet är satt till DHCP, trigga dhclient. "-1" gör ETT
 		// försök och avslutar om ingen server svarar (annars hänger klienten
 		// kvar för evigt på t.ex. en VLAN utan DHCP-server), och en
@@ -223,6 +239,38 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 	}
 
 	return nil
+}
+
+// removeStaticAddresses tar bort alla PERMANENTA IPv4-adresser på ett kort
+// men lämnar DHCP-tilldelade (dynamiska) adresser orörda. Används när ett
+// kort körs i DHCP-läge: då är en permanent adress per definition en rest
+// från en tidigare statisk konfiguration.
+//
+// `ip -4 addr show dev X` markerar DHCP-adresser med "dynamic"; allt annat
+// är permanent. Vi kan inte använda `ip addr flush` här eftersom den tar
+// bort ÄVEN den aktiva leasen och lämnar kortet utan adress tills dhclient
+// svarat — det skulle koppla ner administratören mitt i en applicering.
+func removeStaticAddresses(ctx context.Context, device string) {
+	out, err := exec.CommandContext(ctx, "ip", "-4", "-o", "addr", "show", "dev", device).Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" || strings.Contains(line, "dynamic") {
+			continue // tom rad, eller en aktiv DHCP-lease som ska vara kvar
+		}
+		fields := strings.Fields(line)
+		// Format: "3: ens19    inet 10.0.0.9/24 scope global ens19\..."
+		for i, f := range fields {
+			if f != "inet" || i+1 >= len(fields) {
+				continue
+			}
+			cidr := fields[i+1]
+			log.Printf("[NÄTVERK] %s är i DHCP-läge — tar bort kvarglömd statisk adress %s", device, cidr)
+			_ = exec.CommandContext(ctx, "ip", "addr", "del", cidr, "dev", device).Run()
+			break
+		}
+	}
 }
 
 // runDHClientOnce kör dhclient EN gång mot ett gränssnitt — utbruten ur

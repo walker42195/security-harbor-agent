@@ -54,6 +54,29 @@ type Engine struct {
 	// engine-tillståndet) — värsta fallet efter en omstart är att de senast
 	// hanterade larmen bedöms på nytt, inte att något missas.
 	idsLastAlertTS string
+
+	// degradedBackends håller icke-blockerande fel från senaste applyBackends
+	// (t.ex. att Suricata inte kunde starta). Se applyBackends för
+	// resonemanget kring vilka backends som får faila utan att fälla hela
+	// appliceringen. Läses av API:t och visas som en varning i GUI:t.
+	degradedBackends []BackendWarning
+}
+
+// BackendWarning beskriver en backend som inte kunde appliceras men som inte
+// är trafikstyrande — appliceringen fortsätter, men administratören ska se
+// att funktionen inte är igång.
+type BackendWarning struct {
+	Backend string `json:"backend"`
+	Message string `json:"message"`
+}
+
+// DegradedBackends returnerar varningarna från den senaste appliceringen.
+func (e *Engine) DegradedBackends() []BackendWarning {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]BackendWarning, len(e.degradedBackends))
+	copy(out, e.degradedBackends)
+	return out
 }
 
 func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter, syslogAdapter *syslog.Adapter, suricataAdapter *suricata.Adapter, haproxyAdapter *haproxy.Adapter) *Engine {
@@ -76,6 +99,12 @@ func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.
 // rollback så att en rollback verkligen återställer DHCP/VPN, inte bara
 // brandväggsreglerna.
 func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun bool) error {
+	// warnings samlar icke-blockerande fel (se IDS-blocket längre ned).
+	var warnings []BackendWarning
+	if !dryRun {
+		defer func() { e.degradedBackends = warnings }()
+	}
+
 	if _, err := e.nftAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
 		return fmt.Errorf("nftables: %w", err)
 	}
@@ -177,9 +206,28 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 		return fmt.Errorf("syslog: %w", err)
 	}
 
+	// IDS (Suricata) är PASSIV övervakning — den styr ingen trafik. Att den
+	// inte startar får därför inte fälla hela appliceringen.
+	//
+	// Live-incident 2026-08-25 (10.0.0.9): Proxmox-värden var överbokad och
+	// ballongdrivrutinen hade krympt brandvägg-VM:en till ~535 MB användbart
+	// minne. Suricata hann inte ladda ET Open-regelsetet (~68 500 regler)
+	// inom systemds TimeoutStartSec=90s, dödades, startades om av
+	// Restart=on-failure, och loopade. Varje Apply blockerade då 90 sekunder
+	// på `systemctl restart suricata` och FAILADE sedan — varpå den
+	// automatiska rollbacken körde exakt samma anrop och failade likadant.
+	// Resultatet blev "systemet kan vara halvapplicerat" trots att nftables
+	// (det enda som faktiskt filtrerar trafik) hade applicerats korrekt.
+	//
+	// Nu registreras felet som en varning i stället. Trafikstyrande backends
+	// (nftables, ip-forwarding, DHCP, VPN, DNS, SNI) failar fortfarande hårt.
 	if !cfg.IsHostMode() {
 		if err := e.suricataAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
-			return fmt.Errorf("suricata: %w", err)
+			log.Printf("[APPLY] VARNING: IDS (Suricata) kunde inte appliceras: %v — appliceringen fortsätter, IDS är AVSTÄNGD tills detta åtgärdats", err)
+			warnings = append(warnings, BackendWarning{
+				Backend: "ids",
+				Message: fmt.Sprintf("IDS (Suricata) kunde inte startas: %v. Brandväggsreglerna är applicerade, men intrångsdetekteringen är inte igång. Vanligaste orsaken är för lite minne för regelsetet.", err),
+			})
 		}
 	}
 

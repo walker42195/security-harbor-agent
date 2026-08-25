@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
 // managedService beskriver EN systemd-tjänst som agenten själv startar/
@@ -51,6 +53,52 @@ type serviceStatus struct {
 	managedService
 	Active string `json:"active"` // ActiveState: active, inactive, failed, activating, ...
 	Sub    string `json:"sub"`    // SubState: running, dead, exited, ...
+	// Configured säger om FUNKTIONEN är påslagen i brandväggens
+	// konfiguration — till skillnad från Active, som bara speglar systemds
+	// syn på enheten.
+	//
+	// Rapporterat 2026-08-25: Tjänstepanelen visade "rsyslog igång" trots att
+	// syslog-vidarebefordran var AVSTÄNGD i inställningarna. rsyslog är
+	// systemets ordinarie logghanterare på Debian/Ubuntu och körs alltid,
+	// oavsett om vi vidarebefordrar något. Utan det här fältet gick det inte
+	// att skilja "tjänsten lever" från "funktionen är aktiverad".
+	Configured bool `json:"configured"`
+}
+
+// serviceConfigured avgör om funktionen bakom en tjänst är påslagen i
+// konfigurationen. Agenten själv är alltid "konfigurerad".
+func serviceConfigured(id string, cfg *config.Config) bool {
+	if id == "agent" {
+		return true
+	}
+	if cfg == nil {
+		return false
+	}
+	switch id {
+	case "dns":
+		return cfg.DNS != nil && cfg.DNS.Enabled
+	case "ids":
+		return cfg.IDS != nil && cfg.IDS.Enabled
+	case "syslog":
+		return cfg.Syslog != nil && cfg.Syslog.Enabled
+	case "openvpn":
+		return cfg.OpenVPN != nil && cfg.OpenVPN.Enabled
+	case "dhcp":
+		for _, iface := range cfg.Interfaces {
+			if iface.Enabled && iface.DHCP != nil && iface.DHCP.Enabled {
+				return true
+			}
+		}
+		return false
+	case "sni":
+		for _, r := range cfg.SNIRoutes {
+			if r.Enabled {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // queryUnitState läser ActiveState/SubState för EN systemd-enhet via
@@ -87,10 +135,16 @@ func (s *Server) handleServicesStatus(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
+	cfg := s.engine.GetRunningConfig()
 	out := make([]serviceStatus, 0, len(managedServices))
 	for _, svc := range managedServices {
 		active, sub := queryUnitState(ctx, svc.Unit)
-		out = append(out, serviceStatus{managedService: svc, Active: active, Sub: sub})
+		out = append(out, serviceStatus{
+			managedService: svc,
+			Active:         active,
+			Sub:            sub,
+			Configured:     serviceConfigured(svc.ID, cfg),
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -140,5 +194,10 @@ func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
 	}
 	active, sub := queryUnitState(context.Background(), svc.Unit)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(serviceStatus{managedService: svc, Active: active, Sub: sub})
+	_ = json.NewEncoder(w).Encode(serviceStatus{
+		managedService: svc,
+		Active:         active,
+		Sub:            sub,
+		Configured:     serviceConfigured(svc.ID, s.engine.GetRunningConfig()),
+	})
 }
