@@ -195,19 +195,25 @@ type OpenVPNClient struct {
 
 // Interface representerar ett nätverksgränssnitt eller VLAN.
 type Interface struct {
-	ID          string      `json:"id"`             // t.ex. "eth0", "eth1", "vlan10"
-	Name        string      `json:"name"`           // Läsbart visningsnamn satt av användaren (valfritt, faller tillbaka på Device i GUI:t)
-	Device      string      `json:"device"`         // Linux device name, t.ex. "eth0", "eth1.10"
-	Parent      string      `json:"parent"`         // För VLAN: föräldra-interface, t.ex. "eth1"
-	VLANID      int         `json:"vlan_id"`        // 0 för fysiska, 1-4094 för VLAN
-	Zone        string      `json:"zone"`           // Kopplad zon: "WAN", "LAN", "SERVERS", etc.
-	Enabled     bool        `json:"enabled"`        // Om gränssnittet är aktivt
-	AddressType string      `json:"address_type"`   // "static", "dhcp"
-	IPv4        string      `json:"ipv4"`           // IP/CIDR t.ex. "192.168.10.1/24"
-	Gateway     string      `json:"gateway"`        // Default gateway (främst WAN)
-	DNSServers  []string    `json:"dns_servers"`    // Statiska DNS-servrar för gränssnittet, t.ex. ["1.1.1.1", "8.8.8.8"]
-	MTU         int         `json:"mtu"`            // MTU (standard 1500)
-	DHCP        *DHCPConfig `json:"dhcp,omitempty"` // DHCP Server inställningar för detta interface/VLAN
+	ID          string   `json:"id"`           // t.ex. "eth0", "eth1", "vlan10"
+	Name        string   `json:"name"`         // Läsbart visningsnamn satt av användaren (valfritt, faller tillbaka på Device i GUI:t)
+	Device      string   `json:"device"`       // Linux device name, t.ex. "eth0", "eth1.10"
+	Parent      string   `json:"parent"`       // För VLAN: föräldra-interface, t.ex. "eth1"
+	VLANID      int      `json:"vlan_id"`      // 0 för fysiska, 1-4094 för VLAN
+	Zone        string   `json:"zone"`         // Kopplad zon: "WAN", "LAN", "SERVERS", etc.
+	Enabled     bool     `json:"enabled"`      // Om gränssnittet är aktivt
+	AddressType string   `json:"address_type"` // "static", "dhcp"
+	IPv4        string   `json:"ipv4"`         // IP/CIDR t.ex. "192.168.10.1/24"
+	Gateway     string   `json:"gateway"`      // Default gateway (främst WAN)
+	DNSServers  []string `json:"dns_servers"`  // Statiska DNS-servrar för gränssnittet, t.ex. ["1.1.1.1", "8.8.8.8"]
+	MTU         int      `json:"mtu"`          // MTU (standard 1500)
+	// MACAddress sätter kortets MAC manuellt ("MAC-kloning"). Främst för WAN:
+	// många ISP:er binder abonnemanget till MAC-adressen på den router som
+	// först registrerades, och byter man hårdvara får man ingen DHCP-lease
+	// förrän den gamla adressen klonas. Tomt = rör inte kortets MAC (behåll
+	// den brända adressen).
+	MACAddress string      `json:"mac_address,omitempty"`
+	DHCP       *DHCPConfig `json:"dhcp,omitempty"` // DHCP Server inställningar för detta interface/VLAN
 }
 
 // DHCPConfig innehåller DHCP-serverkonfiguration för ett gränssnitt/VLAN.

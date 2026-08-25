@@ -581,6 +581,9 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 // förvirrande — allt såg ut att fungera utom just lease-listan.
 func validateInterfaces(cfg *config.Config) error {
 	for _, iface := range cfg.Interfaces {
+		if err := validateInterfaceMAC(iface); err != nil {
+			return err
+		}
 		if !iface.Enabled || iface.AddressType != "static" || iface.IPv4 == "" {
 			continue
 		}
@@ -591,6 +594,48 @@ func validateInterfaces(cfg *config.Config) error {
 			}
 			return fmt.Errorf("gränssnitt %q: IPv4-adressen %q måste anges med prefix (t.ex. \"10.13.13.1/24\"), inte bara en bar IP-adress", label, iface.IPv4)
 		}
+	}
+	return nil
+}
+
+// validateInterfaceMAC kontrollerar en manuellt satt MAC-adress. Den skrivs
+// rakt in i ett `ip link set ... address`-anrop, så formatet måste vara känt
+// giltigt innan vi kommer dit. Två adresser avvisas utöver rena syntaxfel:
+//
+//   - multicast (lägsta biten i första oktetten satt) — en sådan käll-MAC är
+//     ogiltig på ethernet och kortet blir tyst; switchen släpper ramarna.
+//   - hel-noll — kortet får ingen användbar identitet alls.
+//
+// Vi kräver 6 oktetter (EUI-48): net.ParseMAC godtar även 8 och 20 byte
+// (EUI-64/InfiniBand), vilket inte går att sätta på ett ethernetkort.
+func validateInterfaceMAC(iface config.Interface) error {
+	mac := strings.TrimSpace(iface.MACAddress)
+	if mac == "" {
+		return nil
+	}
+	label := iface.Name
+	if label == "" {
+		label = iface.Device
+	}
+	hw, err := net.ParseMAC(mac)
+	if err != nil {
+		return fmt.Errorf("gränssnitt %q: %q är ingen giltig MAC-adress — ange den på formen aa:bb:cc:dd:ee:ff", label, mac)
+	}
+	if len(hw) != 6 {
+		return fmt.Errorf("gränssnitt %q: MAC-adressen måste vara 6 oktetter (aa:bb:cc:dd:ee:ff)", label)
+	}
+	if hw[0]&0x01 != 0 {
+		return fmt.Errorf("gränssnitt %q: %q är en multicast-adress och kan inte användas som kortets egen MAC — första oktetten måste vara jämn", label, mac)
+	}
+	allZero := true
+	for _, b := range hw {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return fmt.Errorf("gränssnitt %q: MAC-adressen får inte vara 00:00:00:00:00:00", label)
 	}
 	return nil
 }

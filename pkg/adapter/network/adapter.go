@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -166,7 +167,31 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 		}
 	}
 
-	// 2. Sätt interface UP eller DOWN
+	// 2. Manuellt satt MAC-adress ("MAC-kloning") och MTU.
+	//
+	// MÅSTE ske medan kortet är NERE: de flesta drivrutiner avvisar en
+	// adressändring på ett uppe kort med EBUSY. Vi tar därför alltid ner
+	// kortet först, sätter MAC:en, och låter steg 3 nedan ta upp det igen.
+	// Kortet är nere i millisekunder och bara när en MAC faktiskt är
+	// konfigurerad — sitter administratören på det kortet märks det inte.
+	if mac := strings.TrimSpace(iface.MACAddress); mac != "" && !macAlreadySet(iface.Device, mac) {
+		_ = exec.CommandContext(ctx, "ip", "link", "set", iface.Device, "down").Run()
+		out, err := exec.CommandContext(ctx, "ip", "link", "set", "dev", iface.Device, "address", mac).CombinedOutput()
+		if err != nil {
+			// Inte ett hårt fel: kortet fungerar med sin brända adress, och
+			// att fälla hela appliceringen (och därmed brandväggsreglerna)
+			// för att en MAC-kloning nekades vore oproportionerligt. Vissa
+			// virtuella kort tillåter helt enkelt inte ändringen.
+			log.Printf("[NÄTVERK] kunde inte sätta MAC %s på %s: %v - %s", mac, iface.Device, err, strings.TrimSpace(string(out)))
+		} else {
+			log.Printf("[NÄTVERK] %s använder manuellt satt MAC-adress %s", iface.Device, mac)
+		}
+	}
+	if iface.MTU > 0 {
+		_ = exec.CommandContext(ctx, "ip", "link", "set", "dev", iface.Device, "mtu", strconv.Itoa(iface.MTU)).Run()
+	}
+
+	// 3. Sätt interface UP eller DOWN
 	state := "up"
 	if !iface.Enabled {
 		state = "down"
@@ -174,7 +199,7 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 	cmdState := exec.CommandContext(ctx, "ip", "link", "set", iface.Device, state)
 	_ = cmdState.Run()
 
-	// 3. Om statisk IPv4 är angiven, tilldela IP-adressen
+	// 4. Om statisk IPv4 är angiven, tilldela IP-adressen
 	if iface.Enabled && iface.AddressType == "static" && iface.IPv4 != "" {
 		// Flush gamla adresser först för att undvika konflikter
 		_ = exec.CommandContext(ctx, "ip", "addr", "flush", "dev", iface.Device).Run()
@@ -250,6 +275,21 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 // är permanent. Vi kan inte använda `ip addr flush` här eftersom den tar
 // bort ÄVEN den aktiva leasen och lämnar kortet utan adress tills dhclient
 // svarat — det skulle koppla ner administratören mitt i en applicering.
+// macAlreadySet undviker att i onödan ta ner kortet vid varje applicering.
+// Utan kontrollen hade varenda "Applicera" — även en som bara rör en
+// policyrad — kort brutit länken på ett kort med klonad MAC.
+func macAlreadySet(device, want string) bool {
+	iface, err := net.InterfaceByName(device)
+	if err != nil {
+		return false
+	}
+	wantHW, err := net.ParseMAC(want)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(iface.HardwareAddr, wantHW)
+}
+
 func removeStaticAddresses(ctx context.Context, device string) {
 	out, err := exec.CommandContext(ctx, "ip", "-4", "-o", "addr", "show", "dev", device).Output()
 	if err != nil {
