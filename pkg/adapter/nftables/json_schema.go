@@ -28,11 +28,11 @@ type Table struct {
 }
 
 type Chain struct {
-	Family string `json:"family"`             // "inet"
-	Table  string `json:"table"`               // "security_harbor"
-	Name   string `json:"name"`                 // "input", "forward", "output", "prerouting", "postrouting"
-	Type   string `json:"type,omitempty"`       // "filter", "nat"
-	Hook   string `json:"hook,omitempty"`       // "input", "forward", "output", "prerouting", "postrouting"
+	Family string `json:"family"`         // "inet"
+	Table  string `json:"table"`          // "security_harbor"
+	Name   string `json:"name"`           // "input", "forward", "output", "prerouting", "postrouting"
+	Type   string `json:"type,omitempty"` // "filter", "nat"
+	Hook   string `json:"hook,omitempty"` // "input", "forward", "output", "prerouting", "postrouting"
 	// Prio SAKNAR omitempty MED FLIT. Standardprioriteten för ett filter-hook
 	// (input/forward/output) är 0, vilket är Go-nollvärdet för int — med
 	// omitempty försvann "prio"-fältet helt ur JSON:en för dessa kedjor, och
@@ -48,10 +48,10 @@ type Chain struct {
 }
 
 type Rule struct {
-	Family string        `json:"family"`
-	Table  string        `json:"table"`
-	Chain  string        `json:"chain"`
-	Expr   []interface{} `json:"expr"`
-	Handle int           `json:"handle,omitempty"`
-	Comment string       `json:"comment,omitempty"`
+	Family  string        `json:"family"`
+	Table   string        `json:"table"`
+	Chain   string        `json:"chain"`
+	Expr    []interface{} `json:"expr"`
+	Handle  int           `json:"handle,omitempty"`
+	Comment string        `json:"comment,omitempty"`
 }
