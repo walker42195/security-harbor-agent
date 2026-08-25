@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
@@ -162,14 +163,14 @@ func GenerateBlocklistConfig(domains []string, cfg *config.Config) string {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "server:\n")
 	for domain := range blocked {
-		if domain == "" {
+		if !validDomain(domain) {
 			continue
 		}
 		fmt.Fprintf(&b, "    local-zone: \"%s.\" always_nxdomain\n", domain)
 	}
 	for _, d := range cfg.DNS.CustomAllowedDomains {
 		domain := normalizeDomain(d)
-		if domain == "" {
+		if !validDomain(domain) {
 			continue
 		}
 		fmt.Fprintf(&b, "    local-zone: \"%s.\" transparent\n", domain)
@@ -207,9 +208,18 @@ func GenerateHostsConfig(leases []dhcp.Lease, cfg *config.Config) string {
 		if hostname == "" || ip == "" {
 			return
 		}
+		// Värdnamnet kan komma från en DHCP-lease, dvs. sättas av vilken
+		// enhet som helst på nätet — och IP:t skrivs in i samma citerade
+		// sträng. Båda måste valideras (se validDomain).
+		if !validDomain(hostname) || net.ParseIP(ip) == nil {
+			return
+		}
 		fqdn := hostname
 		if appendSuffix && suffix != "" && !strings.HasSuffix(hostname, "."+suffix) && hostname != suffix {
 			fqdn = hostname + "." + suffix
+		}
+		if !validDomain(fqdn) {
+			return
 		}
 		fmt.Fprintf(&b, "    local-data: \"%s. IN A %s\"\n", fqdn, ip)
 		fmt.Fprintf(&b, "    local-data-ptr: \"%s %s.\"\n", ip, fqdn)
@@ -225,6 +235,31 @@ func GenerateHostsConfig(leases []dhcp.Lease, cfg *config.Config) string {
 	}
 
 	return b.String()
+}
+
+// safeDomainPattern är en ALLOWLIST för allt som skrivs in i Unbounds
+// konfiguration som ett domännamn (local-zone/local-data). Bara tecken som
+// faktiskt får förekomma i ett värdnamn — inga citattecken, blanksteg eller
+// radbrytningar.
+//
+// Kodgranskning 2026-08-25: normalizeDomain gjorde bara ToLower + trim, och
+// värdet skrevs in i en CITERAD sträng: `local-zone: "%s." ...`. Ett
+// citattecken bröt alltså ut ur strängen. Två källor är angriparnära:
+// domäner ur en blocklista som HÄMTAS FRÅN EN URL, och — värre — värdnamn
+// ur DHCP-leaser, som vilken enhet som helst på nätet sätter själv (DHCP
+// option 12). Ovaliderad indata från nätet skrevs alltså in i
+// konfigurationen för en tjänst som startas av root.
+var safeDomainPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`)
+
+// validDomain avgör om ett normaliserat domän-/värdnamn är säkert att
+// skriva in i konfigurationen. Ogiltiga poster hoppas över tyst (en enda
+// trasig rad i en blocklista med tiotusentals poster ska inte slå ut hela
+// DNS-konfigurationen).
+func validDomain(d string) bool {
+	if d == "" || len(d) > 253 {
+		return false
+	}
+	return safeDomainPattern.MatchString(d)
 }
 
 func normalizeDomain(d string) string {

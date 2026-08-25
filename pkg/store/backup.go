@@ -37,6 +37,26 @@ var backupFiles = []string{
 	"openvpn_server.key.enc",
 }
 
+// minBackupPassphrase är minsta längd på lösenfrasen till en backup.
+const minBackupPassphrase = 12
+
+// maxRestoreFileBytes är taket per fil vid återställning. Skyddar mot en
+// "gzip-bomb": arkivet packas upp i minnet, och utan tak kan en liten
+// backup-fil expandera till godtyckligt mycket RAM.
+const maxRestoreFileBytes = 16 << 20 // 16 MiB per fil, med god marginal
+
+// isBackupFileName avgör om ett filnamn ur ett tar-arkiv är en av de filer
+// en backup faktiskt får innehålla. Jämförelsen är exakt — inga sökvägar,
+// inga separatorer, inget "..".
+func isBackupFileName(name string) bool {
+	for _, f := range backupFiles {
+		if name == f {
+			return true
+		}
+	}
+	return false
+}
+
 // encryptedBackupFile avgör om en fil i backupFiles är krypterad på disk
 // (allt utom *.json) och därför ska dekrypteras innan den läggs i arkivet
 // / krypteras om efter att den packats upp.
@@ -64,6 +84,15 @@ func deriveBackupKey(passphrase string, salt []byte) ([]byte, error) {
 // backup ska spegla vad som FAKTISKT finns, inte kräva att allt är
 // konfigurerat.
 func (s *Store) Backup(passphrase string) ([]byte, error) {
+	// Backupen innehåller ALLA nycklar och certifikat i klartext inuti det
+	// krypterade arkivet — lösenfrasen är det enda som skyddar dem, och
+	// filen hamnar typiskt utanför brandväggen (urklipp, molnlagring).
+	// scrypt gör offline-knäckning dyrt, men inte mot en fyra teckens fras
+	// (kodgranskning 2026-08-25).
+	if len(passphrase) < minBackupPassphrase {
+		return nil, fmt.Errorf("lösenfrasen måste vara minst %d tecken — den är det enda som skyddar nycklarna i backupen", minBackupPassphrase)
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -200,7 +229,25 @@ func (s *Store) Restore(data []byte, passphrase string) error {
 		if err != nil {
 			return fmt.Errorf("korrupt backup-arkiv: %w", err)
 		}
-		content, err := io.ReadAll(tr)
+		// Filnamnet i arkivet är ANGRIPARKONTROLLERAT — en backup-fil är
+		// bara en blob som klistras in i GUI:t, och den som skapade den
+		// väljer själv lösenfrasen. Utan den här kontrollen användes
+		// hdr.Name direkt i filepath.Join(baseDir, ...) nedan, vilket
+		// släppte igenom "../../etc/rsyslog.d/x.conf" och gav skrivning
+		// utanför datakatalogen — inom agentens ReadWritePaths finns bl.a.
+		// /etc/rsyslog.d, där en omprog-konfiguration ger kodexekvering som
+		// root (upptäckt vid kodgranskning 2026-08-25, klassisk "Zip-Slip").
+		//
+		// Backupen innehåller per definition bara filerna i backupFiles, så
+		// allowlistan är den snävaste möjliga kontrollen: allt annat avvisas
+		// hellre än saneras.
+		if !isBackupFileName(hdr.Name) {
+			return fmt.Errorf("backup-arkivet innehåller en oväntad fil (%q) — avbryter återställningen", hdr.Name)
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			return fmt.Errorf("backup-arkivet innehåller en post som inte är en vanlig fil (%q)", hdr.Name)
+		}
+		content, err := io.ReadAll(io.LimitReader(tr, maxRestoreFileBytes))
 		if err != nil {
 			return fmt.Errorf("korrupt backup-arkiv: %w", err)
 		}

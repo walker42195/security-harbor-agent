@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -640,6 +641,17 @@ func validatePolicies(cfg *config.Config) error {
 			return err
 		}
 
+		// 4b. Schemat (Fas 7 — tidsstyrda regler) måste vara komplett och
+		// välformat. Utan den här kontrollen kunde ett AKTIVERAT schema utan
+		// dagar och utan kompletta tider rendera regeln helt utan
+		// tidsbegränsning (dygnet runt) — se scheduleMatchExpr i
+		// pkg/adapter/nftables. Ogiltiga dag-/tidssträngar gick dessutom rakt
+		// in i nft-JSON och fick HELA ruleset-applyn att failas med ett
+		// obegripligt lågnivåfel.
+		if err := validatePolicySchedule(pol); err != nil {
+			return err
+		}
+
 		// 5. DNAT-parametrar måste vara kompletta och rimliga — annars
 		// genereras en trasig prerouting-regel som nft avvisar med ett
 		// lågnivåfel långt från orsaken.
@@ -676,6 +688,48 @@ func validatePolicyService(cfg *config.Config, pol config.Policy) error {
 	return fmt.Errorf(
 		"policy %q: tjänsten/porten %q går inte att tolka (använd t.ex. \"443\", \"TCP:443\", \"UDP:53\", \"TCP:8000-8100\", \"ICMP\", \"ANY\", eller en kommaseparerad lista som \"80,443,TCP:8000-8100,UDP:53\" — varje del utan eget tcp:/udp:-prefix ärver protokollet från föregående del, eller tcp om inget angetts alls)",
 		pol.Name, pol.Service)
+}
+
+// scheduleDayNames är de exakta dagsträngar nftables `meta day` accepterar
+// (och som GUI:t skickar). Allt annat avvisas hellre än skickas vidare till
+// nft.
+var scheduleDayNames = map[string]bool{
+	"Monday": true, "Tuesday": true, "Wednesday": true, "Thursday": true,
+	"Friday": true, "Saturday": true, "Sunday": true,
+}
+
+// scheduleTimePattern: HH:MM (24-timmars), valfritt med sekunder.
+var scheduleTimePattern = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$`)
+
+// validatePolicySchedule kontrollerar att ett aktiverat schema faktiskt
+// begränsar regeln i tid, och att dag-/tidsvärdena är sådana nftables
+// förstår. Se kommentaren vid anropsstället för vad som gick fel utan den.
+func validatePolicySchedule(pol config.Policy) error {
+	sched := pol.Schedule
+	if sched == nil || !sched.Enabled {
+		return nil
+	}
+	hasDays := len(sched.Days) > 0
+	hasTimes := sched.StartTime != "" && sched.EndTime != ""
+	if !hasDays && !hasTimes {
+		return fmt.Errorf(
+			"policy %q: schemat är aktiverat men saknar både veckodagar och start-/sluttid — välj minst en dag eller ett komplett tidsintervall (regeln skulle annars gälla dygnet runt, tvärtemot avsikten)",
+			pol.Name)
+	}
+	if (sched.StartTime == "") != (sched.EndTime == "") {
+		return fmt.Errorf("policy %q: schemat har bara en av start-/sluttid angiven — ange båda eller ingen", pol.Name)
+	}
+	for _, d := range sched.Days {
+		if !scheduleDayNames[d] {
+			return fmt.Errorf("policy %q: okänd veckodag %q i schemat", pol.Name, d)
+		}
+	}
+	for label, t := range map[string]string{"starttid": sched.StartTime, "sluttid": sched.EndTime} {
+		if t != "" && !scheduleTimePattern.MatchString(t) {
+			return fmt.Errorf("policy %q: %s %q är inte ett giltigt klockslag (använd HH:MM, t.ex. 08:00)", pol.Name, label, t)
+		}
+	}
+	return nil
 }
 
 // validatePolicyNAT kontrollerar att en DNAT-policy har de fält som
@@ -977,9 +1031,21 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 		e.confirmTimer.Stop()
 	}
 
+	// Klampas till ett rimligt intervall. Tidigare defaultades BARA värdet 0
+	// till 30 s — ett NEGATIVT värde gav en negativ duration till
+	// time.AfterFunc, som då utlöser omedelbart och rullar tillbaka varje
+	// Apply direkt (kodgranskning 2026-08-25). Ett orimligt stort värde gör
+	// tvärtom skyddsnätet meningslöst.
 	timeout := time.Duration(candidate.Settings.RollbackTimeoutSec) * time.Second
-	if timeout == 0 {
+	const minRollbackTimeout, maxRollbackTimeout = 10 * time.Second, 10 * time.Minute
+	if timeout <= 0 {
 		timeout = 30 * time.Second
+	}
+	if timeout < minRollbackTimeout {
+		timeout = minRollbackTimeout
+	}
+	if timeout > maxRollbackTimeout {
+		timeout = maxRollbackTimeout
 	}
 
 	// Starta automatisk rollback timer ifall confirmation uteblir
@@ -1433,6 +1499,19 @@ func (e *Engine) AdminResetPassword(userID, newPassword string) error {
 
 func (e *Engine) FindUserByUsername(username string) (*store.PublicUser, error) {
 	return e.store.Users.FindByUsername(username)
+}
+
+// UsernameByID slår upp användarnamnet för ett konto-ID. Behövs av
+// API-lagret för att kunna ogiltigförklara ett kontos aktiva sessioner vid
+// radering/lösenordsåterställning, där bara ID:t skickas in. Tom sträng om
+// kontot inte finns.
+func (e *Engine) UsernameByID(id string) string {
+	for _, u := range e.store.Users.ListUsers() {
+		if u.ID == id {
+			return u.Username
+		}
+	}
+	return ""
 }
 
 // setIPForwarding slår på/av kärnans IPv4-forwarding via /proc/sys.

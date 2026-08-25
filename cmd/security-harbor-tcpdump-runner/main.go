@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -33,6 +35,33 @@ type result struct {
 	Output string `json:"output"`
 }
 
+// ifacePattern/filterPattern är allowlists — inget som kan tolkas som en
+// tcpdump-flagga får passera (se validateArg/validateFilter).
+var (
+	ifacePattern  = regexp.MustCompile(`^[A-Za-z0-9._@-]+$`)
+	filterPattern = regexp.MustCompile(`^[A-Za-z0-9 ._:/()\[\]<>=!&|+*]*$`)
+)
+
+func validateArg(iface string) error {
+	if strings.HasPrefix(iface, "-") || !ifacePattern.MatchString(iface) || len(iface) > 64 {
+		return fmt.Errorf("otillåtet värde")
+	}
+	return nil
+}
+
+func validateFilter(filter string) error {
+	if filter == "" {
+		return nil
+	}
+	if len(filter) > 512 {
+		return fmt.Errorf("för långt")
+	}
+	if strings.HasPrefix(strings.TrimSpace(filter), "-") || !filterPattern.MatchString(filter) {
+		return fmt.Errorf("otillåtna tecken")
+	}
+	return nil
+}
+
 func main() {
 	data, err := os.ReadFile(requestPath)
 	if err != nil {
@@ -47,6 +76,20 @@ func main() {
 	}
 	if req.Interface == "" {
 		writeResult("tcpdump-runner: inget gränssnitt angivet")
+		return
+	}
+	// Runnern kör som ROOT och får därför ALDRIG lita på request-filen, även
+	// om den bara kan skrivas av tjänstekontot. tcpdump tolkar argument som
+	// börjar med "-" som flaggor (getopt tillåter sammanskriven form), så ett
+	// enda ovaliderat argument — t.ex. "-w/etc/rsyslog.d/x.conf" — räcker för
+	// godtycklig filskrivning som root. API-lagret validerar redan
+	// (validateBPFFilter i pkg/api/server.go); detta är den andra spärren.
+	if err := validateArg(req.Interface); err != nil {
+		writeResult(fmt.Sprintf("tcpdump-runner: ogiltigt gränssnitt: %v", err))
+		return
+	}
+	if err := validateFilter(req.Filter); err != nil {
+		writeResult(fmt.Sprintf("tcpdump-runner: ogiltigt filter: %v", err))
 		return
 	}
 

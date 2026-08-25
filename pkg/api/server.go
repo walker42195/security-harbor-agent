@@ -85,6 +85,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/dhcp/leases", s.authMiddleware(s.handleDHCPLeases))
 	mux.HandleFunc("/api/v1/config/running", s.authMiddleware(s.handleGetRunningConfig))
 	mux.HandleFunc("/api/v1/auth/change-password", s.authMiddleware(s.handleChangePassword))
+	mux.HandleFunc("/api/v1/auth/logout", s.authMiddleware(s.handleLogout))
 
 	// Skyddade endpoints — kräver admin-roll: allt som ändrar konfig,
 	// exekverar kommandon (ping/traceroute kan användas för intern
@@ -131,7 +132,7 @@ func (s *Server) Start() error {
 
 	// managementACLMiddleware och securityHeadersMiddleware omsluter HELA
 	// mux:en, så web-UI:t skyddas/får samma huvuden som Management-API:t.
-	handler := s.managementACLMiddleware(securityHeadersMiddleware(mux))
+	handler := s.managementACLMiddleware(securityHeadersMiddleware(bodyLimitMiddleware(mux)))
 
 	s.srv = &http.Server{
 		Addr:    s.bindAddr,
@@ -262,6 +263,26 @@ func (s *Server) managementACLMiddleware(next http.Handler) http.Handler {
 // specifika, avgränsade CSP3-nyckeln för att kompilera WASM alls —
 // 'wasm-unsafe-eval' tillåter BARA WebAssembly-kompilering, inte
 // godtycklig eval()/Function() av vanlig JS som 'unsafe-eval' hade gjort.
+// maxRequestBodyBytes är taket för en request-body. Konfigurationen
+// (candidate.json med hot-listor upplösta) och en inklistrad backup är de
+// största legitima bodies, därav en generös men ändå ändlig gräns.
+const maxRequestBodyBytes = 32 << 20 // 32 MiB
+
+// bodyLimitMiddleware sätter ett tak på hur mycket en klient kan skicka.
+//
+// Kodgranskning 2026-08-25: ingen handler använde http.MaxBytesReader, så
+// varje json.Decode läste obegränsat. Mest relevant för /api/v1/auth/login,
+// som är OAUTENTISERAD — 30 sekunders ReadTimeout räcker för att skicka
+// mycket data på ett LAN och tvinga fram allokeringar.
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -373,6 +394,23 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Felaktigt användarnamn eller lösenord", http.StatusUnauthorized)
 }
 
+// handleLogout ogiltigförklarar den token anropet gjordes med, på SERVERN.
+//
+// Kodgranskning 2026-08-25: tidigare fanns ingen sådan endpoint alls —
+// "Logga ut" i GUI:t rensade bara klientens minne, medan sessionen levde
+// vidare i upp till 24 timmar. En token som läckt (delad dator, kopierad
+// localStorage) gick alltså inte att återkalla.
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	s.auth.DeleteSession(token)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
 // handleChangePassword byter LOSENORDET FÖR DEN INLOGGADE ANVÄNDAREN
 // SJÄLV — kräver att nuvarande lösenord anges (se Engine.ChangeOwnPassword).
 // Tillgänglig för alla roller (både admin och viewer får byta sitt eget
@@ -401,6 +439,12 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Ett lösenordsbyte ska ogiltigförklara ALLA andra sessioner för kontot —
+	// annars gör "byt lösenord efter intrång" ingen nytta mot någon som redan
+	// har en giltig token. Den token anropet gjordes med behålls, så
+	// administratören inte loggas ut av sitt eget byte.
+	currentToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	s.auth.DeleteSessionsForUserExcept(user.Username, currentToken)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -447,9 +491,19 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id saknas", http.StatusBadRequest)
 		return
 	}
+	// Slå upp namnet FÖRE raderingen — efteråt går kontot inte att hitta.
+	username := s.engine.UsernameByID(req.ID)
 	if err := s.engine.DeleteUser(req.ID); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	// Ett raderat konto måste förlora sina aktiva sessioner direkt. Utan
+	// detta fortsatte en raderad användares token att fungera i upp till 24
+	// timmar (kodgranskning 2026-08-25).
+	if username != "" {
+		if n := s.auth.DeleteSessionsForUser(username); n > 0 {
+			log.Printf("[AUTH] raderade %d aktiv(a) session(er) för borttagen användare %q", n, username)
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -473,6 +527,14 @@ func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request)
 	if err := s.engine.AdminResetPassword(req.ID, req.NewPassword); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	// En admin som återställer någons lösenord gör det typiskt EFTER en
+	// misstänkt kapning — då måste kontots befintliga sessioner dö, annars
+	// sitter angriparen kvar med sin token (kodgranskning 2026-08-25).
+	if username := s.engine.UsernameByID(req.ID); username != "" {
+		if n := s.auth.DeleteSessionsForUser(username); n > 0 {
+			log.Printf("[AUTH] raderade %d aktiv(a) session(er) efter lösenordsåterställning för %q", n, username)
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
@@ -593,6 +655,19 @@ func (s *Server) handleUpdateDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if m.Firewall == nil {
 		http.Error(w, "manifestet saknar en firewall-bunt", http.StatusBadGateway)
+		return
+	}
+	// Nedgraderingsskydd: tarbollen är signerad, men MANIFESTET är det inte.
+	// Den som kontrollerar manifest-URL:en (t.ex. ett kapat GitHub-konto)
+	// kan därför inte förfalska en bunt — men väl peka ut en ÄLDRE, korrekt
+	// signerad version med kända sårbarheter. Vägra staga något som inte är
+	// nyare än det som redan kör (kodgranskning 2026-08-25). Rollback till
+	// en tidigare version görs medvetet via /system/versions/rollback, som
+	// bara använder lokalt arkiverade versioner.
+	if m.Firewall.Version != s.version && !updater.IsNewer(m.Firewall.Version, s.version) {
+		http.Error(w, fmt.Sprintf(
+			"vägrar ladda ner version %s — den är inte nyare än den installerade (%s). Använd Tidigare versioner för att gå tillbaka.",
+			m.Firewall.Version, s.version), http.StatusBadRequest)
 		return
 	}
 	if err := updater.DownloadAndStage(ctx, m.Firewall); err != nil {
@@ -1242,6 +1317,33 @@ func runNmapViaHelperService(ctx context.Context, args []string) (string, error)
 // hela fångsten körs klart och returneras som textutdata i ett svar, precis
 // som nmap redan hanterar flera minuter långa skanningar. Taket på 12
 // sekunder håller sig inom serverns globala WriteTimeout (se Start()).
+// bpfFilterPattern är en ALLOWLIST för tcpdump-filteruttryck: de tecken en
+// riktig BPF-primitiv behöver (bokstäver, siffror, blanksteg, punkt, kolon,
+// snedstreck för CIDR, parenteser, jämförelseoperatorer och hakparenteser
+// för byte-offsets). Notera att "-" INTE ingår — ett filter kan aldrig
+// börja likna en tcpdump-flagga.
+var bpfFilterPattern = regexp.MustCompile(`^[A-Za-z0-9 ._:/()\[\]<>=!&|+*]*$`)
+
+// validateBPFFilter avvisar allt som inte är ett rimligt BPF-uttryck. Delas
+// medvetet inte med diagnosticHostPattern: den tillåter inledande tecken som
+// vore olämpliga här, och ett BPF-filter behöver blanksteg och parenteser
+// som ett värdnamn inte får ha.
+func validateBPFFilter(filter string) error {
+	if filter == "" {
+		return nil
+	}
+	if len(filter) > 512 {
+		return fmt.Errorf("filtret är för långt (max 512 tecken)")
+	}
+	if strings.HasPrefix(strings.TrimSpace(filter), "-") {
+		return fmt.Errorf("ogiltigt filter: får inte börja med \"-\"")
+	}
+	if !bpfFilterPattern.MatchString(filter) {
+		return fmt.Errorf("ogiltigt filter: endast BPF-uttryck tillåts (t.ex. \"port 443\", \"host 10.0.0.5 and tcp\")")
+	}
+	return nil
+}
+
 func (s *Server) handleTcpdumpCapture(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Interface   string `json:"interface"`
@@ -1269,6 +1371,18 @@ func (s *Server) handleTcpdumpCapture(w http.ResponseWriter, r *http.Request) {
 	}
 	if !valid {
 		http.Error(w, "Okänt eller ej konfigurerat gränssnitt", http.StatusBadRequest)
+		return
+	}
+
+	// BPF-filtret skickas vidare till en tcpdump som körs som ROOT i
+	// hjälptjänsten. Det går aldrig via ett skal, men tcpdump tolkar ett
+	// argument som börjar med "-" som en FLAGGA — och getopt tillåter
+	// sammanskriven form, så ett enda argument som "-w/etc/rsyslog.d/x.conf"
+	// räcker för att skriva en godtycklig fil som root och därmed kringgå
+	// hela privilegieseparationen (upptäckt vid kodgranskning 2026-08-25).
+	// Validera därför strikt här, och en gång till i runnern.
+	if err := validateBPFFilter(req.Filter); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

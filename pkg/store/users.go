@@ -131,8 +131,18 @@ func (us *UserStore) VerifyCredentials(username, password string) (*PublicUser, 
 		pub := u.ToPublic()
 		return &pub, nil
 	}
+	// Okänt användarnamn: kör ändå en bcrypt-jämförelse mot en dummy-hash så
+	// svarstiden liknar den för ett känt namn med fel lösenord. Utan detta
+	// returnerade funktionen direkt, vilket gav en mätbar tidsskillnad och
+	// därmed en orakel för användarnamnsuppräkning — API:ts felmeddelande är
+	// generiskt, men klockan skvallrade (kodgranskning 2026-08-25).
+	_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
 	return nil, fmt.Errorf("okänt användarnamn")
 }
+
+// dummyBcryptHash är en giltig bcrypt-hash (av en slumpsträng) med samma
+// kostnad som riktiga hashar, enbart till för tidsutjämningen ovan.
+var dummyBcryptHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
 
 // ListUsers returnerar alla användare utan lösenordshashar.
 func (us *UserStore) ListUsers() []PublicUser {
@@ -146,13 +156,30 @@ func (us *UserStore) ListUsers() []PublicUser {
 	return out
 }
 
+// maxPasswordBytes: bcrypt läser bara de första 72 byten och trunkerar
+// TYST resten. En användare som satt en lång lösenfras får då inte den
+// entropi de tror (kodgranskning 2026-08-25) — avvisa hellre uttryckligen.
+const maxPasswordBytes = 72
+
+// validatePasswordPolicy delas av CreateUser och ChangePassword så kraven
+// inte kan glida isär mellan de två vägarna.
+func validatePasswordPolicy(password string) error {
+	if len(password) < 8 {
+		return fmt.Errorf("lösenordet måste vara minst 8 tecken")
+	}
+	if len(password) > maxPasswordBytes {
+		return fmt.Errorf("lösenordet får vara högst %d byte (bcrypt trunkerar längre lösenord tyst)", maxPasswordBytes)
+	}
+	return nil
+}
+
 // CreateUser lägger till en ny administrationsanvändare.
 func (us *UserStore) CreateUser(username, password string, role Role) (*PublicUser, error) {
 	if strings.TrimSpace(username) == "" {
 		return nil, fmt.Errorf("användarnamn saknas")
 	}
-	if len(password) < 8 {
-		return nil, fmt.Errorf("lösenordet måste vara minst 8 tecken")
+	if err := validatePasswordPolicy(password); err != nil {
+		return nil, err
 	}
 	if role != RoleAdmin && role != RoleViewer {
 		return nil, fmt.Errorf("ogiltig roll %q", role)
@@ -222,8 +249,8 @@ func (us *UserStore) DeleteUser(id string) error {
 
 // ChangePassword byter lösenord för en given användare (matchad på ID).
 func (us *UserStore) ChangePassword(id, newPassword string) error {
-	if len(newPassword) < 8 {
-		return fmt.Errorf("lösenordet måste vara minst 8 tecken")
+	if err := validatePasswordPolicy(newPassword); err != nil {
+		return err
 	}
 
 	us.mu.Lock()

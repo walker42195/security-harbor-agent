@@ -27,6 +27,20 @@ archive_current_version() {
 
   local versions_dir="$DATA_DIR/versions"
   local target="$versions_dir/$old_version"
+
+  # En arkiverad version är ~65 MB (binärer + webb-GUI). Att fylla disken
+  # mitt i en uppgradering vore betydligt värre än att hoppa över
+  # arkiveringen, så kontrollera utrymmet först och varna hellre än att
+  # riskera det (kodgranskning 2026-08-25).
+  local needed_kb=200000 # ~200 MB marginal
+  local avail_kb
+  avail_kb="$(df -Pk "$DATA_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$needed_kb" ]; then
+    echo "VARNING: bara $((avail_kb / 1024)) MB ledigt i $DATA_DIR — hoppar över arkiveringen av $old_version." >&2
+    echo "         (Rollback till den versionen blir därmed inte möjlig. Frigör utrymme och kör om.)" >&2
+    return 0
+  fi
+
   echo "-> Arkiverar utgående version $old_version till $target"
 
   install -d -m 0755 "$target/systemd"
@@ -50,11 +64,20 @@ archive_current_version() {
       cp -a "$DATA_DIR/webui/." "$target/webui/"
     fi
   fi
+  # OBS: `[ -f "$f" ] && cp ...` som SISTA sats i loopkroppen gör att loopen
+  # (och därmed funktionen) returnerar 1 när globben inte matchar något —
+  # install.sh kör med `set -e` och skulle då AVBRYTAS mitt i uppgraderingen,
+  # innan de nya binärerna installerats (kodgranskning 2026-08-25). Använd
+  # därför `if`-satser, som alltid returnerar 0.
   for f in /etc/systemd/system/security-harbor-*.service /etc/systemd/system/security-harbor-*.timer; do
-    [ -f "$f" ] && cp -a "$f" "$target/systemd/"
+    if [ -f "$f" ]; then
+      cp -a "$f" "$target/systemd/"
+    fi
   done
   for f in /etc/polkit-1/rules.d/10-security-harbor-*.rules; do
-    [ -f "$f" ] && cp -a "$f" "$target/systemd/"
+    if [ -f "$f" ]; then
+      cp -a "$f" "$target/systemd/"
+    fi
   done
 
   local size_bytes

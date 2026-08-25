@@ -73,7 +73,7 @@ func TestRestoreWrongPassphraseFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
-	backup, err := s.Backup("ratt-fras")
+	backup, err := s.Backup("ratt-losenfrasen")
 	if err != nil {
 		t.Fatalf("Backup misslyckades: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestRestoreWrongPassphraseFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
-	err = s2.Restore(backup, "fel-fras")
+	err = s2.Restore(backup, "fel-losenfrasen")
 	if err == nil {
 		t.Fatal("förväntade fel vid återställning med fel lösenfras, fick nil")
 	}

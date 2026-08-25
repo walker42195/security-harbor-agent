@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/walker42195/security-harbor-agent/pkg/config"
@@ -66,19 +67,40 @@ func sanitizeName(s string) string {
 	return b.String()
 }
 
+// safeSNIHostPattern är en ALLOWLIST för värdnamn som skrivs rakt in i
+// haproxy.cfg (`acl ... req.ssl_sni -i <namn>`).
+//
+// Kodgranskning 2026-08-25: värdnamnen validerades bara mot "inte tom", och
+// TrimSpace tar bara bort blanksteg i BÖRJAN och SLUTET — en radbrytning
+// mitt i strängen överlevde och injicerade godtyckliga HAProxy-direktiv i
+// den genererade konfigurationen.
+var safeSNIHostPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
+
+// validSNIHostname avgör om ett (redan gemener-omvandlat) värdnamn är säkert
+// att skriva in i konfigurationen. Wildcard-prefixet "*." hanteras av
+// anroparen och ingår inte här.
+func validSNIHostname(h string) bool {
+	return h != "" && len(h) <= 253 && safeSNIHostPattern.MatchString(h)
+}
+
 // splitHostnames delar upp en backends hostnamn i exakta namn och wildcard-
 // suffix. "*.exempel.se" blir suffixet ".exempel.se" (matchas med HAProxys
-// `-m end`), medan "app.exempel.se" är ett exakt namn (`-i`).
+// `-m end`), medan "app.exempel.se" är ett exakt namn (`-i`). Namn som inte
+// klarar validSNIHostname hoppas över.
 func splitHostnames(hostnames []string) (exact, suffixes []string) {
 	for _, h := range hostnames {
-		h = strings.TrimSpace(h)
+		h = strings.ToLower(strings.TrimSpace(h))
 		if h == "" {
 			continue
 		}
-		if strings.HasPrefix(h, "*.") {
-			suffixes = append(suffixes, strings.ToLower(h[1:])) // "*.x.se" -> ".x.se"
-		} else {
-			exact = append(exact, strings.ToLower(h))
+		if bare, isWildcard := strings.CutPrefix(h, "*."); isWildcard {
+			if validSNIHostname(bare) {
+				suffixes = append(suffixes, "."+bare) // "*.x.se" -> ".x.se"
+			}
+			continue
+		}
+		if validSNIHostname(h) {
+			exact = append(exact, h)
 		}
 	}
 	return exact, suffixes

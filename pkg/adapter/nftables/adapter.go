@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -230,11 +231,25 @@ func serviceMatchExpr(service string) (expr []interface{}, ok bool) {
 // bitmask/array), och `meta hour` matchas med en "range" av "HH:MM"-
 // strängar. Returnerar nil om schemat är ospecificerat/inaktiverat
 // (policyn gäller då alltid, som tidigare).
-func scheduleMatchExpr(sched *config.PolicySchedule) []interface{} {
+// scheduleMatchExpr returnerar (uttryck, ok). ok=false betyder att schemat
+// är AKTIVERAT men saknar allt som skulle kunna begränsa regeln i tid —
+// anroparen måste då hoppa över regeln helt.
+//
+// Kodgranskning 2026-08-25: funktionen returnerade tidigare bara ett
+// (möjligen tomt) uttryck. Ett aktiverat schema utan dagar OCH utan
+// kompletta tider gav då nil, vilket renderade regeln HELT UTAN
+// tidsbegränsning — den gällde dygnet runt. För en Allow-policy är det en
+// tyst utvidgning av precis den begränsning administratören trodde sig ha
+// satt (och läget går att nå från GUI:t genom att avmarkera alla dagar).
+// Nu failar det stängt, och validatePolicySchedule i pkg/engine avvisar
+// dessutom kombinationen redan vid Apply med ett begripligt felmeddelande.
+func scheduleMatchExpr(sched *config.PolicySchedule) (expr []interface{}, ok bool) {
 	if sched == nil || !sched.Enabled {
-		return nil
+		return nil, true
 	}
-	var expr []interface{}
+	if len(sched.Days) == 0 && (sched.StartTime == "" || sched.EndTime == "") {
+		return nil, false
+	}
 	if len(sched.Days) > 0 {
 		expr = append(expr, map[string]interface{}{
 			"match": map[string]interface{}{
@@ -253,7 +268,7 @@ func scheduleMatchExpr(sched *config.PolicySchedule) []interface{} {
 			},
 		})
 	}
-	return expr
+	return expr, true
 }
 
 // resolveServiceMatchExprSets slår upp en Policy.Service-referens och
@@ -515,6 +530,32 @@ func zoneMatchExpr(cfg *config.Config, zoneSpec, metaKey string, wanDevices, lan
 // (dnat/snat/masquerade hanteras i NAT-kedjorna) — anroparen ska då hoppa
 // över regeln istället för att generera en regel utan verdikt (som skulle
 // bli en ren "räkna och fortsätt"-regel, inte det användaren bad om).
+// primaryWANAddress plockar ut den konfigurerade IPv4-adressen (utan
+// CIDR-prefix) för det första aktiverade WAN-gränssnittet. Används bara för
+// NAT-reflektion (hairpin), där vi behöver veta brandväggens EXTERNA adress
+// för att kunna matcha internt initierad trafik mot den — se
+// prerouting-blocket i RenderJSON.
+//
+// Returnerar tom sträng om adressen inte går att fastställa (t.ex. ett
+// DHCP-WAN vars adress ännu inte skrivits tillbaka till konfigurationen).
+// Anroparen ska då hoppa över hairpin-regeln helt hellre än att generera en
+// regel utan adressvillkor.
+func primaryWANAddress(cfg *config.Config) string {
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled || iface.Zone != "WAN" || iface.IPv4 == "" {
+			continue
+		}
+		addr := iface.IPv4
+		if host, _, found := strings.Cut(addr, "/"); found {
+			addr = host
+		}
+		if net.ParseIP(strings.TrimSpace(addr)) != nil {
+			return strings.TrimSpace(addr)
+		}
+	}
+	return ""
+}
+
 func actionVerdictExpr(action config.PolicyAction) (verdict map[string]interface{}, logWord string, ok bool) {
 	switch action {
 	case config.ActionAccept:
@@ -817,6 +858,12 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		if !svcOK {
 			continue
 		}
+		// Ett aktiverat men tomt schema måste stoppa regeln, inte tyst göra
+		// den dygnet-runt-gällande — se scheduleMatchExpr.
+		schedExpr, schedOK := scheduleMatchExpr(pol.Schedule)
+		if !schedOK {
+			continue
+		}
 		for _, lanDev := range lanDevices {
 			for _, svcExpr := range svcSets {
 				rule := &Rule{
@@ -834,7 +881,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 						},
 					},
 				}
-				rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
+				rule.Expr = append(rule.Expr, schedExpr...)
 				rule.Expr = append(rule.Expr, svcExpr...)
 				rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
 				rule.Expr = append(rule.Expr, map[string]interface{}{"log": map[string]interface{}{"prefix": fmt.Sprintf("SH-%s-INPUT-%s: ", logWord, logSlug(pol.Name))}})
@@ -980,11 +1027,30 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				// om. Nu matchas protokoll + INTERN målport (porten efter
 				// DNAT-översättningen, eftersom prerouting redan skrivit om
 				// paketet när det når forward-kedjan).
+				//
+				// Kodgranskning 2026-08-25: KÄLLAN var fortfarande obegränsad
+				// efter den fixen — regeln accepterade trafik mot
+				// InternalIP:InternalPort oavsett vilket gränssnitt den kom
+				// in på, så en klient i en isolerad zon (IoT/gäst) nådde
+				// DNAT-målet förbi Default Deny mellan zoner. Att i stället
+				// låsa regeln till WAN-gränssnittet hade brutit
+				// NAT-reflektion (hairpin), där paketet kommer in på LAN.
+				// `ct status dnat` matchar exakt de paket prerouting-kedjan
+				// FAKTISKT översatte — alltså både äkta WAN-inkommande och
+				// hairpinnad trafik, men ingenting annat som råkar vara
+				// adresserat till samma IP och port.
 				dnatProto := "tcp"
 				if pol.NAT.Protocol != "" {
 					dnatProto = pol.NAT.Protocol
 				}
 				dnatExpr := []interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "in",
+							"left":  map[string]interface{}{"ct": map[string]interface{}{"key": "status"}},
+							"right": "dnat",
+						},
+					},
 					map[string]interface{}{
 						"match": map[string]interface{}{
 							"op":    "==",
@@ -1057,6 +1123,12 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			if !svcOK {
 				continue
 			}
+			// Aktiverat men tomt schema = hoppa över regeln (fail closed),
+			// se scheduleMatchExpr.
+			schedExpr, schedOK := scheduleMatchExpr(pol.Schedule)
+			if !schedOK {
+				continue
+			}
 
 			for _, svcExpr := range svcSets {
 				rule := &Rule{
@@ -1066,7 +1138,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					Comment: fmt.Sprintf("%s (%s)", pol.Name, pol.Service),
 				}
 
-				rule.Expr = append(rule.Expr, scheduleMatchExpr(pol.Schedule)...)
+				rule.Expr = append(rule.Expr, schedExpr...)
 				rule.Expr = append(rule.Expr, srcIfaceExpr...)
 				rule.Expr = append(rule.Expr, dstIfaceExpr...)
 				rule.Expr = append(rule.Expr, srcExpr...)
@@ -1096,48 +1168,118 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		})
 
 		// 4. NAT PREROUTING CHAIN (Port Forwarding / DNAT, samt 1:1 NAT — Fas 7)
+		//
+		// Kodgranskning 2026-08-25 (ALLVARLIG): regeln matchade tidigare BARA
+		// destinationsporten (plus ev. ExternalIP) — utan någon
+		// iifname-begränsning. Eftersom GUI:t aldrig sätter ExternalIP
+		// (dialogen har inget sådant fält) blev varje port forward skapad via
+		// gränssnittet en regel av formen "tcp dport 443 dnat to 10.0.0.5:443"
+		// i prerouting, UTAN gränssnittsvillkor. Det innebar att ALL trafik
+		// mot den porten — även LAN-klienters utgående HTTPS mot godtyckliga
+		// externa servrar — omdirigerades till den interna värden, och att
+		// isolerade zoner nådde DNAT-målet förbi Default Deny.
+		//
+		// Regeln delas därför i två uttryckliga fall:
+		//   a) Äkta inkommande: iifname == WAN-devices.
+		//   b) NAT-reflektion (hairpin): trafik från icke-WAN som är
+		//      adresserad till brandväggens EXTERNA adress. Kräver att vi
+		//      faktiskt vet den adressen (NAT.ExternalIP, annars WAN-kortets
+		//      konfigurerade IPv4). Går den inte att avgöra genereras ingen
+		//      hairpin-regel alls — hairpin slutar då fungera, vilket är rätt
+		//      felmod jämfört med att kapa all trafik på porten.
 		for _, pol := range cfg.Policies {
 			if pol.Enabled && pol.Action == config.ActionDNAT && pol.NAT != nil {
 				proto := "tcp"
 				if pol.NAT.Protocol != "" {
 					proto = pol.NAT.Protocol
 				}
-				expr := []interface{}{}
+				dnatVerdict := map[string]interface{}{
+					"dnat": map[string]interface{}{
+						"family": "ip",
+						"addr":   pol.NAT.InternalIP,
+						"port":   pol.NAT.InternalPort,
+					},
+				}
+				dportMatch := map[string]interface{}{
+					"match": map[string]interface{}{
+						"op":    "==",
+						"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
+						"right": pol.NAT.ExternalPort,
+					},
+				}
 				// 1:1 NAT (statisk NAT, Fas 7): om NAT.ExternalIP är satt gäller
 				// vidarebefordringen bara den specifika WAN-IP:n, inte alla
 				// IP:er på WAN-interfacet.
+				var extDaddrMatch map[string]interface{}
 				if pol.NAT.ExternalIP != "" {
-					expr = append(expr, map[string]interface{}{
+					extDaddrMatch = map[string]interface{}{
 						"match": map[string]interface{}{
 							"op":    "==",
 							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
 							"right": pol.NAT.ExternalIP,
 						},
+					}
+				}
+
+				// a) Äkta inkommande trafik på WAN.
+				if len(wanDevices) > 0 {
+					expr := []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": map[string]interface{}{"set": wanDevices},
+							},
+						},
+					}
+					if extDaddrMatch != nil {
+						expr = append(expr, extDaddrMatch)
+					}
+					expr = append(expr, dportMatch, dnatVerdict)
+					root.Nftables = append(root.Nftables, NFTElement{
+						Rule: &Rule{
+							Family:  a.family,
+							Table:   a.tableName,
+							Chain:   "prerouting",
+							Comment: fmt.Sprintf("Port Forwarding (DNAT): %s", pol.Name),
+							Expr:    expr,
+						},
 					})
 				}
-				expr = append(expr,
-					map[string]interface{}{
-						"match": map[string]interface{}{
-							"op":    "==",
-							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}},
-							"right": pol.NAT.ExternalPort,
-						},
-					},
-					map[string]interface{}{
-						"dnat": map[string]interface{}{
-							"family": "ip",
-							"addr":   pol.NAT.InternalIP,
-							"port":   pol.NAT.InternalPort,
-						},
-					},
-				)
+
+				// b) NAT-reflektion (hairpin) — bara om den externa adressen
+				// går att fastställa (se blockkommentaren ovan).
+				hairpinAddr := pol.NAT.ExternalIP
+				if hairpinAddr == "" {
+					hairpinAddr = primaryWANAddress(cfg)
+				}
+				if hairpinAddr == "" || len(wanDevices) == 0 {
+					continue
+				}
 				root.Nftables = append(root.Nftables, NFTElement{
 					Rule: &Rule{
 						Family:  a.family,
 						Table:   a.tableName,
 						Chain:   "prerouting",
-						Comment: fmt.Sprintf("Port Forwarding (DNAT): %s", pol.Name),
-						Expr:    expr,
+						Comment: fmt.Sprintf("NAT-reflektion (hairpin) DNAT: %s", pol.Name),
+						Expr: []interface{}{
+							map[string]interface{}{
+								"match": map[string]interface{}{
+									"op":    "!=",
+									"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+									"right": map[string]interface{}{"set": wanDevices},
+								},
+							},
+							map[string]interface{}{
+								"match": map[string]interface{}{
+									"op":    "==",
+									"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "daddr"}},
+									"right": hairpinAddr,
+								},
+							},
+							dportMatch,
+							dnatVerdict,
+						},
 					},
 				})
 			}

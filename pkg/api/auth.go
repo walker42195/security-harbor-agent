@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,19 +37,31 @@ type AuthManager struct {
 	// (getSystemStatus gav 401). Tom sträng = ingen persistens (t.ex. i tester).
 	persistPath string
 
-	ipAttempts   map[string]int
+	ipAttempts   map[string]attemptCounter
 	ipLockouts   map[string]time.Time
-	userAttempts map[string]int
+	userAttempts map[string]attemptCounter
 	userLockouts map[string]time.Time
 }
+
+// attemptCounter är en försöksräknare MED tidsstämpel. Tidsstämpeln finns
+// för att posten ska kunna städas bort — se pruneLocked.
+type attemptCounter struct {
+	count int
+	last  time.Time
+}
+
+// attemptTTL är hur länge en försöksräknare utan aktiv spärr är
+// meningsfull. Efter det nollställs den (och posten släpps ur map:en).
+// Samma storleksordning som lockoutens 15 minuter.
+const attemptTTL = 15 * time.Minute
 
 func NewAuthManager(persistPath string) *AuthManager {
 	a := &AuthManager{
 		sessions:     make(map[string]TokenSession),
 		persistPath:  persistPath,
-		ipAttempts:   make(map[string]int),
+		ipAttempts:   make(map[string]attemptCounter),
 		ipLockouts:   make(map[string]time.Time),
-		userAttempts: make(map[string]int),
+		userAttempts: make(map[string]attemptCounter),
 		userLockouts: make(map[string]time.Time),
 	}
 	a.loadSessions()
@@ -114,12 +127,22 @@ func (a *AuthManager) IsLockedOut(ip, username string) bool {
 	return isLockedOutLocked(a.ipLockouts, ip) || isLockedOutLocked(a.userLockouts, username)
 }
 
-func recordFailedAttemptLocked(attempts map[string]int, lockouts map[string]time.Time, key string) {
-	attempts[key]++
-	if attempts[key] >= 5 {
-		lockouts[key] = time.Now().Add(15 * time.Minute)
-		attempts[key] = 0
+func recordFailedAttemptLocked(attempts map[string]attemptCounter, lockouts map[string]time.Time, key string) {
+	now := time.Now()
+	c := attempts[key]
+	// En räknare som legat orörd längre än attemptTTL börjar om — annars
+	// skulle enstaka spridda felslag över dygn ackumulera till en spärr.
+	if !c.last.IsZero() && now.Sub(c.last) > attemptTTL {
+		c.count = 0
 	}
+	c.count++
+	c.last = now
+	if c.count >= 5 {
+		lockouts[key] = now.Add(15 * time.Minute)
+		delete(attempts, key)
+		return
+	}
+	attempts[key] = c
 }
 
 // pruneLocked rensar utgångna sessioner och utgångna lockout-poster.
@@ -136,10 +159,19 @@ func recordFailedAttemptLocked(attempts map[string]int, lockouts map[string]time
 // egen bakgrundsgoroutine att hålla reda på.
 func (a *AuthManager) pruneLocked() {
 	now := time.Now()
+	sessionsChanged := false
 	for token, sess := range a.sessions {
 		if now.After(sess.ExpiresAt) {
 			delete(a.sessions, token)
+			sessionsChanged = true
 		}
+	}
+	// Skriv tillbaka direkt när något faktiskt togs bort, så filen på disk
+	// inte fortsätter innehålla utgångna tokens tills nästa inloggning.
+	// (Ofarligt även utan — loadSessions filtrerar på utgång — men filen ska
+	// spegla minnet.)
+	if sessionsChanged {
+		a.saveSessionsLocked()
 	}
 	for _, m := range []map[string]time.Time{a.ipLockouts, a.userLockouts} {
 		for key, until := range m {
@@ -148,16 +180,20 @@ func (a *AuthManager) pruneLocked() {
 			}
 		}
 	}
-	// Försöksräknare utan en aktiv lockout är bara meningsfulla i
-	// anslutning till pågående försök — släpp dem när spärren gått ut.
-	for key := range a.ipAttempts {
-		if _, locked := a.ipLockouts[key]; !locked && a.ipAttempts[key] == 0 {
-			delete(a.ipAttempts, key)
-		}
-	}
-	for key := range a.userAttempts {
-		if _, locked := a.userLockouts[key]; !locked && a.userAttempts[key] == 0 {
-			delete(a.userAttempts, key)
+	// Försöksräknare släpps när de blivit för gamla för att betyda något.
+	//
+	// Kodgranskning 2026-08-25: den tidigare versionen tog bara bort poster
+	// där räknaren var 0, men en post når bara 0 genom att passera 5 försök
+	// (då sätts en lockout). En post som stannade på 1-4 försök raderades
+	// därför ALDRIG. Eftersom nyckeln i userAttempts är det ANVÄNDARNAMN
+	// klienten skickar in kunde en angripare låta map:en växa obegränsat —
+	// exakt den minnesutmattning kommentaren ovan sade sig ha åtgärdat.
+	// Nu styr tidsstämpeln städningen, oberoende av räknarvärdet.
+	for _, m := range []map[string]attemptCounter{a.ipAttempts, a.userAttempts} {
+		for key, c := range m {
+			if now.Sub(c.last) > attemptTTL {
+				delete(m, key)
+			}
 		}
 	}
 }
@@ -193,6 +229,52 @@ func (a *AuthManager) CreateSession(user, role string, duration time.Duration) (
 	a.saveSessionsLocked() // överlev en omstart av agenten
 
 	return token, nil
+}
+
+// DeleteSession ogiltigförklarar EN session (utloggning). Okänd token är
+// inte ett fel — utloggning ska alltid "lyckas" ur klientens perspektiv.
+func (a *AuthManager) DeleteSession(token string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	delete(a.sessions, token)
+	a.pruneLocked()
+	a.saveSessionsLocked()
+}
+
+// DeleteSessionsForUser ogiltigförklarar ALLA aktiva sessioner för en
+// användare. Måste anropas när kontot raderas eller när lösenordet byts/
+// återställs.
+//
+// Kodgranskning 2026-08-25: utan detta fortsatte en raderad användares
+// token att fungera i upp till 24 timmar, och "byt lösenord efter intrång"
+// gjorde ingen nytta alls mot en angripare som redan hade en giltig token.
+// Returnerar antalet borttagna sessioner (för revisionsloggen).
+func (a *AuthManager) DeleteSessionsForUser(username string) int {
+	return a.DeleteSessionsForUserExcept(username, "")
+}
+
+// DeleteSessionsForUserExcept är samma sak men sparar EN token — används vid
+// eget lösenordsbyte, där administratören inte ska loggas ut av sin egen
+// åtgärd men alla andra sessioner för kontot ska dö.
+func (a *AuthManager) DeleteSessionsForUserExcept(username, keepToken string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	removed := 0
+	for token, sess := range a.sessions {
+		if token == keepToken {
+			continue
+		}
+		if strings.EqualFold(sess.User, username) {
+			delete(a.sessions, token)
+			removed++
+		}
+	}
+	if removed > 0 {
+		a.saveSessionsLocked()
+	}
+	return removed
 }
 
 // ValidateToken returnerar (användarnamn, roll, fel).

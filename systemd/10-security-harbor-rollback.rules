@@ -10,11 +10,30 @@
 // Mallenhet - instansnamnet varierar (versionssträngen), så matchningen
 // sker på prefix, inte exakt sträng (jfr 10-security-harbor-update.rules
 // som matchar en icke-mallenhet exakt).
+//
+// OBS: polkit-regler körs av polkitds INBYGGDA JS-motor, som på Debian/
+// Ubuntu är duktape (ES5.1 med bara partiellt ES2015-stöd) — INTE mozjs.
+// Använd därför ENDAST ES5-konstruktioner här. En tidigare version av den
+// här regeln använde String.prototype.endsWith (ES2015); kastar den ett
+// fel nekar polkit anropet och rollback från GUI:t slutar fungera helt
+// (kodgranskning 2026-08-25). Versionssträngen valideras dessutom strikt
+// mot ^[0-9]+\.[0-9]+\.[0-9]+$ i pkg/api/server.go innan enhetsnamnet ens
+// byggs, så mönstret nedan behöver inte vara den enda spärren.
 polkit.addRule(function(action, subject) {
-    if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit").indexOf("security-harbor-rollback@") == 0 &&
-        action.lookup("unit").endsWith(".service") &&
-        subject.user == "security-harbor") {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" ||
+        subject.user !== "security-harbor") {
+        return;
+    }
+    var unit = action.lookup("unit");
+    if (typeof unit !== "string") {
+        return;
+    }
+    // ES5-motsvarighet till startsWith/endsWith.
+    var prefix = "security-harbor-rollback@";
+    var suffix = ".service";
+    if (unit.indexOf(prefix) === 0 &&
+        unit.length > prefix.length + suffix.length &&
+        unit.indexOf(suffix, unit.length - suffix.length) !== -1) {
         return polkit.Result.YES;
     }
 });
