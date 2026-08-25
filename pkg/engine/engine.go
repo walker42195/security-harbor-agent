@@ -1593,3 +1593,39 @@ func setARPHardening() error {
 	}
 	return nil
 }
+
+// ListConfigHistory returnerar de senast bekräftade konfigurationerna som
+// finns sparade på brandväggen (se pkg/store/history.go).
+func (e *Engine) ListConfigHistory() []store.ConfigHistoryEntry {
+	return e.store.ListConfigHistory()
+}
+
+// RestoreConfigFromHistory laddar en sparad konfiguration och lägger den som
+// KANDIDAT — den appliceras inte här. Administratören trycker sedan
+// Applicera som vanligt och får hela Safe Apply-kedjan (validering,
+// 30-sekunders bekräftelse, automatisk rollback vid utelåsning). Att
+// applicera en gammal konfiguration direkt vore att kringgå precis det
+// skydd som finns för att man inte ska låsa ut sig.
+func (e *Engine) RestoreConfigFromHistory(id, user string) (*config.Config, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.state == StateUnconfirmed {
+		return nil, fmt.Errorf("det finns en obekräftad ändring — bekräfta eller rulla tillbaka den först")
+	}
+
+	cfg, err := e.store.LoadHistoricConfig(id)
+	if err != nil {
+		return nil, err
+	}
+	// Samma validering som vilken annan kandidatändring som helst: en gammal
+	// konfiguration kan referera ett gränssnitt som inte finns kvar.
+	if err := e.ValidateCandidate(context.Background(), cfg); err != nil {
+		return nil, fmt.Errorf("den sparade konfigurationen är inte giltig mot dagens system: %w", err)
+	}
+	if err := e.store.SetCandidateConfig(cfg); err != nil {
+		return nil, err
+	}
+	_ = e.store.LogAudit(user, "RESTORE_CONFIG_HISTORY", fmt.Sprintf("Laddade sparad konfiguration %s som kandidat", id))
+	return cfg, nil
+}

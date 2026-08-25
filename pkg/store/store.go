@@ -749,6 +749,13 @@ func (s *Store) CommitCandidate() error {
 	// running och candidate på samma struct igen efter varje commit, och
 	// nästa direktskrivning i candidate (hotlist-uppdatering, IDS-auto-
 	// block) muterar running i smyg.
+	// Arkivera den UTGÅENDE konfigurationen innan den skrivs över, så att
+	// man kan gå tillbaka till den långt efter att Safe Apply-fönstret
+	// stängts (se pkg/store/history.go). Görs vid COMMIT, inte vid apply:
+	// en konfiguration som aldrig bekräftades rullades per definition
+	// tillbaka och ska inte gå att återställa som ett fungerande läge.
+	s.archiveConfigLocked(s.runningCfg)
+
 	s.runningCfg = cloneConfig(s.candidateCfg)
 	runningPath := filepath.Join(s.baseDir, "running.json")
 	return s.saveConfigLocked(runningPath, s.runningCfg)

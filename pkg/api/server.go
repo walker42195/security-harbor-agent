@@ -108,6 +108,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/config/apply", s.authMiddlewareAdmin(s.handleApplyConfig))
 	mux.HandleFunc("/api/v1/config/confirm", s.authMiddlewareAdmin(s.handleConfirmConfig))
 	mux.HandleFunc("/api/v1/config/rollback", s.authMiddlewareAdmin(s.handleRollbackConfig))
+	mux.HandleFunc("/api/v1/config/history", s.authMiddleware(s.handleConfigHistory))
+	mux.HandleFunc("/api/v1/config/history/restore", s.authMiddlewareAdmin(s.handleRestoreConfigHistory))
 
 	// Användarhantering (Fas 8) — enbart admin.
 	mux.HandleFunc("/api/v1/auth/users", s.authMiddlewareAdmin(s.handleListUsers))
@@ -710,6 +712,52 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"ok":      true,
 		"message": "Installationen startad. Agenten startar om på den nya versionen om en liten stund.",
+	})
+}
+
+// handleConfigHistory listar de senast bekräftade konfigurationerna som
+// finns sparade på brandväggen. Läsbar för alla roller (som övriga
+// statusvyer); att faktiskt återställa kräver admin.
+func (s *Server) handleConfigHistory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"current_revision": currentRevision(s.engine.GetRunningConfig()),
+		"history":          s.engine.ListConfigHistory(),
+	})
+}
+
+func currentRevision(cfg *config.Config) int64 {
+	if cfg == nil {
+		return 0
+	}
+	return cfg.Revision
+}
+
+// handleRestoreConfigHistory laddar en sparad konfiguration som KANDIDAT.
+// Den appliceras INTE här — administratören trycker Applicera som vanligt
+// och får hela Safe Apply-kedjan. Se Engine.RestoreConfigFromHistory.
+func (s *Server) handleRestoreConfigHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == "" {
+		http.Error(w, "id saknas", http.StatusBadRequest)
+		return
+	}
+	cfg, err := s.engine.RestoreConfigFromHistory(req.ID, auditUser(r))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":       true,
+		"revision": cfg.Revision,
+		"message":  "Den sparade konfigurationen är inläst som kandidat. Tryck Applicera för att aktivera den — Safe Apply gäller som vanligt.",
 	})
 }
 
