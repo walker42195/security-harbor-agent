@@ -45,6 +45,9 @@ echo "-> agent (v$VERSION), nmap-runner, tcpdump-runner, network-runner, sign"
 
 echo "=== 2. Bygger webb-GUI:t (flutter build web) från $GUI_DIR ==="
 if [ -d "$GUI_DIR" ]; then
+  # Samma versionsgenerering som gui-repots egen build_release.sh: webb-GUI:t
+  # byggs ur samma källkod och ska rapportera samma version som pubspec.
+  [ -x "$GUI_DIR/sync_app_version.sh" ] && "$GUI_DIR/sync_app_version.sh"
   ( cd "$GUI_DIR" && flutter build web --no-web-resources-cdn --pwa-strategy=none )
   mkdir -p "$DIST_DIR/webui"
   cp -a "$GUI_DIR/build/web/." "$DIST_DIR/webui/"
