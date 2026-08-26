@@ -31,53 +31,21 @@ type LeaseDetail struct {
 // bara tar med namngivna för DNS). Interface/Zone lämnas tomma — de fylls i
 // av anroparen som har konfigurationen.
 func ParseLeasesDetailed(path string) ([]LeaseDetail, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(f)
-	r.FieldsPerRecord = -1
-	records, err := r.ReadAll()
-	if err != nil {
-		return nil, err
-	}
-	if len(records) == 0 {
-		return nil, nil
-	}
-
-	col := map[string]int{}
-	for i, name := range records[0] {
-		col[name] = i
-	}
-	addrIdx, ok := col["address"]
-	if !ok {
-		return nil, nil
-	}
-	get := func(row []string, name string) string {
-		if idx, ok := col[name]; ok && idx < len(row) {
-			return row[idx]
-		}
-		return ""
-	}
-
 	// Senare rader för samma IP skriver över tidigare (memfile är historik).
 	byIP := map[string]LeaseDetail{}
-	for _, row := range records[1:] {
-		if addrIdx >= len(row) || row[addrIdx] == "" {
-			continue
+
+	err := forEachLeaseRow(path, func(get func(string) string) {
+		addr := get("address")
+		if addr == "" {
+			return
 		}
 		// state: 0 = aktiv. Tomt behandlas också som aktivt.
-		if st := get(row, "state"); st != "" && st != "0" {
-			delete(byIP, row[addrIdx]) // en senare icke-aktiv rad tar bort en tidigare aktiv
-			continue
+		if st := get("state"); st != "" && st != "0" {
+			delete(byIP, addr) // en senare icke-aktiv rad tar bort en tidigare aktiv
+			return
 		}
 		parseInt := func(name string) int64 {
-			if v, perr := strconv.ParseInt(get(row, name), 10, 64); perr == nil {
+			if v, perr := strconv.ParseInt(get(name), 10, 64); perr == nil {
 				return v
 			}
 			return 0
@@ -88,13 +56,16 @@ func ParseLeasesDetailed(path string) ([]LeaseDetail, error) {
 		if expire > 0 && validLifetime > 0 {
 			start = expire - validLifetime // Kea lagrar utgång + livslängd; startpunkten (cltt) är differensen
 		}
-		byIP[row[addrIdx]] = LeaseDetail{
-			IP:       row[addrIdx],
-			MAC:      get(row, "hwaddr"),
-			Hostname: get(row, "hostname"),
+		byIP[addr] = LeaseDetail{
+			IP:       addr,
+			MAC:      get("hwaddr"),
+			Hostname: get("hostname"),
 			StartTS:  start,
 			ExpireTS: expire,
 		}
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	out := make([]LeaseDetail, 0, len(byIP))
@@ -104,65 +75,97 @@ func ParseLeasesDetailed(path string) ([]LeaseDetail, error) {
 	return out, nil
 }
 
-// ParseLeaseFile läser Kea:s "memfile"-lease-databas (CSV, se
-// LeaseDatabase.Name i adapter.go) och returnerar aktiva utlåningar som
-// har ett värdnamn — de utan värdnamn (klienten skickade inget DHCP
-// option 12) kan inte registreras i DNS och hoppas över.
+// leaseFiles returnerar de filer som TILLSAMMANS utgör Kea:s lease-databas,
+// i ÄLDST-FÖRST-ordning.
 //
-// Kolumnordningen läses ur CSV-headern istället för att antas, eftersom
-// den kan skilja mellan Kea-versioner.
+// Kea:s memfile-backend kör periodiskt LFC (Lease File Cleanup): den aktuella
+// filen döps om, en ny tom skapas, och den konsoliderade historiken skrivs
+// till en syskonfil. Under och efter en sådan städning ligger utlåningarna
+// alltså i FLERA filer samtidigt.
+//
+// Att bara läsa kea-leases4.csv gav då bilden att nästan alla utlåningar
+// försvunnit — skarpt 2026-08-26: LFC körde 11:15 och GUI:t visade två
+// leasar i stället för ett femtiotal, både under DHCP-klienter och under
+// automatiskt registrerade DNS-enheter (som läser samma fil). Ingenting hade
+// gått förlorat; agenten läste bara en fjärdedel av databasen.
+//
+// Ordningen är viktig: den aktuella filen läses SIST så att dess rader vinner
+// över äldre historik för samma adress.
+func leaseFiles(path string) []string {
+	return []string{
+		path + ".completed", // färdig LFC-utdata, väntar på att laddas in
+		path + ".2",         // LFC-utdata under skrivning (eller avbruten körning)
+		path + ".1",         // LFC-indata: den tidigare aktuella filen
+		path,                // aktuell fil - nyast, vinner
+	}
+}
+
+// forEachLeaseRow läser samtliga lease-filer och anropar fn för varje rad.
+//
+// Kolumnuppslagningen görs per FIL, inte en gång för alla: filerna kan vara
+// skrivna av olika Kea-versioner med olika kolumnordning, och en LFC-utdata
+// behöver inte ha samma header som den aktuella filen.
+//
+// En fil som saknas är inget fel (LFC-filerna finns bara ibland). Ett riktigt
+// läsfel på EN fil stoppar inte de övriga — hellre en delvis lista än ingen.
+func forEachLeaseRow(path string, fn func(get func(string) string)) error {
+	var firstErr error
+	for _, p := range leaseFiles(path) {
+		f, err := os.Open(p)
+		if err != nil {
+			if !os.IsNotExist(err) && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		r := csv.NewReader(f)
+		r.FieldsPerRecord = -1
+		records, err := r.ReadAll()
+		f.Close()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if len(records) < 2 {
+			continue
+		}
+		col := map[string]int{}
+		for i, name := range records[0] {
+			col[name] = i
+		}
+		for _, row := range records[1:] {
+			fn(func(name string) string {
+				if idx, ok := col[name]; ok && idx < len(row) {
+					return row[idx]
+				}
+				return ""
+			})
+		}
+	}
+	return firstErr
+}
+
+// ParseLeaseFile returnerar de aktiva utlåningar som har ett värdnamn — de
+// utan (klienten skickade ingen DHCP option 12) kan inte registreras i DNS.
+//
+// Bygger på ParseLeasesDetailed i stället för att tolka filerna en gång till.
+// Den egna kopian hade ett fel de detaljerade utlåningarna inte hade: en
+// senare rad med icke-aktivt tillstånd HOPPADES ÖVER i stället för att ta
+// bort den tidigare aktiva raden, så en frisläppt adress kunde ligga kvar i
+// DNS-zonen tills agenten startades om.
 func ParseLeaseFile(path string) ([]Lease, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	r := csv.NewReader(f)
-	r.FieldsPerRecord = -1
-	records, err := r.ReadAll()
+	details, err := ParseLeasesDetailed(path)
 	if err != nil {
 		return nil, err
 	}
-	if len(records) == 0 {
-		return nil, nil
-	}
-
-	col := map[string]int{}
-	for i, name := range records[0] {
-		col[name] = i
-	}
-	addrIdx, ok1 := col["address"]
-	hostIdx, ok2 := col["hostname"]
-	if !ok1 || !ok2 {
-		return nil, nil
-	}
-	stateIdx, hasState := col["state"]
-
-	// Senare rader för samma IP skriver över tidigare (Kea memfile
-	// innehåller lease-historik, inte bara aktuellt tillstånd).
-	byIP := map[string]Lease{}
-	for _, row := range records[1:] {
-		if addrIdx >= len(row) || hostIdx >= len(row) {
+	leases := make([]Lease, 0, len(details))
+	for _, d := range details {
+		if d.Hostname == "" {
 			continue
 		}
-		hostname := row[hostIdx]
-		if hostname == "" {
-			continue
-		}
-		// state: 0 = default/active, 1 = declined, 2 = expired-reclaimed.
-		if hasState && stateIdx < len(row) && row[stateIdx] != "" && row[stateIdx] != "0" {
-			continue
-		}
-		byIP[row[addrIdx]] = Lease{IP: row[addrIdx], Hostname: hostname}
-	}
-
-	leases := make([]Lease, 0, len(byIP))
-	for _, l := range byIP {
-		leases = append(leases, l)
+		leases = append(leases, Lease{IP: d.IP, Hostname: d.Hostname})
 	}
 	return leases, nil
 }
