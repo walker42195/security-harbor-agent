@@ -1,0 +1,13 @@
+// Tillåter ENDAST security-harbor-tjänstekontot att sätta systemets tidszon
+// (ingen annan timedate1-åtgärd, ingen annan användare) — se
+// pkg/adapter/timezone och Settings.Timezone i konfigurationen.
+//
+// Bara set-timezone: att sätta KLOCKAN (set-time) eller slå av NTP hör inte
+// till vad brandväggsagenten ska kunna göra, och en felställd klocka bryter
+// certifikatvalidering, VPN-handskakningar och loggarnas tillförlitlighet.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.timedate1.set-timezone" &&
+        subject.user == "security-harbor") {
+        return polkit.Result.YES;
+    }
+});

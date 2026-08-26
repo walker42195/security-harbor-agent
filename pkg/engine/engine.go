@@ -19,6 +19,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/suricata"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/syslog"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/timezone"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
@@ -238,6 +239,17 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 				Message: fmt.Sprintf("IDS (Suricata) kunde inte startas: %v. Brandväggsreglerna är applicerade, men intrångsdetekteringen är inte igång. Vanligaste orsaken är för lite minne för regelsetet.", err),
 			})
 		}
+	}
+
+	// Tidszonen är inte trafikstyrande — att den inte kan sättas får inte
+	// fälla en applicering som i övrigt är korrekt. Rapporteras som varning,
+	// samma resonemang som för IDS ovan.
+	if err := timezone.Apply(ctx, cfg.Settings.Timezone); err != nil {
+		log.Printf("[APPLY] VARNING: tidszonen kunde inte sättas: %v", err)
+		warnings = append(warnings, BackendWarning{
+			Backend: "timezone",
+			Message: fmt.Sprintf("Tidszonen kunde inte sättas: %v. Serverns tidsstämplar (bl.a. i trafikloggen) följer fortfarande den gamla tidszonen.", err),
+		})
 	}
 
 	// HAProxy (SNI-routning) körs i båda lägen — adaptern stoppar tjänsten

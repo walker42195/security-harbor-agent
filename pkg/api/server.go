@@ -23,6 +23,7 @@ import (
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/timezone"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
@@ -74,6 +75,7 @@ func (s *Server) Start() error {
 	// (Fas 8). En "viewer" ska vara strikt skrivskyddad.
 	mux.HandleFunc("/api/v1/system", s.authMiddleware(s.handleSystemStatus))
 	mux.HandleFunc("/api/v1/interfaces/discover", s.authMiddleware(s.handleDiscoverInterfaces))
+	mux.HandleFunc("/api/v1/system/timezones", s.authMiddleware(s.handleTimezones))
 	mux.HandleFunc("/api/v1/diagnostics/conntrack", s.authMiddleware(s.handleConntrack))
 	mux.HandleFunc("/api/v1/diagnostics/firewall-log", s.authMiddleware(s.handleFirewallLog))
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
@@ -2096,4 +2098,17 @@ func parseProcNetDev() []NetDevStat {
 		}
 	}
 	return stats
+}
+
+// handleTimezones listar de tidszoner servern känner till, plus vilken som är
+// aktiv just nu. GUI:t behöver båda: listan för väljaren, och den aktiva för
+// att kunna visa vad som FAKTISKT gäller på servern — som kan skilja sig från
+// konfigurationens värde om appliceringen misslyckats (då finns även en
+// varning under Tjänster).
+func (s *Server) handleTimezones(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"current":   timezone.Current(),
+		"available": timezone.Available(),
+	})
 }

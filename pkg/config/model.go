@@ -383,6 +383,15 @@ type Settings struct {
 	// ingen FORWARD/NAT/DHCP/IDS, inget WAN/LAN-zonkrav). Se
 	// pkg/adapter/nftables.RenderJSON och Engine.applyBackends.
 	Mode string `json:"mode,omitempty"`
+
+	// Timezone är serverns tidszon i IANA-format ("Europe/Stockholm").
+	// Tomt = rör inte systemets nuvarande inställning.
+	//
+	// Tidszonen syns i allt servern själv tidsstämplar — journald (och därmed
+	// trafikloggen) skriver lokal tid med offset. Stod servern kvar på UTC
+	// medan administratören satt i CEST blev loggen två timmar fel, utan att
+	// något var trasigt (rapporterat 2026-08-26).
+	Timezone string `json:"timezone,omitempty"`
 }
 
 const (
