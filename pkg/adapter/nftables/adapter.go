@@ -864,7 +864,38 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		if !schedOK {
 			continue
 		}
-		for _, lanDev := range lanDevices {
+		// Källbegränsningen MÅSTE läsas här, precis som FORWARD-kedjan gör.
+		//
+		// Fram till 2026-08-26 byggdes en lokal regel av enbart iifname +
+		// schema + tjänst — varken SourceZone eller SourceObj lästes. En
+		// policy som i GUI:t stod som "Från: Allowed to Admin" eller
+		// "Från: LAN" renderades därför som en regel HELT UTAN
+		// källbegränsning, på SAMTLIGA interna kort.
+		//
+		// Skarpt: management-API:t (8443) och SSH var nåbara från IoT-VLAN:et
+		// och från den internetexponerade DMZ:en, trots att administratören
+		// hade begränsat dem till två nät. GUI:t visade en begränsning som
+		// inte existerade i kärnan.
+		//
+		// Exakt samma buggklass rättades för FORWARD-kedjan 2026-08-19 (se
+		// kommentaren på zoneMatchExpr); INPUT-kedjan glömdes bort då.
+		srcObjExpr, srcObjIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+		if !srcObjIsAny && len(srcObjExpr) == 0 {
+			// Objektet är tomt eller kunde inte lösas upp. Att då släppa
+			// igenom ALLT vore raka motsatsen till avsikten — hoppa över
+			// regeln i stället.
+			continue
+		}
+
+		// Zonen avgör VILKA kort regeln läggs på. Den uttrycks som ett
+		// iifname-villkor i FORWARD, men här itererar vi redan över korten,
+		// så den används för att filtrera listan i stället.
+		devices := lanDevices
+		if zoneDevices, zoneIsAny := localPolicyDevices(cfg, pol.SourceZone, wanDevices, lanDevices); !zoneIsAny {
+			devices = zoneDevices
+		}
+
+		for _, lanDev := range devices {
 			for _, svcExpr := range svcSets {
 				rule := &Rule{
 					Family:  a.family,
@@ -881,6 +912,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 						},
 					},
 				}
+				rule.Expr = append(rule.Expr, srcObjExpr...)
 				rule.Expr = append(rule.Expr, schedExpr...)
 				rule.Expr = append(rule.Expr, svcExpr...)
 				rule.Expr = append(rule.Expr, map[string]interface{}{"counter": nil})
@@ -1433,4 +1465,60 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 func PolicyServiceIsParseable(cfg *config.Config, serviceRef string) bool {
 	_, ok := resolveServiceMatchExprSets(cfg, serviceRef, map[string]bool{})
 	return ok
+}
+
+// localPolicyDevices översätter en lokal policys källzon till de kort regeln
+// ska läggas på.
+//
+// INPUT-kedjan itererar redan över korten (en regel per kort), så zonen kan
+// inte uttryckas som ett extra iifname-villkor så som FORWARD gör — den
+// används för att filtrera listan i stället. Resultatet blir detsamma:
+// "Från: LAN" träffar bara kort vars zon faktiskt är LAN, inte varje internt
+// kort på lådan.
+//
+// isAny=true betyder "ingen zonbegränsning" och anroparen ska då använda hela
+// listan. En zon som inte matchar något kort ger en TOM lista — regeln läggs
+// då inte på något kort alls, vilket är rätt: en policy för en zon som inte
+// finns ska inte gälla överallt.
+func localPolicyDevices(cfg *config.Config, zoneSpec string, wanDevices, lanDevices []string) (devices []string, isAny bool) {
+	trimmed := strings.TrimSpace(zoneSpec)
+	if trimmed == "" || strings.EqualFold(trimmed, "ANY") {
+		return nil, true
+	}
+
+	allowed := map[string]bool{}
+	for _, part := range strings.Split(trimmed, ",") {
+		zoneName := strings.TrimSpace(part)
+		if zoneName == "" {
+			continue
+		}
+		if strings.EqualFold(zoneName, "ANY") {
+			return nil, true
+		}
+		switch zoneName {
+		case "Any-External (WAN)":
+			for _, d := range wanDevices {
+				allowed[d] = true
+			}
+		case "Any-Trusted (LAN)":
+			for _, d := range lanDevices {
+				allowed[d] = true
+			}
+		default:
+			for _, iface := range cfg.Interfaces {
+				if iface.Enabled && iface.Zone == zoneName && iface.Device != "" {
+					allowed[iface.Device] = true
+				}
+			}
+		}
+	}
+
+	// Behåll lanDevices ordning i stället för kartans, så regelverket blir
+	// deterministiskt mellan appliceringar.
+	for _, d := range lanDevices {
+		if allowed[d] {
+			devices = append(devices, d)
+		}
+	}
+	return devices, false
 }

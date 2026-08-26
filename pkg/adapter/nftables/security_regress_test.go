@@ -131,3 +131,124 @@ func TestEmptyEnabledScheduleSkipsRule(t *testing.T) {
 		t.Fatal("regel med giltigt schema renderades inte")
 	}
 }
+
+// multiVlanCfg speglar en verklig installation: ett LAN plus flera VLAN med
+// EGNA zoner, däribland ett IoT-nät och en internetexponerad DMZ.
+func multiVlanCfg() *config.Config {
+	cfg := baseCfg()
+	cfg.Zones = append(cfg.Zones,
+		config.Zone{Name: "VLAN 9"}, config.Zone{Name: "VLAN 8"}, config.Zone{Name: "VLAN 1337"})
+	cfg.Interfaces = append(cfg.Interfaces,
+		config.Interface{ID: "vlan9", Device: "ens19.9", Parent: "ens19", VLANID: 9, Zone: "VLAN 9", Enabled: true, IPv4: "10.9.9.1/24"},
+		config.Interface{ID: "vlan8", Device: "ens19.8", Parent: "ens19", VLANID: 8, Zone: "VLAN 8", Enabled: true, IPv4: "10.8.8.1/24"},
+		config.Interface{ID: "vlan1337", Device: "ens19.1337", Parent: "ens19", VLANID: 1337, Zone: "VLAN 1337", Enabled: true, IPv4: "10.13.13.1/24"},
+	)
+	cfg.Objects = []config.Object{
+		{ID: "obj_admin", Name: "Allowed to Admin", Type: "group", Values: []string{"obj_lan", "obj_vlan9"}},
+		{ID: "obj_lan", Name: "VLAN1", Type: "host", Values: []string{"10.0.0.0/24"}},
+		{ID: "obj_vlan9", Name: "VLAN9", Type: "host", Values: []string{"10.9.9.0/24"}},
+	}
+	return cfg
+}
+
+func inputRulesFor(t *testing.T, cfg *config.Config, comment string) []Rule {
+	t.Helper()
+	var out []Rule
+	for _, r := range renderRules(t, cfg) {
+		if r.Chain == "input" && strings.Contains(r.Comment, comment) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// Regression (skarpt 2026-08-26): en LOKAL policy byggdes av enbart
+// iifname + schema + tjänst. Varken SourceObj eller SourceZone lästes, så en
+// policy som i GUI:t stod som "Från: Allowed to Admin" renderades UTAN
+// källbegränsning, på SAMTLIGA interna kort. Management-API:t och SSH var
+// därmed nåbara från IoT-VLAN:et och den internetexponerade DMZ:en, trots
+// att administratören begränsat dem till två nät.
+//
+// Exakt samma buggklass rättades för FORWARD-kedjan 2026-08-19; INPUT
+// glömdes bort då.
+func TestLocalPolicyHonoursSourceObject(t *testing.T) {
+	cfg := multiVlanCfg()
+	cfg.Policies = []config.Policy{{
+		ID: "mgmt", Name: "Management", Enabled: true, Local: true,
+		Action: config.ActionAccept, Service: "8443", SourceObj: "obj_admin",
+	}}
+
+	rules := inputRulesFor(t, cfg, "Management")
+	if len(rules) == 0 {
+		t.Fatal("ingen regel renderades alls")
+	}
+	for _, r := range rules {
+		expr := exprJSON(t, r)
+		if !strings.Contains(expr, "saddr") {
+			t.Errorf("regel utan källbegränsning (%s): %s", r.Comment, expr)
+		}
+		if !strings.Contains(expr, "10.0.0.0") || !strings.Contains(expr, "10.9.9.0") {
+			t.Errorf("objektets nät saknas i regeln (%s): %s", r.Comment, expr)
+		}
+	}
+}
+
+// Zonen ska avgöra VILKA kort regeln läggs på. "LAN" får inte betyda
+// "varje internt kort".
+func TestLocalPolicyHonoursSourceZone(t *testing.T) {
+	cfg := multiVlanCfg()
+	cfg.Policies = []config.Policy{{
+		ID: "ssh", Name: "SSH", Enabled: true, Local: true,
+		Action: config.ActionAccept, Service: "22", SourceZone: "LAN",
+	}}
+
+	rules := inputRulesFor(t, cfg, "SSH")
+	if len(rules) != 1 {
+		var got []string
+		for _, r := range rules {
+			got = append(got, r.Comment)
+		}
+		t.Fatalf("förväntade en regel (bara ens19), fick %d: %v", len(rules), got)
+	}
+	if !strings.Contains(exprJSON(t, rules[0]), "ens19\"") {
+		t.Errorf("fel kort: %s", exprJSON(t, rules[0]))
+	}
+}
+
+// En zon som inte matchar något kort ska inte falla tillbaka på "alla kort".
+func TestLocalPolicyUnknownZoneRendersNothing(t *testing.T) {
+	cfg := multiVlanCfg()
+	cfg.Policies = []config.Policy{{
+		ID: "x", Name: "Spökzon", Enabled: true, Local: true,
+		Action: config.ActionAccept, Service: "22", SourceZone: "Finns-inte",
+	}}
+	if rules := inputRulesFor(t, cfg, "Spökzon"); len(rules) != 0 {
+		t.Fatalf("policy för okänd zon renderades ändå: %d regler", len(rules))
+	}
+}
+
+// Ett objekt som inte går att lösa upp (tomt eller borttaget) får ALDRIG bli
+// "släpp igenom allt" — det är raka motsatsen till avsikten.
+func TestLocalPolicyUnresolvableObjectRendersNothing(t *testing.T) {
+	cfg := multiVlanCfg()
+	cfg.Policies = []config.Policy{{
+		ID: "y", Name: "Trasigt objekt", Enabled: true, Local: true,
+		Action: config.ActionAccept, Service: "8443", SourceObj: "obj_finns_inte",
+	}}
+	if rules := inputRulesFor(t, cfg, "Trasigt objekt"); len(rules) != 0 {
+		t.Fatalf("policy med olösbart objekt renderades ändå: %d regler", len(rules))
+	}
+}
+
+// Utan begränsning ska beteendet vara oförändrat: regeln läggs på alla
+// interna kort. Annars hade fixen tyst stängt av fungerande regler.
+func TestLocalPolicyWithoutRestrictionCoversAllInternalDevices(t *testing.T) {
+	cfg := multiVlanCfg()
+	cfg.Policies = []config.Policy{{
+		ID: "dns", Name: "Öppen", Enabled: true, Local: true,
+		Action: config.ActionAccept, Service: "53", SourceZone: "ANY", SourceObj: "ANY",
+	}}
+	if rules := inputRulesFor(t, cfg, "Öppen"); len(rules) != 4 {
+		t.Fatalf("förväntade fyra kort, fick %d", len(rules))
+	}
+}
