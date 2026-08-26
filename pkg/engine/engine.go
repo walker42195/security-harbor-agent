@@ -60,6 +60,14 @@ type Engine struct {
 	// resonemanget kring vilka backends som får faila utan att fälla hela
 	// appliceringen. Läses av API:t och visas som en varning i GUI:t.
 	degradedBackends []BackendWarning
+
+	// interfaceWarnings håller icke-blockerande fel från applyInterfaces
+	// (t.ex. att ingen persistent nätverkskonfiguration kunde skrivas).
+	// Egen field, inte degradedBackends: applyBackends NOLLSTÄLLER den
+	// listan via defer vid varje applicering, och applyInterfaces körs
+	// FÖRE applyBackends — delade de fält hade gränssnittsvarningarna
+	// tystnat i samma ögonblick som de skrevs.
+	interfaceWarnings []BackendWarning
 }
 
 // BackendWarning beskriver en backend som inte kunde appliceras men som inte
@@ -74,8 +82,9 @@ type BackendWarning struct {
 func (e *Engine) DegradedBackends() []BackendWarning {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	out := make([]BackendWarning, len(e.degradedBackends))
-	copy(out, e.degradedBackends)
+	out := make([]BackendWarning, 0, len(e.degradedBackends)+len(e.interfaceWarnings))
+	out = append(out, e.interfaceWarnings...)
+	out = append(out, e.degradedBackends...)
 	return out
 }
 
@@ -257,22 +266,65 @@ func (e *Engine) loadDHCPLeases(cfg *config.Config) []dhcp.Lease {
 	return leases
 }
 
-// applyInterfaces tillämpar gränssnittskonfiguration på Linux (skapar
-// VLAN-subinterface, tar upp/ner länkar, sätter statisk IP eller kör DHCP)
-// men BARA för de gränssnitt som faktiskt ändrats jämfört med prevCfg, plus
-// VLAN som ännu inte finns på systemet. Precis det användaren begärde
-// 2026-08-20: en ändring på ETT gränssnitt ska aldrig påverka de andra —
-// ändrar man en VLAN rörs inte LAN/WAN, och tvärtom.
+// applyInterfaces tillämpar gränssnittskonfiguration på Linux och skriver
+// ner den så att den ÖVERLEVER en omstart.
 //
-// prevCfg == nil (t.ex. vid boot) betyder "ingen jämförelse" → då rörs
-// INGET befintligt gränssnitt, bara VLAN som saknas på systemet skapas.
-// Det skyddar den externt konfigurerade management-IP:n (LAN) från att
-// flushas vid varje omstart.
+// Två lager, i den ordningen:
+//
+//  1. Persistent OS-konfiguration via det lager som äger nätverket på
+//     maskinen — netplan, NetworkManager eller systemd-networkd (se
+//     pkg/adapter/network/persist.go). Det är det som gör att en adress satt
+//     i GUI:t gäller på OS-nivå, precis som om den satts med nmcli/nmtui.
+//  2. Den imperativa `ip`-vägen, som ger omedelbar effekt och fungerar även
+//     om inget känt persistenslager finns.
+//
+// Bara gränssnitt som faktiskt BEHÖVER röras rörs — precis det användaren
+// begärde 2026-08-20: en ändring på ETT gränssnitt ska aldrig påverka de
+// andra. Ett kort behöver röras om det ändrats jämfört med prevCfg, om det
+// är en VLAN som saknas på systemet, eller om det GLIDIT IFRÅN sin
+// konfiguration.
+//
+// Just drift-kontrollen är ny (2026-08-26). Tidigare betydde prevCfg == nil
+// (boot) "rör ingenting alls", vilket lät ett kort ligga kvar i fel läge hur
+// länge som helst: brandväggen på 10.0.0.9 tappade sin statiska
+// management-IP till en DHCP-lease vid varje omstart av agenten, och
+// eftersom det inte fanns någon prevCfg att jämföra med rättades det aldrig.
+// Nu avgör systemets faktiska tillstånd i stället (MatchesSystemState), så
+// ett kort som redan stämmer lämnas fortfarande helt orört — ingen flush,
+// ingen bruten session — medan ett kort som glidit rättas.
 func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Config) {
 	if newCfg == nil {
 		return
 	}
 	netAdapter := network.NewAdapter()
+	// Varningarna skrivs UTAN att ta e.mu — anroparna (ApplyCandidate,
+	// rollbackLocked) håller redan låset, och sync.Mutex är inte reentrant.
+	// Samma konvention som applyBackends följer för degradedBackends.
+	var warnings []BackendWarning
+	defer func() { e.interfaceWarnings = warnings }()
+
+	// 1. Skriv ner konfigurationen på OS-nivå. Görs för ALLA gränssnitt i ett
+	// svep — persistenslagren är deklarativa och vill ha hela bilden — men
+	// TILLÄMPAS sedan bara på de kort som behöver det, i loopen nedan.
+	backend := network.DetectPersistBackend()
+	if backend == nil {
+		warnings = append(warnings, BackendWarning{
+			Backend: "network-persist",
+			Message: "Hittade varken netplan, NetworkManager eller systemd-networkd. " +
+				"Gränssnittsadresserna sätts direkt i kärnan och gäller nu, men skrivs inte " +
+				"ner någonstans och FÖRSVINNER vid omstart.",
+		})
+	} else if _, err := backend.Write(ctx, newCfg.Interfaces); err != nil {
+		log.Printf("[NET] kunde inte skriva persistent nätverkskonfiguration (%s): %v", backend.Name(), err)
+		warnings = append(warnings, BackendWarning{
+			Backend: "network-persist",
+			Message: fmt.Sprintf("Kunde inte spara nätverkskonfigurationen i %s: %v. "+
+				"Adresserna sätts direkt i kärnan och gäller nu, men försvinner vid omstart.", backend.Name(), err),
+		})
+		backend = nil // tillämpa inte något vi inte lyckades skriva
+	}
+
+	warnings = append(warnings, lanDHCPWarnings(newCfg)...)
 
 	prevByID := map[string]config.Interface{}
 	if prevCfg != nil {
@@ -293,10 +345,18 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 			}
 		}
 
-		// Rör bara gränssnittet om det ändrats, ELLER om det är en VLAN som
-		// saknas på systemet (rent additivt — påverkar inga fysiska kort).
-		if !changed && !(isVLAN && deviceMissing) {
+		// Finns ingen tidigare konfiguration att jämföra med (boot, eller ett
+		// nytillkommet gränssnitt) avgör systemets faktiska tillstånd.
+		drifted := !hadPrev && !netAdapter.MatchesSystemState(iface)
+
+		// Rör bara gränssnittet om det ändrats, glidit ifrån sin
+		// konfiguration, ELLER är en VLAN som saknas på systemet (rent
+		// additivt — påverkar inga fysiska kort).
+		if !changed && !drifted && !(isVLAN && deviceMissing) {
 			continue
+		}
+		if drifted {
+			log.Printf("[NET] %s stämmer inte med konfigurationen — återställer", iface.Device)
 		}
 
 		// Om en VLAN flyttats till ett annat fysiskt kort (Parent/VLANID
@@ -310,8 +370,39 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 			}
 		}
 
-		if err := netAdapter.ApplyInterfaceConfig(ctx, iface); err != nil {
-			log.Printf("[NET] kunde inte tillämpa gränssnitt %s: %v", iface.Device, err)
+		// 2. Låt persistenslagret tillämpa sin konfiguration på kortet. Det
+		// är det som gör att t.ex. ett kort som byter från statiskt till DHCP
+		// verkligen börjar köra DHCP på OS-nivå, i stället för att bara få
+		// den gamla adressen bortplockad.
+		device := iface.Device
+		if isVLAN {
+			device = fmt.Sprintf("%s.%d", iface.Parent, iface.VLANID)
+		}
+		applied := false
+		if backend != nil {
+			if err := backend.Reconfigure(ctx, device); err != nil {
+				log.Printf("[NET] %s kunde inte konfigurera om %s: %v", backend.Name(), device, err)
+			} else {
+				applied = true
+			}
+		}
+
+		// 3. Den imperativa `ip`-vägen som FALLBACK — inte som komplement.
+		// Kördes den även när persistenslagret lyckats skulle den flusha och
+		// sätta om en adress som just satts (och för ett DHCP-kort trigga en
+		// andra, onödig förhandling direkt efter den första).
+		if !applied {
+			if err := netAdapter.ApplyInterfaceConfig(ctx, iface); err != nil {
+				log.Printf("[NET] kunde inte tillämpa gränssnitt %s: %v", iface.Device, err)
+			}
+		}
+
+		// Oavsett väg: ett internt kort får aldrig behålla en default-rutt.
+		// Persistenslagren är konfigurerade att inte skapa någon, men en rutt
+		// som redan LIGGER där (t.ex. från en DHCP-lease kortet hade innan
+		// det byttes till statiskt) försvinner inte av sig själv.
+		if iface.Enabled && !strings.EqualFold(iface.Zone, "WAN") {
+			netAdapter.RemoveDefaultRoute(ctx, device)
 		}
 	}
 
@@ -321,6 +412,8 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 	// finns KVAR i newCfg). Ett borttaget VLAN-subinterface rivs helt; ett
 	// borttaget fysiskt kort får sina adresser och default-rutt bortflushade
 	// (själva enheten kan ligga kvar i hypervisorn tills den tas bort där).
+	// Deras poster i persistenslagret städas av backend.Write ovan, som
+	// skriver hela konfigurationen och tar bort det som inte längre finns.
 	if prevCfg != nil {
 		newByID := map[string]bool{}
 		for _, iface := range newCfg.Interfaces {
@@ -452,8 +545,11 @@ func (e *Engine) GetDHCPLeases() ([]dhcp.LeaseDetail, error) {
 // återskapa det tillstånd som redan var bekräftat innan omstarten.
 func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
 	running := e.store.GetRunningConfig()
-	// prevCfg=nil → rör inga befintliga fysiska gränssnitt vid boot (deras
-	// IP är externt konfigurerad), skapa bara VLAN som saknas på systemet.
+	// prevCfg=nil → ingen tidigare konfiguration att jämföra med. Då avgör
+	// systemets faktiska tillstånd vilka kort som behöver röras: de som redan
+	// stämmer lämnas orörda, de som glidit ifrån konfigurationen (t.ex. en
+	// statisk management-IP som ersatts av en DHCP-lease) rättas. Se
+	// applyInterfaces.
 	e.applyInterfaces(ctx, running, nil)
 	e.applyStaticRoutes(ctx, running, nil)
 	return e.applyBackends(ctx, running, false)
@@ -1673,4 +1769,40 @@ func (e *Engine) RestoreConfigFromHistory(id, user string) (*config.Config, erro
 	}
 	_ = e.store.LogAudit(user, "RESTORE_CONFIG_HISTORY", fmt.Sprintf("Laddade sparad konfiguration %s som kandidat", id))
 	return cfg, nil
+}
+
+// lanDHCPWarnings varnar för interna gränssnitt som hämtar sin egen adress
+// via DHCP. En brandvägg bör ha en fast adress på insidan: klienterna får
+// brandväggens IP som gateway och DNS i sina egna DHCP-svar, så ändras
+// brandväggens adress när leasen förnyas pekar hela LAN:et fel tills de
+// hunnit förnya. Kör kortet dessutom en DHCP-SERVER är läget direkt
+// motsägelsefullt — den delar ut en gateway-adress den själv inte äger.
+//
+// Medvetet en VARNING och inte ett valideringsfel. En färsk installation
+// ärver det korten redan är inställda på (se store.adoptSystemAddressing),
+// och ligger LAN på DHCP där ska administratören kunna applicera sina
+// brandväggsregler och byta till en statisk adress i lugn och ro — inte
+// mötas av ett Apply som vägrar gå igenom.
+func lanDHCPWarnings(cfg *config.Config) []BackendWarning {
+	var out []BackendWarning
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled || iface.AddressType != "dhcp" {
+			continue
+		}
+		if strings.EqualFold(iface.Zone, "WAN") || strings.EqualFold(iface.Zone, "HOST") {
+			continue
+		}
+		label := iface.Name
+		if label == "" {
+			label = iface.Device
+		}
+		msg := fmt.Sprintf("Gränssnittet %q (zon %s) hämtar sin adress via DHCP. "+
+			"Brandväggens interna kort bör ha en fast adress — klienterna får den som "+
+			"gateway och DNS, och pekar fel om den ändras.", label, iface.Zone)
+		if iface.DHCP != nil && iface.DHCP.Enabled {
+			msg += " Kortet kör dessutom en DHCP-server, som delar ut en gateway-adress brandväggen själv inte äger."
+		}
+		out = append(out, BackendWarning{Backend: "interfaces", Message: msg})
+	}
+	return out
 }

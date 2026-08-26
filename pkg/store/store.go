@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
@@ -95,6 +96,7 @@ func (s *Store) loadOrInit(seedMode string) error {
 	runningPath := filepath.Join(s.baseDir, "running.json")
 	if _, err := os.Stat(runningPath); os.IsNotExist(err) {
 		defaultCfg := defaultSeedConfig(seedMode)
+		adoptSystemAddressing(defaultCfg)
 		s.runningCfg = defaultCfg
 		s.candidateCfg = cloneConfig(defaultCfg)
 		return s.saveConfigLocked(runningPath, defaultCfg)
@@ -264,14 +266,12 @@ func defaultSeedConfig(seedMode string) *config.Config {
 
 	base.Interfaces = []config.Interface{
 		{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
-		// LAN i DHCP-läge vid seed: en färsk installation vet inte vilket
-		// subnät LAN-sidan har, och en hårdkodad statisk IP (tidigare
-		// 10.0.0.163/24 från dev-referensmiljön) är både förvirrande — den
-		// visas fast servern inte har den adressen — och en FÄLLA: ett Apply
-		// hade satt om LAN till den IP:n och kapat administratörens
-		// anslutning (och krockat med en annan låda på samma nät). DHCP håller
-		// i stället kvar den adress servern redan fått tills administratören
-		// själv sätter en statisk LAN-IP + DHCP-scope via GUI:t.
+		// Adresstyperna här är bara ett utgångsläge: adoptSystemAddressing
+		// skriver över dem med vad korten FAKTISKT är inställda på innan
+		// configen sparas första gången. En hårdkodad statisk IP hade annars
+		// varit en fälla — ett Apply hade flyttat lådan dit och kapat
+		// administratörens anslutning — medan ett hårdkodat "dhcp" lika tyst
+		// hade kastat bort en redan satt statisk management-adress.
 		{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "dhcp"},
 	}
 	base.Zones = []config.Zone{
@@ -919,4 +919,41 @@ func (s *Store) LogAudit(user, action, details string) error {
 
 	_, err = f.Write(data)
 	return err
+}
+
+// adoptSystemAddressing låter en FÄRSK installation ta över den
+// adresskonfiguration korten redan har på OS-nivå, i stället för att påtvinga
+// seed-configens gissning.
+//
+// Regeln användaren satte 2026-08-26: är kortet inställt på DHCP ska det
+// förbli DHCP, och är det redan statiskt ska ingenting ändras. Det undviker
+// båda fällorna. En hårdkodad statisk seed-IP (tidigare 10.0.0.163/24 från
+// dev-referensmiljön) hade vid första appliceringen flyttat lådan dit och
+// kapat administratörens session — men motsatsen är lika illa: en maskin som
+// installerats med en medvetet satt statisk management-adress ska inte tyst
+// hamna på en DHCP-lease bara för att seed-configen råkar säga "dhcp".
+//
+// Körs BARA när running.json saknas, alltså exakt en gång per installation.
+// Därefter är configen sanningen och skrivs ner på OS-nivå vid varje
+// applicering (se pkg/adapter/network/persist.go).
+func adoptSystemAddressing(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	for i := range cfg.Interfaces {
+		iface := &cfg.Interfaces[i]
+		// VLAN har ingen befintlig OS-konfiguration att ärva — de skapas
+		// först av agenten — och seedas aldrig med adress ändå.
+		if iface.VLANID > 0 {
+			continue
+		}
+		addressType, ipv4, gateway := network.AdoptSystemAddressing(iface.Device)
+		iface.AddressType = addressType
+		iface.IPv4 = ipv4
+		if strings.EqualFold(iface.Zone, "WAN") {
+			iface.Gateway = gateway
+		}
+		log.Printf("[INIT] %s ärver befintlig konfiguration från systemet: %s %s",
+			iface.Device, addressType, ipv4)
+	}
 }

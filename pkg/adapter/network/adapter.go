@@ -244,7 +244,9 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 		go func(device string, isWAN bool) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			runDHClientOnce(ctx, device, isWAN)
+			if err := runDHClientOnce(ctx, device, isWAN); err != nil {
+				log.Printf("[NÄTVERK] kunde inte hämta DHCP-adress för %s: %v", device, err)
+			}
 		}(iface.Device, isWAN)
 	}
 
@@ -255,15 +257,29 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 	// här; DHCP-fallet hanteras dessutom inne i goroutinen ovan efter att
 	// dhclient hunnit installera sin rutt.
 	if iface.Enabled && !strings.EqualFold(iface.Zone, "WAN") {
-		// Kan finnas flera default-rutter via samma kort; loopa tills slut.
-		for i := 0; i < 8; i++ {
-			if err := exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", iface.Device).Run(); err != nil {
-				break
-			}
-		}
+		a.RemoveDefaultRoute(ctx, iface.Device)
 	}
 
 	return nil
+}
+
+// RemoveDefaultRoute tar bort samtliga default-rutter via ett kort. Bruten ur
+// ApplyInterfaceConfig så att den kan köras oavsett vilken väg som
+// konfigurerade kortet — persistenslagret (netplan/NM/networkd) eller den
+// imperativa `ip`-vägen. En brandvägg får ha default-rutt ENDAST via WAN;
+// en kvarglömd rutt via ett internt kort gör egress-valet slumpartat och
+// skickar trafik förbi masquerade och LAN→WAN-policyn, rakt in i Default
+// Deny (skarp incident 2026-08-26).
+func (a *Adapter) RemoveDefaultRoute(ctx context.Context, device string) {
+	if device == "" {
+		return
+	}
+	// Kan finnas flera default-rutter via samma kort; loopa tills slut.
+	for i := 0; i < 8; i++ {
+		if err := exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", device).Run(); err != nil {
+			return
+		}
+	}
 }
 
 // removeStaticAddresses tar bort alla PERMANENTA IPv4-adresser på ett kort
@@ -318,18 +334,38 @@ func removeStaticAddresses(ctx context.Context, device string) {
 // manuellt via RenewDHCP (en "förnya"-knapp i GUI:t, 2026-08-24) utan att
 // gå via en hel gränssnittsapplicering. Anroparen ansvarar för context/
 // timeout och ev. att köra detta i en egen goroutine.
-func runDHClientOnce(ctx context.Context, device string, isWAN bool) {
-	if isWAN {
-		_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
-		return
+func runDHClientOnce(ctx context.Context, device string, isWAN bool) error {
+	// Föredra det lager som faktiskt äger nätverket. dhclient är på väg bort
+	// ur distributionerna — på Ubuntu 26.04 finns paketet inte alls längre,
+	// och eftersom felet från exec ignorerades var hela DHCP-vägen (inklusive
+	// "förnya IP"-knappen i GUI:t) en TYST no-op där. DHCP fungerade bara för
+	// att systemd-networkd råkade göra jobbet i bakgrunden.
+	if backend := DetectPersistBackend(); backend != nil {
+		return backend.Renew(ctx, device)
 	}
+
+	if _, err := exec.LookPath("dhclient"); err != nil {
+		return fmt.Errorf("hittade varken netplan, NetworkManager, systemd-networkd eller dhclient — kan inte begära en DHCP-adress för %s", device)
+	}
+	if isWAN {
+		if out, err := exec.CommandContext(ctx, "dhclient", "-1", "-v", device).CombinedOutput(); err != nil {
+			return fmt.Errorf("dhclient %s: %w - %s", device, err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+
+	var runErr error
 	if confPath, cleanup, err := writeInternalDHClientConf(); err == nil {
 		defer cleanup()
-		_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", "-cf", confPath, device).Run()
-	} else {
-		_ = exec.CommandContext(ctx, "dhclient", "-1", "-v", device).Run()
+		if out, err := exec.CommandContext(ctx, "dhclient", "-1", "-v", "-cf", confPath, device).CombinedOutput(); err != nil {
+			runErr = fmt.Errorf("dhclient %s: %w - %s", device, err, strings.TrimSpace(string(out)))
+		}
+	} else if out, err := exec.CommandContext(ctx, "dhclient", "-1", "-v", device).CombinedOutput(); err != nil {
+		runErr = fmt.Errorf("dhclient %s: %w - %s", device, err, strings.TrimSpace(string(out)))
 	}
+	// Interna kort får aldrig behålla en DHCP-inlärd default-rutt.
 	_ = exec.CommandContext(ctx, "ip", "route", "del", "default", "dev", device).Run()
+	return runErr
 }
 
 // RenewDHCP kör om DHCP-förhandlingen för ETT gränssnitt på begäran (en
@@ -343,8 +379,7 @@ func (a *Adapter) RenewDHCP(ctx context.Context, device string, isWAN bool) erro
 	if device == "" {
 		return fmt.Errorf("gränssnittsenhet saknas")
 	}
-	runDHClientOnce(ctx, device, isWAN)
-	return nil
+	return runDHClientOnce(ctx, device, isWAN)
 }
 
 // writeInternalDHClientConf skriver en tillfällig dhclient-konfiguration som
@@ -485,4 +520,105 @@ func (a *Adapter) ApplyDNSConfig(ctx context.Context, interfaces []config.Interf
 	}
 
 	return os.WriteFile("/etc/resolv.conf", []byte(sb.String()), 0644)
+}
+
+// MatchesSystemState avgör om ett gränssnitt redan ser ut på Linux som
+// konfigurationen säger att det ska göra.
+//
+// Behövs vid boot, där det inte finns någon föregående konfiguration att
+// jämföra med. Tidigare tolkades "ingen jämförelse" som "rör ingenting",
+// vilket lät ett kort ligga kvar i FEL läge hur länge som helst — det var så
+// brandväggen på 10.0.0.9 kunde köra vidare på en DHCP-adress trots att
+// configen sa statiskt 10.0.0.9 (se paketkommentaren i netplan.go). Nu
+// jämförs mot systemets faktiska tillstånd i stället, så ett kort som
+// glidit ifrån sin konfiguration rättas — medan ett kort som redan stämmer
+// lämnas helt orört (ingen flush, ingen bruten session).
+func (a *Adapter) MatchesSystemState(iface config.Interface) bool {
+	device := iface.Device
+	if iface.VLANID > 0 && iface.Parent != "" {
+		device = fmt.Sprintf("%s.%d", iface.Parent, iface.VLANID)
+	}
+	if device == "" {
+		return true
+	}
+
+	link, err := net.InterfaceByName(device)
+	if err != nil {
+		// Enheten finns inte. Ska den vara avstängd är det rätt tillstånd;
+		// ska den vara igång måste den skapas/tas upp.
+		return !iface.Enabled
+	}
+	if isUP := link.Flags&net.FlagUp != 0; isUP != iface.Enabled {
+		return false
+	}
+	if !iface.Enabled {
+		return true
+	}
+
+	permanent, dynamic := deviceAddresses(device)
+
+	// En brandvägg får ha default-rutt ENDAST via WAN. En kvarglömd
+	// default-rutt via ett internt kort räknas som drift även om adressen
+	// stämmer — det var just den (via LAN-kortets DHCP-lease) som gjorde
+	// egress-valet slumpartat under incidenten.
+	if !strings.EqualFold(iface.Zone, "WAN") && hasDefaultRoute(device) {
+		return false
+	}
+
+	if iface.AddressType == "static" && iface.IPv4 != "" {
+		// Adressen ska finnas OCH vara den enda — en kvarglömd DHCP-lease
+		// vid sidan om den statiska adressen är också drift.
+		if len(dynamic) > 0 {
+			return false
+		}
+		for _, addr := range permanent {
+			if addr == iface.IPv4 {
+				return true
+			}
+		}
+		return false
+	}
+
+	// DHCP-läge: kortet ska ha en lease och inga statiska rester.
+	return len(dynamic) > 0 && len(permanent) == 0
+}
+
+// deviceAddresses delar upp ett korts IPv4-adresser i permanenta (statiskt
+// satta) och dynamiska (DHCP-tilldelade). Kärnan markerar de senare med
+// "dynamic" i `ip addr`-utskriften; loopback-adresser hoppas över.
+func deviceAddresses(device string) (permanent, dynamic []string) {
+	out, err := exec.Command("ip", "-4", "-o", "addr", "show", "dev", device).Output()
+	if err != nil {
+		return nil, nil
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		cidr := ""
+		for i, f := range fields {
+			if f == "inet" && i+1 < len(fields) {
+				cidr = fields[i+1]
+				break
+			}
+		}
+		if cidr == "" || strings.HasPrefix(cidr, "127.") {
+			continue
+		}
+		if strings.Contains(line, "dynamic") {
+			dynamic = append(dynamic, cidr)
+		} else {
+			permanent = append(permanent, cidr)
+		}
+	}
+	return permanent, dynamic
+}
+
+func hasDefaultRoute(device string) bool {
+	out, err := exec.Command("ip", "-4", "route", "show", "default", "dev", device).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
 }
