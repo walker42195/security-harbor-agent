@@ -13,11 +13,13 @@ package haproxy
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/svc"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
@@ -229,11 +231,18 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 		return nil
 	}
 
-	if err := os.WriteFile(a.cfgPath, []byte(text), 0644); err != nil {
+	changed, err := svc.WriteIfChanged(a.cfgPath, []byte(text))
+	if err != nil {
 		return fmt.Errorf("misslyckades skriva %s: %w", a.cfgPath, err)
 	}
-	if out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("systemctl restart %s misslyckades: %w - output: %s", unit, err, string(out))
+	// Omstart bara vid ändrad konfiguration (eller om tjänsten inte redan
+	// kör): en omstart bryter pågående SNI-routade anslutningar i onödan.
+	restarted, err := svc.RestartIfNeeded(ctx, unit, changed)
+	if err != nil {
+		return err
+	}
+	if !restarted {
+		log.Printf("[HAPROXY] konfigurationen oförändrad - hoppar över omstart av %s", unit)
 	}
 	return nil
 }

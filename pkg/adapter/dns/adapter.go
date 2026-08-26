@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/svc"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
@@ -311,53 +313,44 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, domains [
 	if err := os.MkdirAll(a.dir, 0755); err != nil {
 		return fmt.Errorf("misslyckades skapa katalog %s: %w", a.dir, err)
 	}
-	if err := atomicWriteInDir(a.dir, "security-harbor.conf", []byte(serverConf)); err != nil {
+	// changed ackumulerar om NÅGON av konfigurationsfilerna faktiskt ändrades.
+	// Unbound startas om bara då (eller om den inte redan kör): en omstart tar
+	// DNS ur drift i flera sekunder medan blocklistan läses in på nytt, och
+	// för klienterna på LAN:et ser det ut som att internet försvinner. Vid en
+	// agentuppdatering är konfigurationen typiskt identisk — då ska DNS inte
+	// gå ner alls (rapporterat 2026-08-26).
+	changed := false
+
+	serverChanged, err := svc.WriteIfChanged(filepath.Join(a.dir, "security-harbor.conf"), []byte(serverConf))
+	if err != nil {
 		return fmt.Errorf("misslyckades skriva security-harbor.conf: %w", err)
 	}
+	changed = changed || serverChanged
+
 	if hasAnyBlocklistSource(cfg.DNS) {
 		blocklistConf := GenerateBlocklistConfig(domains, cfg)
-		if err := atomicWriteInDir(a.dir, blocklistFilename, []byte(blocklistConf)); err != nil {
+		blocklistChanged, err := svc.WriteIfChanged(blocklistPath, []byte(blocklistConf))
+		if err != nil {
 			return fmt.Errorf("misslyckades skriva %s: %w", blocklistFilename, err)
 		}
+		changed = changed || blocklistChanged
 	}
 	if cfg.DNS.DHCPHostnameRegistration || len(cfg.DNS.StaticRecords) > 0 {
 		hostsConf := GenerateHostsConfig(leases, cfg)
-		if err := atomicWriteInDir(a.dir, hostsFilename, []byte(hostsConf)); err != nil {
+		hostsChanged, err := svc.WriteIfChanged(hostsPath, []byte(hostsConf))
+		if err != nil {
 			return fmt.Errorf("misslyckades skriva %s: %w", hostsFilename, err)
 		}
+		changed = changed || hostsChanged
 	}
 
-	if out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("systemctl restart %s misslyckades: %w - output: %s", unit, err, string(out))
-	}
-
-	return nil
-}
-
-// atomicWriteInDir skriver data till dir/name atomiskt via en temp-fil i samma
-// katalog + rename. Samma mönster som kea-adaptern: skrivbarheten hänger på att
-// KATALOGEN är grupp-skrivbar för tjänstekontot (install.sh), inte på målfilens
-// ägare — unbounds conf.d-filer installeras/ersätts annars av paketet som
-// root:root, och en direkt os.WriteFile (O_TRUNC) på en sådan fil failar med
-// "permission denied" även om katalogen är skrivbar. Rename byter ut filen
-// atomiskt så unbound aldrig läser en halvskriven config.
-func atomicWriteInDir(dir, name string, data []byte) error {
-	tmp, err := os.CreateTemp(dir, "."+name+".*")
+	restarted, err := svc.RestartIfNeeded(ctx, unit, changed)
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op efter lyckad rename
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+	if !restarted {
+		log.Printf("[DNS] konfigurationen oförändrad - hoppar över omstart av %s", unit)
 	}
-	if err := tmp.Chmod(0644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, filepath.Join(dir, name))
+
+	return nil
 }

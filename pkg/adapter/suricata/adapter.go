@@ -14,10 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"regexp"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/svc"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
@@ -115,14 +117,24 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(orig, updated) {
+	changed := !bytes.Equal(orig, updated)
+	if changed {
 		if err := os.WriteFile(a.yamlPath, updated, 0644); err != nil {
 			return fmt.Errorf("misslyckades skriva %s: %w", a.yamlPath, err)
 		}
 	}
 
-	if out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("systemctl restart %s misslyckades: %w - output: %s", unit, err, string(out))
+	// Suricata startas om BARA när konfigurationen ändrats (eller om den inte
+	// redan kör). Omstarten är den i särklass dyraste i hela appliceringen —
+	// ET Open-regelsetet (~68 500 regler) tog 36 av appliceringens 41 sekunder
+	// vid mätningen 2026-08-26 — och konfigurationen ändras nästan aldrig,
+	// t.ex. inte alls vid en agentuppdatering.
+	restarted, err := svc.RestartIfNeeded(ctx, unit, changed)
+	if err != nil {
+		return err
+	}
+	if !restarted {
+		log.Printf("[IDS] konfigurationen oförändrad - hoppar över omstart av %s", unit)
 	}
 	return nil
 }

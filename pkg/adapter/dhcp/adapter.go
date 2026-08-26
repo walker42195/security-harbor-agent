@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/svc"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
 
@@ -159,40 +160,27 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 		return nil
 	}
 
-	// Atomisk skrivning: skriv till en temp-fil i SAMMA katalog och byt namn
-	// över målet. Detta kräver bara skrivrätt på KATALOGEN (som install.sh ger
-	// tjänstekontot via grupp-skriv på /etc/kea), INTE på själva målfilen —
-	// kea-dhcp4.conf installeras av paketet som root:root, och en direkt
-	// os.WriteFile på den gav "permission denied" (upptäckt på ny server
-	// 2026-08-23 när LAN ändrades från DHCP till statisk). Rename ersätter
-	// dessutom filen atomiskt så kea aldrig läser en halvskriven config.
-	dir := filepath.Dir(a.configPath)
-	_ = os.MkdirAll(dir, 0755)
-	tmp, err := os.CreateTemp(dir, ".kea-dhcp4.conf.*")
+	// Skrivningen är atomär och sker via en temp-fil i SAMMA katalog: det
+	// kräver bara skrivrätt på KATALOGEN (som install.sh ger tjänstekontot via
+	// grupp-skriv på /etc/kea), INTE på själva målfilen — kea-dhcp4.conf
+	// installeras av paketet som root:root, och en direkt os.WriteFile på den
+	// gav "permission denied" (upptäckt på ny server 2026-08-23 när LAN
+	// ändrades från DHCP till statisk). Se svc.WriteIfChanged.
+	_ = os.MkdirAll(filepath.Dir(a.configPath), 0755)
+	changed, err := svc.WriteIfChanged(a.configPath, data)
 	if err != nil {
-		return fmt.Errorf("misslyckades skapa temp-fil i %s: %w", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op om rename redan flyttat den
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("misslyckades skriva %s: %w", tmpName, err)
-	}
-	if err := tmp.Chmod(0644); err != nil {
-		tmp.Close()
-		return fmt.Errorf("misslyckades sätta rättigheter på %s: %w", tmpName, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("misslyckades stänga %s: %w", tmpName, err)
-	}
-	if err := os.Rename(tmpName, a.configPath); err != nil {
-		return fmt.Errorf("misslyckades ersätta %s: %w", a.configPath, err)
+		return fmt.Errorf("misslyckades skriva %s: %w", a.configPath, err)
 	}
 
-	// Starta om kea-dhcp4-server. Felet ytas nu upp (tidigare svalt med _ =) så
-	// att t.ex. en saknad polkit-regel inte tyst gör att DHCP inte startar om.
-	if out, err := exec.CommandContext(ctx, "systemctl", "restart", "kea-dhcp4-server.service").CombinedOutput(); err != nil {
-		return fmt.Errorf("systemctl restart kea-dhcp4-server.service misslyckades: %w - output: %s", err, string(out))
+	// Kea startas om bara när konfigurationen ändrats (eller om den inte redan
+	// kör). En omstart tar DHCP ur drift, och konfigurationen är typiskt
+	// identisk vid t.ex. en agentuppdatering.
+	restarted, err := svc.RestartIfNeeded(ctx, "kea-dhcp4-server.service", changed)
+	if err != nil {
+		return err
+	}
+	if !restarted {
+		log.Printf("[DHCP] konfigurationen oförändrad - hoppar över omstart av kea-dhcp4-server.service")
 	}
 	return nil
 }

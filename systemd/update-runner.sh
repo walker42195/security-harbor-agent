@@ -74,8 +74,18 @@ log "kör install.sh --mode=$MODE (idempotent uppdatering av binärer, webb-GUI,
 # /var/lib/security-harbor (config/db/nycklar).
 ( cd "$WORK" && ./install.sh "${INSTALL_ARGS[@]}" )
 
-log "startar om agenten på den nya versionen..."
-systemctl restart security-harbor-agent.service
+# install.sh startar SJÄLV om agenten (steg 7) — den nya binären är redan på
+# plats när det sker. En omstart här ovanpå gjorde att hela boot-appliceringen
+# kördes TVÅ gånger: unbound, kea, haproxy och suricata startades om två gånger
+# i rad, vilket dubblade avbrottet för klienterna vid varje uppdatering
+# (uppmätt 2026-08-26). Starta därför bara om något gick fel och tjänsten inte
+# kör.
+if systemctl is-active --quiet security-harbor-agent.service; then
+    log "agenten kör redan på den nya versionen (omstartad av install.sh)."
+else
+    log "agenten kör inte efter install.sh - startar den..."
+    systemctl restart security-harbor-agent.service
+fi
 
 log "klart. Städar staging."
 rm -f "$TARBALL" "$SIG" "$STAGING_DIR/staged-version.txt"
