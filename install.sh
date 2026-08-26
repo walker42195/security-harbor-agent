@@ -113,6 +113,7 @@ if [ "$MODE" = "host" ]; then
 else
   apt-get install -y \
     nftables \
+    chrony \
     kea-dhcp4-server \
     unbound \
     wireguard-tools \
@@ -212,7 +213,7 @@ fi
 # ligger också root:root efter paketinstallationen. Missades 2026-08-23:
 # /etc/unbound blev grupp-skrivbar men conf.d inte, så DNS-applicering failade
 # med "open .../security-harbor.conf: permission denied". Ta med conf.d i loopen.
-for d in /etc/kea /etc/unbound /etc/unbound/unbound.conf.d /etc/openvpn /etc/wireguard; do
+for d in /etc/kea /etc/unbound /etc/unbound/unbound.conf.d /etc/openvpn /etc/wireguard /etc/chrony/conf.d; do
   if [ -d "$d" ]; then
     chgrp security-harbor "$d"
     chmod g+wx "$d"

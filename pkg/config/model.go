@@ -7,6 +7,7 @@ type Config struct {
 	Version      int              `json:"version"`                 // Konfigurationsversion
 	Revision     int64            `json:"revision"`                // Inkrementeras vid varje commit
 	UpdatedAt    time.Time        `json:"updated_at"`              // Tidstämpel för senaste ändring
+	NTP          *NTPConfig       `json:"ntp,omitempty"`           // Brandväggen som NTP-server för interna nät
 	Interfaces   []Interface      `json:"interfaces"`              // Fysiska nätverkskort & VLANs
 	Zones        []Zone           `json:"zones"`                   // Zoner (WAN, LAN, SERVERS, IOT, GUEST, VPN)
 	Objects      []Object         `json:"objects"`                 // Objekt (Hosts, Subnets, IP-listor, GeoIP)
@@ -392,6 +393,19 @@ type Settings struct {
 	// medan administratören satt i CEST blev loggen två timmar fel, utan att
 	// något var trasigt (rapporterat 2026-08-26).
 	Timezone string `json:"timezone,omitempty"`
+}
+
+// NTPConfig styr om brandväggen ska agera NTP-server åt de interna näten.
+//
+// Enheter i DMZ och på IoT-VLAN behöver rätt tid för certifikatvalidering och
+// TLS — men de ska inte behöva nå ut till internet för att få den. Med
+// brandväggen som tidskälla räcker det att öppna UDP 123 mot den.
+type NTPConfig struct {
+	Enabled bool `json:"enabled"`
+	// ServeWhenUnsynced låter brandväggen svara även innan den själv hunnit
+	// synka mot en uppström ("local stratum 10"). Utan det står klienterna
+	// utan tid efter varje omstart tills en källa hittats.
+	ServeWhenUnsynced bool `json:"serve_when_unsynced"`
 }
 
 const (

@@ -923,6 +923,43 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		}
 	}
 
+	// Input 4c: Tillåt NTP (UDP 123) till brandväggen själv från LAN/VLAN när
+	// NTP-servern är påslagen. Följer NTP.Enabled automatiskt, samma mönster
+	// som DNS-regeln nedan.
+	//
+	// ENDAST interna kort. En NTP-server nåbar från WAN är ett klassiskt
+	// förstärkningsverktyg för DDoS (NTP amplification) — den får aldrig
+	// hamna där, och lanDevices innehåller per definition inga WAN-kort.
+	if cfg.NTP != nil && cfg.NTP.Enabled {
+		for _, lanDev := range lanDevices {
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family:  a.family,
+					Table:   a.tableName,
+					Chain:   "input",
+					Comment: fmt.Sprintf("Allow NTP (UDP 123) on LAN %s", lanDev),
+					Expr: []interface{}{
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+								"right": lanDev,
+							},
+						},
+						map[string]interface{}{
+							"match": map[string]interface{}{
+								"op":    "==",
+								"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}},
+								"right": 123,
+							},
+						},
+						map[string]interface{}{"accept": nil},
+					},
+				},
+			})
+		}
+	}
+
 	// Input 4b: Tillåt DNS (UDP+TCP 53) till brandväggen själv från LAN/VLAN
 	// när den lokala resolvern är aktiverad (Fas 6). Precis som Management
 	// API ovan är detta INTE en konfigurerbar policy — den följer bara

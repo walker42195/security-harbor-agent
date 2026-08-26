@@ -16,6 +16,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/haproxy"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/ntp"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/suricata"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/syslog"
@@ -43,6 +44,7 @@ type Engine struct {
 	ovpnAdapter     *openvpn.Adapter
 	dnsAdapter      *dns.Adapter
 	syslogAdapter   *syslog.Adapter
+	ntpAdapter      *ntp.Adapter
 	suricataAdapter *suricata.Adapter
 	haproxyAdapter  *haproxy.Adapter
 	state           State
@@ -98,6 +100,7 @@ func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.
 		ovpnAdapter:     ovpnAdapter,
 		dnsAdapter:      dnsAdapter,
 		syslogAdapter:   syslogAdapter,
+		ntpAdapter:      ntp.NewAdapter(""),
 		suricataAdapter: suricataAdapter,
 		haproxyAdapter:  haproxyAdapter,
 		state:           StateIdle,
@@ -214,6 +217,17 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 
 	if err := e.syslogAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
 		return fmt.Errorf("syslog: %w", err)
+	}
+
+	// NTP-servern styr ingen trafik — att chrony inte kan startas om får inte
+	// fälla en applicering som i övrigt är korrekt. Samma resonemang som för
+	// IDS ovan.
+	if err := e.ntpAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+		log.Printf("[APPLY] VARNING: NTP-servern kunde inte konfigureras: %v", err)
+		warnings = append(warnings, BackendWarning{
+			Backend: "ntp",
+			Message: fmt.Sprintf("NTP-servern kunde inte konfigureras: %v. Interna enheter kan inte hämta tid från brandväggen.", err),
+		})
 	}
 
 	// IDS (Suricata) är PASSIV övervakning — den styr ingen trafik. Att den
