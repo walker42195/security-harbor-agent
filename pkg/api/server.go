@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/timezone"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
@@ -76,6 +77,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/system", s.authMiddleware(s.handleSystemStatus))
 	mux.HandleFunc("/api/v1/interfaces/discover", s.authMiddleware(s.handleDiscoverInterfaces))
 	mux.HandleFunc("/api/v1/system/timezones", s.authMiddleware(s.handleTimezones))
+	mux.HandleFunc("/api/v1/policies/implicit", s.authMiddleware(s.handleImplicitPolicies))
 	mux.HandleFunc("/api/v1/diagnostics/conntrack", s.authMiddleware(s.handleConntrack))
 	mux.HandleFunc("/api/v1/diagnostics/firewall-log", s.authMiddleware(s.handleFirewallLog))
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
@@ -2111,4 +2113,16 @@ func (s *Server) handleTimezones(w http.ResponseWriter, r *http.Request) {
 		"current":   timezone.Current(),
 		"available": timezone.Available(),
 	})
+}
+
+// handleImplicitPolicies beskriver de regler adaptern genererar själv
+// (loopback, etablerade anslutningar, VPN-portar, WAN-drop, DNS, NTP).
+//
+// De finns inte som Policy-objekt och gick därför inte att se någonstans i
+// GUI:t — man kunde inte svara på "vad är öppet mot brandväggen själv?" utan
+// SSH. Beskrivningarna räknas fram ur RUNNING-configen, alltså det som
+// faktiskt gäller, inte ur kandidaten.
+func (s *Server) handleImplicitPolicies(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(nftables.DescribeImplicitRules(s.engine.GetRunningConfig()))
 }

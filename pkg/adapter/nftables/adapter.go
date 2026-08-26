@@ -463,6 +463,48 @@ func cidrsToSetElements(cidrs []string) []interface{} {
 	return elements
 }
 
+// implicitTail bygger svansen på en IMPLICIT regel: räknare, loggrad och
+// verdikt.
+//
+// Implicita regler (loopback, established, VPN-portar på WAN, DNS, NTP,
+// HARD WAN DROP) genereras direkt av adaptern och finns inte som Policy-
+// objekt. De saknade tidigare både räknare och logg, vilket gjorde dem
+// osynliga: man kunde inte svara på "vad är öppet mot brandväggen själv?"
+// eller "frågar mina IoT-enheter faktiskt efter tid?" utan att logga in med
+// SSH och läsa nft-utskriften.
+//
+// Loggprefixet följer samma konvention som policyreglerna
+// (SH-ACCEPT/DENY-INPUT-namn:), så parseFirewallLog i pkg/api plockar upp
+// dem utan ändring och de dyker upp i trafikloggen som allt annat.
+func implicitTail(accept bool, name string) []interface{} {
+	word := "DENY"
+	verdict := map[string]interface{}{"drop": nil}
+	if accept {
+		word = "ACCEPT"
+		verdict = map[string]interface{}{"accept": nil}
+	}
+	return []interface{}{
+		map[string]interface{}{"counter": nil},
+		map[string]interface{}{"log": map[string]interface{}{
+			"prefix": fmt.Sprintf("SH-%s-INPUT-%s: ", word, logSlug(name)),
+		}},
+		verdict,
+	}
+}
+
+// implicitCounterOnly är svansen för regler som ska RÄKNAS men aldrig loggas.
+//
+// Gäller loopback och established/related. De matchar varje paket i varje
+// pågående anslutning — en loggrad per paket vore gigabyte per timme, hög
+// CPU-last och en logg där de intressanta raderna dränks. Räknaren ger ändå
+// svaret på "träffar den här regeln?", vilket är det man vill veta.
+func implicitCounterOnly() []interface{} {
+	return []interface{}{
+		map[string]interface{}{"counter": nil},
+		map[string]interface{}{"accept": nil},
+	}
+}
+
 // zoneMatchExpr bygger ett nftables match-uttryck som begränsar en policy
 // till trafik som passerar in/ut via ett gränssnitt i den angivna zonen
 // (via `meta iifname`/`oifname` mot en mängd device-namn). Samma
@@ -670,7 +712,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			Table:   a.tableName,
 			Chain:   "input",
 			Comment: "Allow loopback interface",
-			Expr: []interface{}{
+			Expr: append([]interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
 						"op":    "==",
@@ -678,8 +720,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 						"right": "lo",
 					},
 				},
-				map[string]interface{}{"accept": nil},
-			},
+			}, implicitCounterOnly()...),
 		},
 	})
 
@@ -690,7 +731,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			Table:   a.tableName,
 			Chain:   "input",
 			Comment: "Allow established/related connections",
-			Expr: []interface{}{
+			Expr: append([]interface{}{
 				map[string]interface{}{
 					"match": map[string]interface{}{
 						"op":    "in",
@@ -698,8 +739,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 						"right": []string{"established", "related"},
 					},
 				},
-				map[string]interface{}{"accept": nil},
-			},
+			}, implicitCounterOnly()...),
 		},
 	})
 
@@ -713,7 +753,9 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					Table:   a.tableName,
 					Chain:   "input",
 					Comment: fmt.Sprintf("Allow WireGuard (UDP %d) on WAN %s", cfg.WireGuard.ListenPort, wanDev),
-					Expr: []interface{}{
+					// implicitTail nedan: räknare + logg, så VPN-anslutningar
+					// syns i trafikloggen som all annan trafik.
+					Expr: append([]interface{}{
 						map[string]interface{}{
 							"match": map[string]interface{}{
 								"op":    "==",
@@ -728,8 +770,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 								"right": cfg.WireGuard.ListenPort,
 							},
 						},
-						map[string]interface{}{"accept": nil},
-					},
+					}, implicitTail(true, "WireGuard VPN")...),
 				},
 			})
 		}
@@ -755,7 +796,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					Table:   a.tableName,
 					Chain:   "input",
 					Comment: fmt.Sprintf("Allow OpenVPN (%s %d) on WAN %s", strings.ToUpper(proto), cfg.OpenVPN.ListenPort, wanDev),
-					Expr: []interface{}{
+					Expr: append([]interface{}{
 						map[string]interface{}{
 							"match": map[string]interface{}{
 								"op":    "==",
@@ -770,8 +811,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 								"right": cfg.OpenVPN.ListenPort,
 							},
 						},
-						map[string]interface{}{"accept": nil},
-					},
+					}, implicitTail(true, "OpenVPN")...),
 				},
 			})
 		}
@@ -791,7 +831,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					Table:   a.tableName,
 					Chain:   "input",
 					Comment: fmt.Sprintf("Allow SNI route %q (TCP %d) on WAN %s", r.Name, r.ListenPort, wanDev),
-					Expr: []interface{}{
+					Expr: append([]interface{}{
 						map[string]interface{}{
 							"match": map[string]interface{}{
 								"op":    "==",
@@ -806,8 +846,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 								"right": r.ListenPort,
 							},
 						},
-						map[string]interface{}{"accept": nil},
-					},
+					}, implicitTail(true, "SNI-routning")...),
 				},
 			})
 		}
@@ -821,7 +860,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				Table:   a.tableName,
 				Chain:   "input",
 				Comment: fmt.Sprintf("HARD WAN DROP ALL INCOMING on %s", wanDev),
-				Expr: []interface{}{
+				Expr: append([]interface{}{
 					map[string]interface{}{
 						"match": map[string]interface{}{
 							"op":    "==",
@@ -829,8 +868,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 							"right": wanDev,
 						},
 					},
-					map[string]interface{}{"drop": nil},
-				},
+				}, implicitTail(false, "WAN Drop")...),
 			},
 		})
 	}
@@ -969,7 +1007,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					Table:   a.tableName,
 					Chain:   "input",
 					Comment: fmt.Sprintf("Allow NTP (UDP 123) on LAN %s", lanDev),
-					Expr: []interface{}{
+					Expr: append([]interface{}{
 						map[string]interface{}{
 							"match": map[string]interface{}{
 								"op":    "==",
@@ -984,8 +1022,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 								"right": 123,
 							},
 						},
-						map[string]interface{}{"accept": nil},
-					},
+					}, implicitTail(true, "NTP till brandvaggen")...),
 				},
 			})
 		}
@@ -1005,7 +1042,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 						Table:   a.tableName,
 						Chain:   "input",
 						Comment: fmt.Sprintf("Allow DNS (%s 53) on LAN %s", strings.ToUpper(proto), lanDev),
-						Expr: []interface{}{
+						Expr: append([]interface{}{
 							map[string]interface{}{
 								"match": map[string]interface{}{
 									"op":    "==",
@@ -1020,8 +1057,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 									"right": 53,
 								},
 							},
-							map[string]interface{}{"accept": nil},
-						},
+						}, implicitTail(true, "DNS till brandvaggen")...),
 					},
 				})
 			}
@@ -1042,7 +1078,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					Table:   a.tableName,
 					Chain:   "input",
 					Comment: fmt.Sprintf("Allow SNI route %q (TCP %d) on LAN %s", r.Name, r.ListenPort, lanDev),
-					Expr: []interface{}{
+					Expr: append([]interface{}{
 						map[string]interface{}{
 							"match": map[string]interface{}{
 								"op":    "==",
@@ -1057,8 +1093,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 								"right": r.ListenPort,
 							},
 						},
-						map[string]interface{}{"accept": nil},
-					},
+					}, implicitTail(true, "SNI-routning")...),
 				},
 			})
 		}
