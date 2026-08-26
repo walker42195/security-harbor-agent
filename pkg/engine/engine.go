@@ -196,10 +196,15 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 			return fmt.Errorf("openvpn: kunde inte generera CRL: %w", err)
 		}
 
-		if err := e.ovpnAdapter.ApplyConfig(ctx, cfg, ca.CertPEM, serverCert.CertPEM, serverCert.KeyPEM, crl, dryRun); err != nil {
+		tlsCryptKey, err := e.store.EnsureOpenVPNTLSCryptKey()
+		if err != nil {
+			return fmt.Errorf("openvpn: kunde inte hämta tls-crypt-nyckel: %w", err)
+		}
+
+		if err := e.ovpnAdapter.ApplyConfig(ctx, cfg, ca.CertPEM, serverCert.CertPEM, serverCert.KeyPEM, crl, tlsCryptKey, dryRun); err != nil {
 			return fmt.Errorf("openvpn: %w", err)
 		}
-	} else if err := e.ovpnAdapter.ApplyConfig(ctx, cfg, "", "", "", "", dryRun); err != nil {
+	} else if err := e.ovpnAdapter.ApplyConfig(ctx, cfg, "", "", "", "", "", dryRun); err != nil {
 		return fmt.Errorf("openvpn: %w", err)
 	}
 
@@ -1631,6 +1636,13 @@ func (e *Engine) GetOpenVPNCACertPEM() (string, error) {
 		return "", err
 	}
 	return ca.CertPEM, nil
+}
+
+// GetOpenVPNTLSCryptKey returnerar tls-crypt-nyckeln så att den kan bakas in
+// i en klientprofil. Nyckeln är hemlig — den får bara lämna brandväggen som
+// en del av en .ovpn-fil till en klient som ändå ska in.
+func (e *Engine) GetOpenVPNTLSCryptKey() (string, error) {
+	return e.store.EnsureOpenVPNTLSCryptKey()
 }
 
 // IssueOpenVPNClient signerar ett nytt klientcertifikat med brandväggens CA.

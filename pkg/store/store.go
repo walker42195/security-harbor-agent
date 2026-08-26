@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
@@ -891,6 +892,44 @@ func (s *Store) EnsureOpenVPNServerCert() (*pki.KeyPair, error) {
 	return s.loadOrCreateKeyPair("openvpn_server.key.enc", func() (*pki.KeyPair, error) {
 		return pki.IssueCert(ca.CertPEM, ca.KeyPEM, "security-harbor-server", true)
 	})
+}
+
+// EnsureOpenVPNTLSCryptKey returnerar brandväggens tls-crypt-nyckel och
+// genererar+krypterar en ny vid första anropet, samma mönster som CA:n ovan.
+//
+// Nyckeln är delad mellan servern och alla klientprofiler. Att byta den
+// stänger därför ute varje redan utfärdad profil — den genereras en gång och
+// roteras aldrig automatiskt.
+func (s *Store) EnsureOpenVPNTLSCryptKey() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	keyPath := filepath.Join(s.baseDir, "openvpn_tls_crypt.key.enc")
+
+	if data, readErr := os.ReadFile(keyPath); readErr == nil {
+		plain, decErr := s.crypto.Decrypt(data)
+		if decErr != nil {
+			return "", fmt.Errorf("misslyckades dekryptera tls-crypt-nyckeln: %w", decErr)
+		}
+		key := string(plain)
+		if !openvpn.ValidTLSCryptKey(key) {
+			return "", fmt.Errorf("korrupt tls-crypt-nyckel i %s", keyPath)
+		}
+		return key, nil
+	}
+
+	key, genErr := openvpn.GenerateTLSCryptKey()
+	if genErr != nil {
+		return "", genErr
+	}
+	cipherBytes, encErr := s.crypto.Encrypt([]byte(key))
+	if encErr != nil {
+		return "", fmt.Errorf("misslyckades kryptera tls-crypt-nyckeln: %w", encErr)
+	}
+	if writeErr := os.WriteFile(keyPath, cipherBytes, 0600); writeErr != nil {
+		return "", fmt.Errorf("misslyckades skriva %s: %w", keyPath, writeErr)
+	}
+	return key, nil
 }
 
 func (s *Store) LogAudit(user, action, details string) error {

@@ -1617,7 +1617,17 @@ func (s *Server) handleOpenVPNGenerateClient(w http.ResponseWriter, r *http.Requ
 	ovpnCopy.CACertPEM = caCertPEM
 	cfgCopy.OpenVPN = &ovpnCopy
 
-	ovpnFile, err := openvpn.GenerateClientConfig(&cfgCopy, certPEM, keyPEM)
+	// Utan tls-crypt-nyckeln kommer profilen inte in på en härdad server:
+	// servern kastar paket som saknar den innan TLS ens börjar. Ett fel här
+	// måste därför stoppa utfärdandet, inte ge en profil som tyst inte
+	// fungerar.
+	tlsCryptKey, err := s.engine.GetOpenVPNTLSCryptKey()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	ovpnFile, err := openvpn.GenerateClientConfig(&cfgCopy, certPEM, keyPEM, tlsCryptKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

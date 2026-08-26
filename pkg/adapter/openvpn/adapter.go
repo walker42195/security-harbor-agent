@@ -24,6 +24,17 @@ import (
 
 const InstanceName = "sh-server"
 
+// tlsCryptFileName är nyckelfilen i a.dir. Skrivs med 0600 — läcker den är
+// tls-crypt-skyddet borta för alla klienter samtidigt.
+const tlsCryptFileName = "tls-crypt.key"
+
+// Kontot serverprocessen växlar ner till efter uppstart. nobody/nogroup finns
+// på Debian och Ubuntu, som är de distributioner installationen stödjer.
+const (
+	unprivilegedUser  = "nobody"
+	unprivilegedGroup = "nogroup"
+)
+
 type Adapter struct {
 	// dir är katalogen där server.conf/ca.crt/server.crt/server.key/crl.pem
 	// skrivs, normalt /etc/openvpn.
@@ -41,7 +52,7 @@ func NewAdapter(dir string) *Adapter {
 // istället för klassiska Diffie-Hellman-parametrar (`openssl dhparam`, som
 // tar lång tid att generera) — från OpenVPN 2.4+ är detta säkert när
 // ECDHE-cipher-sviter används, vilket är standard i moderna OpenSSL-bygen.
-func GenerateServerConfig(cfg *config.Config) (string, error) {
+func GenerateServerConfig(cfg *config.Config, tlsCryptKey string) (string, error) {
 	if cfg.OpenVPN == nil || !cfg.OpenVPN.Enabled {
 		return "", nil
 	}
@@ -61,7 +72,8 @@ func GenerateServerConfig(cfg *config.Config) (string, error) {
 	// Om en SNI-rutt frontar OpenVPN (port-delning på t.ex. 443) äger HAProxy
 	// den publika porten — OpenVPN binder då loopback-TCP i stället, och
 	// HAProxy relayar SNI-lös trafik dit. Kräver TCP (valideras i engine).
-	if fronted, _ := cfg.OpenVPNFrontedBySNI(); fronted {
+	fronted, _ := cfg.OpenVPNFrontedBySNI()
+	if fronted {
 		fmt.Fprintf(&b, "port %d\n", config.OpenVPNLoopbackPort)
 		fmt.Fprintf(&b, "proto tcp-server\n")
 		fmt.Fprintf(&b, "local 127.0.0.1\n")
@@ -80,10 +92,42 @@ func GenerateServerConfig(cfg *config.Config) (string, error) {
 	fmt.Fprintf(&b, "keepalive 10 60\n")
 	fmt.Fprintf(&b, "persist-key\n")
 	fmt.Fprintf(&b, "persist-tun\n")
-	fmt.Fprintf(&b, "cipher AES-256-GCM\n")
+	// data-ciphers ersätter det gamla `cipher`-direktivet. Med enbart
+	// `cipher` FÖRHANDLAR OpenVPN 2.5+ fritt om datakanalens chiffer, och en
+	// klient kan då förmå servern att falla tillbaka på ett svagare val.
+	// Listan här är uttömmande: allt utanför den avvisas.
+	fmt.Fprintf(&b, "data-ciphers AES-256-GCM:AES-128-GCM\n")
+	fmt.Fprintf(&b, "data-ciphers-fallback AES-256-GCM\n")
 	fmt.Fprintf(&b, "auth SHA256\n")
 	fmt.Fprintf(&b, "tls-server\n")
-	fmt.Fprintf(&b, "explicit-exit-notify 1\n")
+	// TLS 1.0 och 1.1 är avskrivna sedan länge; utan den här raden accepterar
+	// OpenVPN dem fortfarande om klienten föreslår det.
+	fmt.Fprintf(&b, "tls-version-min 1.2\n")
+	// Kräver att klientcertifikatet har klient-EKU. Utan detta duger VILKET
+	// certifikat som helst utfärdat av CA:n — och eftersom samma CA utfärdar
+	// både server- och klientcertifikat räcker det annars med en giltig
+	// klientprofil för att spela server mot någon annans klient.
+	fmt.Fprintf(&b, "remote-cert-tls client\n")
+	if tlsCryptKey != "" {
+		// Se GenerateTLSCryptKey för varför det här är den enskilt viktigaste
+		// raden när servern står vänd mot internet.
+		fmt.Fprintf(&b, "tls-crypt %s\n", tlsCryptFileName)
+	}
+	// explicit-exit-notify finns bara för UDP. Med TCP loggar OpenVPN en
+	// varning vid varje start — och en konfiguration som klagar varje gång
+	// lär en att sluta läsa loggen.
+	if protocol == "udp" && !fronted {
+		fmt.Fprintf(&b, "explicit-exit-notify 1\n")
+	}
+	// Släpp root efter uppstart. Serverprocessen behöver root för att skapa
+	// tun-enheten och binda porten, men inget av det efteråt — och det är
+	// efteråt den tar emot trafik från internet. persist-key/persist-tun ovan
+	// är förutsättningen: utan dem kan processen inte läsa om nyckeln eller
+	// återskapa tun-enheten vid en omförhandling när rättigheterna är borta.
+	fmt.Fprintf(&b, "user %s\n", unprivilegedUser)
+	fmt.Fprintf(&b, "group %s\n", unprivilegedGroup)
+	// verb 3 loggar klienters IP-adresser vid varje anslutning. Det är rimligt
+	// på en brandvägg man själv driver, men mer än vad som behövs för drift.
 	fmt.Fprintf(&b, "verb 3\n")
 
 	return b.String(), nil
@@ -93,7 +137,7 @@ func GenerateServerConfig(cfg *config.Config) (string, error) {
 // ca/cert/key) för en given klient. clientCertPEM/clientKeyPEM kommer från
 // pki.IssueCert och sparas ALDRIG på brandväggen — de returneras bara en
 // gång till GUI:t (se API-endpointen generate-client, Fas 4).
-func GenerateClientConfig(cfg *config.Config, clientCertPEM, clientKeyPEM string) (string, error) {
+func GenerateClientConfig(cfg *config.Config, clientCertPEM, clientKeyPEM, tlsCryptKey string) (string, error) {
 	if cfg.OpenVPN == nil {
 		return "", fmt.Errorf("openvpn: ingen serverkonfiguration")
 	}
@@ -120,19 +164,32 @@ func GenerateClientConfig(cfg *config.Config, clientCertPEM, clientKeyPEM string
 	fmt.Fprintf(&b, "persist-key\n")
 	fmt.Fprintf(&b, "persist-tun\n")
 	fmt.Fprintf(&b, "remote-cert-tls server\n")
-	fmt.Fprintf(&b, "cipher AES-256-GCM\n")
+	// Speglar serverns inställningar. Avviker de går anslutningen inte att
+	// upprätta alls — vilket är avsikten: hellre ett tydligt fel än en tyst
+	// nedgradering till något svagare.
+	fmt.Fprintf(&b, "data-ciphers AES-256-GCM:AES-128-GCM\n")
+	fmt.Fprintf(&b, "data-ciphers-fallback AES-256-GCM\n")
 	fmt.Fprintf(&b, "auth SHA256\n")
+	fmt.Fprintf(&b, "tls-version-min 1.2\n")
+	// Håll inte kvar lösenfrasen till den privata nyckeln i minnet mellan
+	// omförhandlingar.
+	fmt.Fprintf(&b, "auth-nocache\n")
 	fmt.Fprintf(&b, "verb 3\n")
 	fmt.Fprintf(&b, "<ca>\n%s</ca>\n", strings.TrimSpace(ovpn.CACertPEM)+"\n")
 	fmt.Fprintf(&b, "<cert>\n%s</cert>\n", strings.TrimSpace(clientCertPEM)+"\n")
 	fmt.Fprintf(&b, "<key>\n%s</key>\n", strings.TrimSpace(clientKeyPEM)+"\n")
+	// Utan tls-crypt-nyckeln kommer klienten inte in på en härdad server —
+	// den måste följa med i profilen.
+	if tlsCryptKey != "" {
+		fmt.Fprintf(&b, "<tls-crypt>\n%s</tls-crypt>\n", strings.TrimSpace(tlsCryptKey)+"\n")
+	}
 
 	return b.String(), nil
 }
 
 // ApplyConfig skriver server.conf + ca.crt/server.crt/server.key/crl.pem och
 // startar/stoppar/restartar openvpn@<InstanceName>.service därefter.
-func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, caCertPEM, serverCertPEM, serverKeyPEM, crlPEM string, dryRun bool) error {
+func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, caCertPEM, serverCertPEM, serverKeyPEM, crlPEM, tlsCryptKey string, dryRun bool) error {
 	unit := "openvpn@" + InstanceName + ".service"
 
 	if cfg.OpenVPN == nil || !cfg.OpenVPN.Enabled {
@@ -143,8 +200,9 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, caCertPEM
 		return nil
 	}
 
-	serverConf, err := GenerateServerConfig(cfg)
-	if err != nil {
+	// Genereras även vid dry-run: ett ogiltigt subnät ska ge fel INNAN man
+	// trycker Applicera, inte efteråt.
+	if _, err := GenerateServerConfig(cfg, tlsCryptKey); err != nil {
 		return fmt.Errorf("misslyckades generera OpenVPN-serverkonfiguration: %w", err)
 	}
 
@@ -152,8 +210,42 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, caCertPEM
 		return nil
 	}
 
-	if err := os.MkdirAll(a.dir, 0700); err != nil {
+	// Katalogen måste vara läs- och gångbar för ANDRA än ägaren, och det
+	// hänger ihop med rättighetsdroppet i serverkonfigurationen:
+	// `crl-verify` läses om vid VARJE ny anslutning, alltså efter att
+	// serverprocessen växlat ner till nobody. Med en katalog bara ägaren får
+	// gå in i skulle varje klient nekas så fort spärrlistan skulle läsas —
+	// och felet hade sett ut som ett certifikatproblem.
+	//
+	// Hemligheterna skyddas av filrättigheterna i stället: server.key och
+	// tls-crypt.key skrivs 0600 och läses en gång vid uppstart, medan
+	// OpenVPN fortfarande är root.
+	if err := os.MkdirAll(a.dir, 0755); err != nil {
 		return fmt.Errorf("misslyckades skapa katalog %s: %w", a.dir, err)
+	}
+	if err := a.ensureTraversable(); err != nil {
+		return err
+	}
+
+	if err := a.writeFiles(cfg, caCertPEM, serverCertPEM, serverKeyPEM, crlPEM, tlsCryptKey); err != nil {
+		return err
+	}
+
+	if out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart %s misslyckades: %w - output: %s", unit, err, string(out))
+	}
+
+	return nil
+}
+
+// writeFiles skriver serverkonfigurationen och nyckelmaterialet till a.dir.
+//
+// Hemligheterna (allt som slutar på .key) skrivs 0600; resten 0644 så att den
+// nedgraderade serverprocessen kan läsa om spärrlistan.
+func (a *Adapter) writeFiles(cfg *config.Config, caCertPEM, serverCertPEM, serverKeyPEM, crlPEM, tlsCryptKey string) error {
+	serverConf, err := GenerateServerConfig(cfg, tlsCryptKey)
+	if err != nil {
+		return fmt.Errorf("misslyckades generera OpenVPN-serverkonfiguration: %w", err)
 	}
 
 	files := map[string]string{
@@ -163,6 +255,16 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, caCertPEM
 		"server.key":           serverKeyPEM,
 		"crl.pem":              crlPEM,
 	}
+	if tlsCryptKey != "" {
+		// Kontrolleras här och inte bara vid genereringen: nyckeln passerar
+		// kryptering och disk på vägen hit, och OpenVPN vägrar starta på en
+		// trasig nyckel med ett fel som är svårt att härleda.
+		if !ValidTLSCryptKey(tlsCryptKey) {
+			return fmt.Errorf("openvpn: tls-crypt-nyckeln har fel format")
+		}
+		files[tlsCryptFileName] = tlsCryptKey
+	}
+
 	for name, content := range files {
 		mode := os.FileMode(0644)
 		if strings.HasSuffix(name, ".key") {
@@ -172,11 +274,34 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, caCertPEM
 			return fmt.Errorf("misslyckades skriva %s: %w", name, err)
 		}
 	}
+	return nil
+}
 
-	if out, err := exec.CommandContext(ctx, "systemctl", "restart", unit).CombinedOutput(); err != nil {
-		return fmt.Errorf("systemctl restart %s misslyckades: %w - output: %s", unit, err, string(out))
+// ensureTraversable ser till att a.dir går att läsa för den nedgraderade
+// serverprocessen.
+//
+// Rättar BARA en katalog som faktiskt är för snäv, och bara om vi äger den.
+// Agenten kör inte som root och /etc/openvpn ägs normalt av root — ett
+// villkorslöst chmod hade därför misslyckats och slagit ut hela
+// OpenVPN-appliceringen på varje installation där katalogen redan är rätt
+// satt. Går den inte att rätta ges ett fel som säger varför det spelar roll,
+// i stället för att servern startar och sedan nekar varje klient.
+func (a *Adapter) ensureTraversable() error {
+	info, err := os.Stat(a.dir)
+	if err != nil {
+		return fmt.Errorf("misslyckades läsa katalogen %s: %w", a.dir, err)
 	}
-
+	const needed = 0o005 // r-x för "andra"
+	if info.Mode().Perm()&needed == needed {
+		return nil
+	}
+	if err := os.Chmod(a.dir, info.Mode().Perm()|needed); err != nil {
+		return fmt.Errorf(
+			"katalogen %s är inte läsbar för den nedgraderade OpenVPN-processen (%v) "+
+				"och rättigheterna kunde inte ändras: %w — utan detta nekas varje "+
+				"klient när spärrlistan ska läsas om",
+			a.dir, info.Mode().Perm(), err)
+	}
 	return nil
 }
 
