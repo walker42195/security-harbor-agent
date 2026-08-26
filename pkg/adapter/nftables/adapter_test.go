@@ -235,8 +235,20 @@ func TestRenderJSONPolicyObjectMatching(t *testing.T) {
 		if strings.Contains(string(data), `"1.2.3.0/24"`) {
 			t.Errorf("hittade CIDR som en RÅ STRÄNG i set-elementen — nft -j avvisar det med \"Could not resolve hostname\": %s", string(data))
 		}
-		if !strings.Contains(string(data), `"addr": "5.6.7.8"`) {
-			t.Errorf("förväntade en strukturerad prefix-post för 5.6.7.8/32 i den genererade JSON-regeln, men den saknas: %s", string(data))
+		// En /32 skickas däremot som en BAR ADRESS, inte som ett prefix.
+		// Skyddet ovan gäller strängar med SNEDSTRECK — det är dem nft -j
+		// försöker DNS-slå upp. En ren adress tolkas korrekt (verifierat
+		// skarpt mot nft -j 2026-08-26: ett blandat set laddade och kärnan
+		// visade "ip saddr { 1.2.3.0/24, 5.6.7.8 }").
+		//
+		// Skillnaden är inte kosmetisk: som prefix tvingas kärnan använda ett
+		// intervallträd i stället för en hashtabell, vilket för en
+		// AbuseIPDB-lista med 126 616 poster mätte 31 MB kärnminne mot 7 MB.
+		if !strings.Contains(string(data), `"5.6.7.8"`) {
+			t.Errorf("förväntade 5.6.7.8/32 som en bar adress i set-elementen: %s", string(data))
+		}
+		if strings.Contains(string(data), `"5.6.7.8/32"`) {
+			t.Errorf("hittade /32 som en RÅ STRÄNG MED SNEDSTRECK — det är just det nft -j DNS-slår upp: %s", string(data))
 		}
 	})
 

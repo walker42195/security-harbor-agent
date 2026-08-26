@@ -442,6 +442,20 @@ func cidrsToSetElements(cidrs []string) []interface{} {
 		if !ok || err != nil {
 			continue
 		}
+		// En /32 (eller /128) ÄR en enskild adress. Skickas den som ett
+		// prefix tvingas kärnan använda ett intervallträd i stället för en
+		// hashtabell, och det kostar på riktigt: mätt på en AbuseIPDB-lista
+		// med 126 616 poster (2026-08-26) tog prefixvarianten 31 MB kärnminne
+		// och 407 ms att ladda, mot 7 MB och 333 ms som rena adresser.
+		//
+		// Hot-listor består nästan uteslutande av enskilda värdar, och
+		// parsern normaliserar dem till /32 — utan det här hade varje sådan
+		// lista blivit fyra gånger dyrare än nödvändigt.
+		if (length == 32 && !strings.Contains(addr, ":")) ||
+			(length == 128 && strings.Contains(addr, ":")) {
+			elements = append(elements, addr)
+			continue
+		}
 		elements = append(elements, map[string]interface{}{
 			"prefix": map[string]interface{}{"addr": addr, "len": length},
 		})

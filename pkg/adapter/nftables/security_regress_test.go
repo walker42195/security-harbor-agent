@@ -278,3 +278,36 @@ func TestSetElementOrderIsPreserved(t *testing.T) {
 		}
 	}
 }
+
+// En /32 är en enskild adress. Skickas den som prefix tvingas kärnan använda
+// ett intervallträd i stället för en hashtabell — uppmätt 31 MB mot 7 MB för
+// en lista med 126 616 poster (2026-08-26).
+func TestHostAddressesAreNotEmittedAsPrefixes(t *testing.T) {
+	got := cidrsToSetElements([]string{"1.2.3.4/32", "10.0.0.0/24", "2001:db8::1/128", "2001:db8::/64"})
+	if len(got) != 4 {
+		t.Fatalf("fick %d element: %v", len(got), got)
+	}
+	if s, ok := got[0].(string); !ok || s != "1.2.3.4" {
+		t.Errorf("IPv4 /32 ska bli en bar adress, fick %#v", got[0])
+	}
+	if _, ok := got[1].(map[string]interface{}); !ok {
+		t.Errorf("ett riktigt nät ska förbli ett prefix, fick %#v", got[1])
+	}
+	if s, ok := got[2].(string); !ok || s != "2001:db8::1" {
+		t.Errorf("IPv6 /128 ska bli en bar adress, fick %#v", got[2])
+	}
+	if _, ok := got[3].(map[string]interface{}); !ok {
+		t.Errorf("IPv6-nät ska förbli ett prefix, fick %#v", got[3])
+	}
+}
+
+// En /128 på en IPv4-adress är inte en värdadress — blanda inte ihop
+// familjerna.
+func TestPrefixLengthIsCheckedPerFamily(t *testing.T) {
+	got := cidrsToSetElements([]string{"1.2.3.4/128", "2001:db8::1/32"})
+	for i, e := range got {
+		if _, ok := e.(map[string]interface{}); !ok {
+			t.Errorf("element %d skulle förbli ett prefix, fick %#v", i, e)
+		}
+	}
+}
