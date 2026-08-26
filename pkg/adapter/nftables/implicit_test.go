@@ -11,6 +11,11 @@ func fullCfg() *config.Config {
 	cfg := multiVlanCfg()
 	cfg.DNS = &config.DNSConfig{Enabled: true}
 	cfg.NTP = &config.NTPConfig{Enabled: true}
+	for i := range cfg.Interfaces {
+		if cfg.Interfaces[i].Zone != "WAN" {
+			cfg.Interfaces[i].DHCP = &config.DHCPConfig{Enabled: true}
+		}
+	}
 	cfg.WireGuard = &config.WireGuardConfig{Enabled: true, ListenPort: 51820}
 	cfg.OpenVPN = &config.OpenVPNConfig{Enabled: true, ListenPort: 443, Protocol: "udp"}
 	return cfg
@@ -31,6 +36,7 @@ func TestImplicitRulesMatchRendered(t *testing.T) {
 		"WAN Drop":                "HARD WAN DROP",
 		"NTP till brandväggen":    "Allow NTP",
 		"DNS till brandväggen":    "Allow DNS",
+		"DHCP till brandväggen":   "Allow DHCP",
 	}
 
 	var inputComments []string
@@ -91,7 +97,7 @@ func TestDisabledFeaturesAreNotDescribed(t *testing.T) {
 	for _, d := range DescribeImplicitRules(cfg) {
 		names[d.Name] = true
 	}
-	for _, gone := range []string{"NTP till brandväggen", "DNS till brandväggen", "WireGuard VPN", "OpenVPN"} {
+	for _, gone := range []string{"NTP till brandväggen", "DNS till brandväggen", "DHCP till brandväggen", "WireGuard VPN", "OpenVPN"} {
 		if names[gone] {
 			t.Errorf("%q beskrevs trots att funktionen är avstängd", gone)
 		}

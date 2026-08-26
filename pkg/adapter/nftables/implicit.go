@@ -80,6 +80,23 @@ func DescribeImplicitRules(cfg *config.Config) []ImplicitRule {
 		Reason: "Allt annat inkommande från internet nekas. Ligger FÖRE alla LAN-regler, så ingen LAN-regel kan råka matcha WAN-trafik.",
 	})
 
+	// Beskrivs bara om något kort faktiskt kör DHCP-server.
+	dhcpOn := false
+	for _, iface := range cfg.Interfaces {
+		if iface.Enabled && iface.Zone != "WAN" && iface.Device != "" &&
+			iface.DHCP != nil && iface.DHCP.Enabled {
+			dhcpOn = true
+			break
+		}
+	}
+	if dhcpOn {
+		out = append(out, ImplicitRule{
+			Name: "DHCP till brandväggen", Chain: "input", Action: "accept", Service: "UDP:67",
+			From: "LAN / VLAN", To: "SELF", Logged: true,
+			Reason: "Öppnas automatiskt på de kort där brandväggen är DHCP-server. Krävs för unicast-förnyelse av en befintlig lease (RFC 2131 RENEWING) — den första förfrågan tas emot via raw-socket och passerar aldrig den här kedjan.",
+		})
+	}
+
 	if cfg.NTP != nil && cfg.NTP.Enabled {
 		out = append(out, ImplicitRule{
 			Name: "NTP till brandväggen", Chain: "input", Action: "accept", Service: "UDP:123",

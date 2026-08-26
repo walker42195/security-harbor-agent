@@ -693,6 +693,9 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	// Hitta WAN-interfacer och LAN-interfacer
 	var wanDevices []string
 	var lanDevices []string
+	// Kort där brandväggen själv är DHCP-server. Skilt från lanDevices: en
+	// klient ska inte kunna nå DHCP-porten på ett nät där ingen server finns.
+	var dhcpDevices []string
 	for _, iface := range cfg.Interfaces {
 		if !iface.Enabled {
 			continue
@@ -701,6 +704,9 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			wanDevices = append(wanDevices, iface.Device)
 		} else if iface.Device != "" {
 			lanDevices = append(lanDevices, iface.Device)
+			if iface.DHCP != nil && iface.DHCP.Enabled {
+				dhcpDevices = append(dhcpDevices, iface.Device)
+			}
 		}
 	}
 
@@ -990,6 +996,50 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 				root.Nftables = append(root.Nftables, NFTElement{Rule: rule})
 			}
 		}
+	}
+
+	// Input 4d: Tillåt DHCP (UDP 67) till brandväggen själv på de kort där
+	// den ÄR DHCP-server.
+	//
+	// Att den här regeln saknades märktes länge inte, och det är värt att
+	// förstå varför: Kea binder en RAW-socket för att kunna ta emot
+	// broadcast-förfrågningar från klienter som ännu inte har någon adress,
+	// och raw-sockets plockar paketet innan det når INPUT-kedjan. Den
+	// inledande DISCOVER/OFFER-handskakningen fungerade därför utmärkt.
+	//
+	// En klient som redan HAR en lease förnyar den däremot med unicast direkt
+	// till servern (RFC 2131, RENEWING vid T1) — ett heltvanligt UDP-paket som
+	// går genom INPUT och nekades av DefaultDeny. Klienten fick inget svar,
+	// väntade till T2 och föll tillbaka på broadcast REBIND, som gick igenom.
+	// Nätet fungerade alltså, men varje förnyelse tog en onödig omväg och
+	// fyllde loggen med DENY-rader (rapporterat 2026-08-26).
+	//
+	// ENDAST kort med DHCP påslaget, aldrig WAN.
+	for _, dev := range dhcpDevices {
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family:  a.family,
+				Table:   a.tableName,
+				Chain:   "input",
+				Comment: fmt.Sprintf("Allow DHCP (UDP 67) on LAN %s", dev),
+				Expr: append([]interface{}{
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+							"right": dev,
+						},
+					},
+					map[string]interface{}{
+						"match": map[string]interface{}{
+							"op":    "==",
+							"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}},
+							"right": 67,
+						},
+					},
+				}, implicitTail(true, "DHCP till brandvaggen")...),
+			},
+		})
 	}
 
 	// Input 4c: Tillåt NTP (UDP 123) till brandväggen själv från LAN/VLAN när
