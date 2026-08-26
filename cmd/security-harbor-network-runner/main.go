@@ -25,7 +25,9 @@ import (
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Något kortare än enhetens TimeoutStartSec=90s, så vi hinner skriva ett
+	// begripligt resultat till agenten innan systemd dödar oss.
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
 
 	result := run(ctx)

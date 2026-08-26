@@ -1,8 +1,10 @@
 package network
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
@@ -307,4 +309,23 @@ func keys(m map[string]string) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Ett avstängt kort ska aldrig väntas på: det får ingen adress, så en väntan
+// hade bara bränt hela timeouten vid varje applicering.
+func TestWaitForAddressSkipsDisabledInterface(t *testing.T) {
+	off := lanStatic()
+	off.Enabled = false
+
+	done := make(chan error, 1)
+	go func() { done <- waitForAddress(context.Background(), off, "ens19") }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("förväntade inget fel, fick: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitForAddress väntade på ett avstängt kort")
+	}
 }

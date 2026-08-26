@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
@@ -122,10 +123,23 @@ func RunApplyRequest(ctx context.Context, req ApplyRequest) ApplyResult {
 		result.Changed = changed
 	}
 
+	byDevice := map[string]config.Interface{}
+	for _, iface := range req.Interfaces {
+		byDevice[deviceNameFor(iface)] = iface
+	}
 	for _, device := range req.Reconfigure {
 		if err := backend.Reconfigure(ctx, device); err != nil {
 			result.Error = err.Error()
 			return result
+		}
+		// Vänta tills adressen faktiskt sitter på kortet innan vi säger att
+		// appliceringen är klar — anroparen startar om adressbundna tjänster
+		// direkt efteråt.
+		if iface, ok := byDevice[device]; ok {
+			if err := waitForAddress(ctx, iface, device); err != nil {
+				result.Error = err.Error()
+				return result
+			}
 		}
 	}
 	for _, device := range req.Renew {
@@ -135,4 +149,72 @@ func RunApplyRequest(ctx context.Context, req ApplyRequest) ApplyResult {
 		}
 	}
 	return result
+}
+
+// Hur länge vi väntar på att en adress faktiskt ska dyka upp på kortet efter
+// en omkonfigurering. Statiska adresser sätts i praktiken direkt; en
+// DHCP-förhandling tar längre tid och kan aldrig lyckas alls (ingen server på
+// den VLAN:en), därför olika budget och olika stränghet nedan.
+const (
+	staticAddressTimeout = 10 * time.Second
+	dhcpAddressTimeout   = 10 * time.Second
+)
+
+// waitForAddress blockerar tills kortet FAKTISKT har den konfigurerade
+// adressen.
+//
+// `networkctl reconfigure` (och nmcli) är ASYNKRONA: de begär en
+// omkonfigurering och returnerar direkt — man-sidan lovar ingenting om när
+// den är klar, och systemd har ett separat systemd-networkd-wait-online just
+// därför. Den imperativa `ip addr add`-vägen som backendarna ersatte var
+// synkron, så adressen fanns när anropet returnerade.
+//
+// Utan den här väntan uppstår ett kapplöpningsfel: applyInterfaces returnerar,
+// applyBackends startar omedelbart om tjänster som binder till LAN-adresserna,
+// och unbound (som medvetet binder specifika LAN-IP:n, inte 0.0.0.0) dör med
+// "can't bind socket: Cannot assign requested address". Skarpt 2026-08-26 när
+// LAN-adressen byttes från 10.0.0.9 till 10.0.0.1 — både appliceringen och den
+// automatiska återställningen föll på samma sak, och lådan blev
+// "halvapplicerad".
+func waitForAddress(ctx context.Context, iface config.Interface, device string) error {
+	if !iface.Enabled || device == "" {
+		return nil
+	}
+
+	static := iface.AddressType == "static" && iface.IPv4 != ""
+	timeout := dhcpAddressTimeout
+	if static {
+		timeout = staticAddressTimeout
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		permanent, dynamic := deviceAddresses(device)
+		if static {
+			for _, addr := range permanent {
+				if addr == iface.IPv4 {
+					return nil
+				}
+			}
+		} else if len(dynamic) > 0 {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			if static {
+				return fmt.Errorf("%s fick aldrig adressen %s (väntade %s) — "+
+					"tjänster som binder till den kommer inte att starta", device, iface.IPv4, timeout)
+			}
+			// Ingen DHCP-lease är inget fel i sig: det kan helt enkelt inte
+			// finnas någon DHCP-server på det nätet. Tjänster binder inte till
+			// en adress vi inte känner, så appliceringen kan fortsätta.
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
