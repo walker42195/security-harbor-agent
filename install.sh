@@ -63,7 +63,8 @@ if [ ! -f "$SCRIPT_DIR/security-harbor-agent" ]; then
   echo "-> Uppackat till $TMP_DIR"
 fi
 
-for bin in security-harbor-agent security-harbor-nmap-runner security-harbor-tcpdump-runner; do
+for bin in security-harbor-agent security-harbor-nmap-runner security-harbor-tcpdump-runner \
+           security-harbor-network-runner; do
   if [ ! -f "$SCRIPT_DIR/$bin" ]; then
     echo "Hittar inte $SCRIPT_DIR/$bin - trasig bunt/release" >&2
     exit 1
@@ -250,6 +251,11 @@ if [ -f "$SCRIPT_DIR/systemd/lib-archive-version.sh" ]; then
   install -m 0644 -o root -g root "$SCRIPT_DIR/systemd/lib-archive-version.sh" \
     /usr/local/lib/security-harbor/lib-archive-version.sh
 fi
+# Nätverkstillämparen (körs av security-harbor-network-apply.service). Ligger
+# medvetet i /usr/local/lib/security-harbor och INTE i PATH — den är en
+# hjälpare för root-oneshoten, inte ett kommando att köra för hand.
+install -m 0755 -o root -g root "$SCRIPT_DIR/security-harbor-network-runner" \
+  /usr/local/lib/security-harbor/security-harbor-network-runner
 
 # Webb-GUI:t (flutter build web) buntas med releasen och deployas till
 # agentens --webui-dir. Följer därmed alltid med agentuppdateringen. Ägs av

@@ -275,8 +275,15 @@ func (e *Engine) loadDHCPLeases(cfg *config.Config) []dhcp.Lease {
 //     maskinen — netplan, NetworkManager eller systemd-networkd (se
 //     pkg/adapter/network/persist.go). Det är det som gör att en adress satt
 //     i GUI:t gäller på OS-nivå, precis som om den satts med nmcli/nmtui.
-//  2. Den imperativa `ip`-vägen, som ger omedelbar effekt och fungerar även
-//     om inget känt persistenslager finns.
+//     Skrivningen kräver root och görs därför av en minimal root-oneshot,
+//     inte i den härdade daemon-processen (se network/helper.go).
+//  2. Den imperativa `ip`-vägen som FALLBACK, om inget känt persistenslager
+//     finns eller om hjälparen misslyckades.
+//
+// Funktionen går i två pass: först avgörs vilka kort som behöver röras, sedan
+// skickas hela konfigurationen + listan på de korten i ETT anrop till
+// hjälparen. Uppdelningen finns för att varje anrop är en egen
+// root-oneshot — ett per kort vore både långsamt och onödigt.
 //
 // Bara gränssnitt som faktiskt BEHÖVER röras rörs — precis det användaren
 // begärde 2026-08-20: en ändring på ETT gränssnitt ska aldrig påverka de
@@ -303,27 +310,6 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 	var warnings []BackendWarning
 	defer func() { e.interfaceWarnings = warnings }()
 
-	// 1. Skriv ner konfigurationen på OS-nivå. Görs för ALLA gränssnitt i ett
-	// svep — persistenslagren är deklarativa och vill ha hela bilden — men
-	// TILLÄMPAS sedan bara på de kort som behöver det, i loopen nedan.
-	backend := network.DetectPersistBackend()
-	if backend == nil {
-		warnings = append(warnings, BackendWarning{
-			Backend: "network-persist",
-			Message: "Hittade varken netplan, NetworkManager eller systemd-networkd. " +
-				"Gränssnittsadresserna sätts direkt i kärnan och gäller nu, men skrivs inte " +
-				"ner någonstans och FÖRSVINNER vid omstart.",
-		})
-	} else if _, err := backend.Write(ctx, newCfg.Interfaces); err != nil {
-		log.Printf("[NET] kunde inte skriva persistent nätverkskonfiguration (%s): %v", backend.Name(), err)
-		warnings = append(warnings, BackendWarning{
-			Backend: "network-persist",
-			Message: fmt.Sprintf("Kunde inte spara nätverkskonfigurationen i %s: %v. "+
-				"Adresserna sätts direkt i kärnan och gäller nu, men försvinner vid omstart.", backend.Name(), err),
-		})
-		backend = nil // tillämpa inte något vi inte lyckades skriva
-	}
-
 	warnings = append(warnings, lanDHCPWarnings(newCfg)...)
 
 	prevByID := map[string]config.Interface{}
@@ -333,6 +319,12 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 		}
 	}
 
+	// FÖRSTA PASSET: avgör vilka kort som behöver röras. Inget tillämpas här —
+	// persistenslagret vill ha hela listan i ETT anrop (det är en root-oneshot
+	// per anrop, se pkg/adapter/network/helper.go), så beslutet måste tas
+	// innan något görs.
+	var touch []config.Interface
+	var devices []string
 	for _, iface := range newCfg.Interfaces {
 		prev, hadPrev := prevByID[iface.ID]
 		changed := hadPrev && interfaceConfigDiffers(prev, iface)
@@ -349,9 +341,6 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 		// nytillkommet gränssnitt) avgör systemets faktiska tillstånd.
 		drifted := !hadPrev && !netAdapter.MatchesSystemState(iface)
 
-		// Rör bara gränssnittet om det ändrats, glidit ifrån sin
-		// konfiguration, ELLER är en VLAN som saknas på systemet (rent
-		// additivt — påverkar inga fysiska kort).
 		if !changed && !drifted && !(isVLAN && deviceMissing) {
 			continue
 		}
@@ -361,8 +350,8 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 
 		// Om en VLAN flyttats till ett annat fysiskt kort (Parent/VLANID
 		// ändrats) ligger det GAMLA subinterfacet kvar på Linux och måste
-		// rivas — annars fortsätter det fånga trafik på fel kort. Görs
-		// FÖRE ApplyInterfaceConfig som skapar det nya subinterfacet.
+		// rivas — annars fortsätter det fånga trafik på fel kort. Görs FÖRE
+		// tillämpningen som skapar det nya subinterfacet.
 		if hadPrev && prev.VLANID > 0 && prev.Device != "" &&
 			(prev.Parent != iface.Parent || prev.VLANID != iface.VLANID) {
 			if err := netAdapter.DeleteVLANInterface(ctx, prev.Device); err != nil {
@@ -370,39 +359,57 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 			}
 		}
 
-		// 2. Låt persistenslagret tillämpa sin konfiguration på kortet. Det
-		// är det som gör att t.ex. ett kort som byter från statiskt till DHCP
-		// verkligen börjar köra DHCP på OS-nivå, i stället för att bara få
-		// den gamla adressen bortplockad.
 		device := iface.Device
 		if isVLAN {
 			device = fmt.Sprintf("%s.%d", iface.Parent, iface.VLANID)
 		}
-		applied := false
-		if backend != nil {
-			if err := backend.Reconfigure(ctx, device); err != nil {
-				log.Printf("[NET] %s kunde inte konfigurera om %s: %v", backend.Name(), device, err)
-			} else {
-				applied = true
-			}
-		}
+		touch = append(touch, iface)
+		devices = append(devices, device)
+	}
 
-		// 3. Den imperativa `ip`-vägen som FALLBACK — inte som komplement.
-		// Kördes den även när persistenslagret lyckats skulle den flusha och
-		// sätta om en adress som just satts (och för ett DHCP-kort trigga en
-		// andra, onödig förhandling direkt efter den första).
-		if !applied {
+	// Skriv ner konfigurationen på OS-nivå och tillämpa den på de kort som
+	// behöver det. Ett enda anrop med HELA gränssnittslistan: lagren är
+	// deklarativa och behöver hela bilden för att kunna städa bort det som
+	// inte längre finns. Görs även när inget kort behöver röras, så att filen
+	// hålls i synk (t.ex. efter att ett gränssnitt tagits bort).
+	persisted := false
+	if network.DetectPersistBackend() == nil {
+		warnings = append(warnings, BackendWarning{
+			Backend: "network-persist",
+			Message: "Hittade varken netplan, NetworkManager eller systemd-networkd. " +
+				"Gränssnittsadresserna sätts direkt i kärnan och gäller nu, men skrivs inte " +
+				"ner någonstans och FÖRSVINNER vid omstart.",
+		})
+	} else if _, err := network.ApplyPersistent(ctx, network.ApplyRequest{
+		Interfaces:  newCfg.Interfaces,
+		Reconfigure: devices,
+	}); err != nil {
+		log.Printf("[NET] kunde inte spara nätverkskonfigurationen: %v", err)
+		warnings = append(warnings, BackendWarning{
+			Backend: "network-persist",
+			Message: fmt.Sprintf("Kunde inte spara nätverkskonfigurationen: %v. "+
+				"Adresserna sätts direkt i kärnan och gäller nu, men försvinner vid omstart.", err),
+		})
+	} else {
+		persisted = true
+	}
+
+	// ANDRA PASSET: den imperativa `ip`-vägen som FALLBACK — inte som
+	// komplement. Kördes den även när persistenslagret lyckats skulle den
+	// flusha och sätta om en adress som just satts (och för ett DHCP-kort
+	// trigga en andra, onödig förhandling direkt efter den första).
+	for i, iface := range touch {
+		if !persisted {
 			if err := netAdapter.ApplyInterfaceConfig(ctx, iface); err != nil {
 				log.Printf("[NET] kunde inte tillämpa gränssnitt %s: %v", iface.Device, err)
 			}
 		}
-
 		// Oavsett väg: ett internt kort får aldrig behålla en default-rutt.
 		// Persistenslagren är konfigurerade att inte skapa någon, men en rutt
 		// som redan LIGGER där (t.ex. från en DHCP-lease kortet hade innan
 		// det byttes till statiskt) försvinner inte av sig själv.
 		if iface.Enabled && !strings.EqualFold(iface.Zone, "WAN") {
-			netAdapter.RemoveDefaultRoute(ctx, device)
+			netAdapter.RemoveDefaultRoute(ctx, devices[i])
 		}
 	}
 

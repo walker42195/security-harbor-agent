@@ -56,6 +56,13 @@ rm -f "$BIN_DIR/security-harbor-agent" \
 # systemd/update-runner.sh) och dess katalog.
 rm -rf /usr/local/lib/security-harbor
 
+# /etc/netplan/90-security-harbor.yaml (respektive /etc/systemd/network/
+# 05-security-harbor-* eller NM-profilerna security-harbor-*) lämnas MEDVETET
+# kvar. Det är maskinens nätverkskonfiguration: tas den bort faller korten
+# tillbaka på installationens DHCP-fallback, och en brandvägg som avinstalleras
+# över SSH skulle tappa sin management-adress mitt i körningen. Vill man bli av
+# med den får man ta bort filen för hand efteråt.
+
 if [ "$PURGE" = true ]; then
   echo "=== 4. --purge: tar bort config/nycklar, systemkonto och paket ==="
   echo "VARNING: Detta raderar $DATA_DIR (all config, nycklar, användarkonton)"

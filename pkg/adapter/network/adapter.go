@@ -340,8 +340,11 @@ func runDHClientOnce(ctx context.Context, device string, isWAN bool) error {
 	// och eftersom felet från exec ignorerades var hela DHCP-vägen (inklusive
 	// "förnya IP"-knappen i GUI:t) en TYST no-op där. DHCP fungerade bara för
 	// att systemd-networkd råkade göra jobbet i bakgrunden.
-	if backend := DetectPersistBackend(); backend != nil {
-		return backend.Renew(ctx, device)
+	// Går via root-hjälparen: networkctl/nmcli nekas av polkit för det
+	// oprivilegierade tjänstekontot (se pkg/adapter/network/helper.go).
+	if DetectPersistBackend() != nil {
+		_, err := ApplyPersistent(ctx, ApplyRequest{Renew: []string{device}})
+		return err
 	}
 
 	if _, err := exec.LookPath("dhclient"); err != nil {

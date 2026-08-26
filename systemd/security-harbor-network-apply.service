@@ -1,0 +1,23 @@
+[Unit]
+Description=Security Harbor tillämpning av nätverkskonfiguration (privilegierad)
+
+[Service]
+Type=oneshot
+# Kör den privilegierade tillämparen som root. Den oprivilegierade agenten
+# (security-harbor-agent.service, ProtectSystem=strict, NoNewPrivileges=true)
+# triggar den här tjänsten via `systemctl start --wait` i stället för att röra
+# /etc/netplan eller anropa networkctl/nmcli själv — privilegiehöjningen
+# isoleras till denna minimala engångskörning.
+#
+# Root krävs på riktigt här: `netplan generate` skriver i det root-ägda
+# /run/systemd/network, och networkctl/nmcli/netplan nekas alla av polkit för
+# tjänstekontot ("Access denied ... requires interactive authentication").
+#
+# Förfrågan (/run/security-harbor/network-apply.json) är DEKLARATIV — den
+# innehåller gränssnittskonfiguration, aldrig kommandon att köra. En
+# komprometterad agent kan därför på sin höjd be om en nätverkskonfiguration,
+# inte köra godtyckliga kommandon som root.
+ExecStart=/usr/local/lib/security-harbor/security-harbor-network-runner
+# Skyddsnät: en hängande networkctl/nmcli får inte blockera agentens
+# applicering för evigt (agenten väntar med `systemctl start --wait`).
+TimeoutStartSec=90

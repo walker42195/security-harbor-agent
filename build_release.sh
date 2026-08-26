@@ -38,9 +38,10 @@ LDFLAGS="-X main.version=$VERSION"
 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "$DIST_DIR/security-harbor-agent" ./cmd/security-harbor-agent
 GOOS=linux GOARCH=amd64 go build -o "$DIST_DIR/security-harbor-nmap-runner" ./cmd/security-harbor-nmap-runner
 GOOS=linux GOARCH=amd64 go build -o "$DIST_DIR/security-harbor-tcpdump-runner" ./cmd/security-harbor-tcpdump-runner
+GOOS=linux GOARCH=amd64 go build -o "$DIST_DIR/security-harbor-network-runner" ./cmd/security-harbor-network-runner
 # Signeringsverktyget byggs för värdens plattform (används lokalt nedan).
 go build -o "$DIST_DIR/security-harbor-sign" ./cmd/security-harbor-sign
-echo "-> agent (v$VERSION), nmap-runner, tcpdump-runner, sign"
+echo "-> agent (v$VERSION), nmap-runner, tcpdump-runner, network-runner, sign"
 
 echo "=== 2. Bygger webb-GUI:t (flutter build web) från $GUI_DIR ==="
 if [ -d "$GUI_DIR" ]; then
