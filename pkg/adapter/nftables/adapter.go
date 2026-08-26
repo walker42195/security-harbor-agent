@@ -414,8 +414,25 @@ func objectMatchExpr(cfg *config.Config, objID, field string) (expr []interface{
 // CIDR-poster måste uttryckas som {"prefix":{"addr":..,"len":..}} — enstaka
 // IP-adresser utan "/" fungerar dock fint som råa strängar.
 func cidrsToSetElements(cidrs []string) []interface{} {
+	// Deduplicera. Samma IP förekommer nästan garanterat i flera hot-listor —
+	// Tor-noder är t.ex. flitigt rapporterade till AbuseIPDB — och läggs två
+	// listor i en grupp konkateneras deras värden rakt av.
+	//
+	// nftables klarar dubbletter av egen kraft (verifierat 2026-08-26, både
+	// text- och JSON-syntaxen accepterar dem tyst), så det här är inte en
+	// korrekthetsfix utan en storleksfix: en AbuseIPDB-lista har över 126 000
+	// poster, och att skicka samma adress flera gånger gör bara regelsetet
+	// större och appliceringen långsammare.
+	//
+	// Ordningen bevaras så att utskriften förblir deterministisk — annars ser
+	// varje applicering ut som en ändring.
+	seen := make(map[string]bool, len(cidrs))
 	var elements []interface{}
 	for _, c := range cidrs {
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
 		if !strings.Contains(c, "/") {
 			elements = append(elements, c)
 			continue

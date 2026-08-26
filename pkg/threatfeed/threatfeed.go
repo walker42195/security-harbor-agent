@@ -188,9 +188,32 @@ func parseGenericCIDRList(scanner *bufio.Scanner) []string {
 	var out []string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		if line == "" {
 			continue
 		}
+
+		// Kommentaren kan ligga EFTER värdet, inte bara på en egen rad.
+		// AbuseIPDB-listorna ser ut så här:
+		//
+		//     1.0.164.165      # TH  AS23969   TOT Public Company Limited
+		//
+		// Tidigare klipptes bara hela kommentarrader bort, så varje sådan rad
+		// misslyckades i net.ParseIP och HELA listan gav noll poster —
+		// rapporterat 2026-08-26 för borestad/blocklist-abuseipdb.
+		if i := strings.IndexAny(line, "#;"); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// En del listor skriver metadata efter värdet utan kommentarstecken
+		// ("1.2.3.4 SE Telia"). Värdet står alltid först.
+		if fields := strings.Fields(line); len(fields) > 0 {
+			line = fields[0]
+		}
+
 		if isValidCIDROrIP(line) {
 			out = append(out, normalizeCIDR(line))
 		}

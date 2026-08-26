@@ -252,3 +252,29 @@ func TestLocalPolicyWithoutRestrictionCoversAllInternalDevices(t *testing.T) {
 		t.Fatalf("förväntade fyra kort, fick %d", len(rules))
 	}
 }
+
+// Samma IP finns nästan garanterat i flera hot-listor. nftables klarar
+// dubbletter själv, men agenten ska inte skicka dem i onödan: en
+// AbuseIPDB-lista har över 126 000 poster (2026-08-26).
+func TestSetElementsAreDeduplicated(t *testing.T) {
+	got := cidrsToSetElements([]string{
+		"1.2.3.4", "5.6.7.8", "1.2.3.4", "10.0.0.0/24", "10.0.0.0/24", "5.6.7.8",
+	})
+	if len(got) != 3 {
+		t.Fatalf("förväntade 3 unika element, fick %d: %v", len(got), got)
+	}
+}
+
+// Ordningen måste bevaras, annars ser varje applicering ut som en ändring.
+func TestSetElementOrderIsPreserved(t *testing.T) {
+	got := cidrsToSetElements([]string{"9.9.9.9", "1.1.1.1", "9.9.9.9", "8.8.8.8"})
+	want := []string{"9.9.9.9", "1.1.1.1", "8.8.8.8"}
+	if len(got) != len(want) {
+		t.Fatalf("fick %v", got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("position %d: fick %v, ville ha %s", i, got[i], w)
+		}
+	}
+}
