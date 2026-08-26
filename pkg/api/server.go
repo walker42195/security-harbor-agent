@@ -1120,9 +1120,17 @@ func (s *Server) handleConntrack(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFirewallLog(w http.ResponseWriter, r *http.Request) {
-	entries := parseFirewallLog()
+	entries, truncated := parseFirewallLogWindow(r.URL.Query().Get("window"))
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(entries)
+	// Svaret är ett OBJEKT, inte en bar lista, så klienten kan få veta att
+	// fönstret klipptes. Äldre GUI:n som förväntar sig en lista hanteras av
+	// att de skickar utan window-parameter och då får samma 500 rader som
+	// förut — men de måste ändå uppdateras för att kunna tolka svaret.
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"entries":   entries,
+		"truncated": truncated,
+		"max":       firewallLogMaxEntries,
+	})
 }
 
 // handleSecurityEvents returnerar de senaste Suricata-larmen (Fas 9).
@@ -1993,13 +2001,43 @@ var firewallLogHeaderRe = regexp.MustCompile(`SH-(ACCEPT|DENY)-(INPUT|FWD)-(.+?)
 // SH-ACCEPT-*/SH-DENY-*-prefixen i pkg/adapter/nftables/adapter.go) och
 // returnerar dem strukturerat, inklusive vilken policy som fattade
 // beslutet (PolicyName).
-func parseFirewallLog() []config.FirewallLogEntry {
-	out, err := exec.Command("journalctl", "-k", "-n", "500", "--no-pager", "-o", "short-iso", "-g", "SH-(ACCEPT|DENY)-").CombinedOutput()
-	if err != nil && len(out) == 0 {
-		return []config.FirewallLogEntry{}
+// firewallLogWindowRe begränsar vad som får skickas till journalctl --since.
+//
+// Värdet kommer från en HTTP-parameter och hamnar i ett kommandoargument.
+// Bara "<tal><enhet>" godtas, med enheten m/h/d — inget annat, och aldrig
+// journalctls fria datumsyntax.
+var firewallLogWindowRe = regexp.MustCompile(`^[0-9]{1,4}[mhd]$`)
+
+// firewallLogMaxEntries är taket på hur många poster ETT svar innehåller.
+//
+// Behövs eftersom tidsfönstret kan spänna över dygn: brandväggen loggar i
+// storleksordningen hundratusen rader per dygn, och att skicka dem till
+// GUI:t skulle låsa både agenten och klienten. Nås taket returneras de
+// NYASTE posterna, och svaret säger att det klipptes.
+const firewallLogMaxEntries = 3000
+
+// ParseFirewallLogWindow läser brandväggsloggen för ett tidsfönster.
+//
+// window är t.ex. "15m", "6h", "2d". Tomt värde ger de senaste 500 raderna,
+// vilket var beteendet innan tidsfiltret fanns.
+//
+// Fram till 2026-08-26 hämtades ALLTID exakt de 500 senaste raderna. Med den
+// loggvolym brandväggen numera producerar (~680 rader/minut) motsvarade det
+// bara omkring 45 sekunder — man kunde inte titta på något som hänt för fem
+// minuter sedan.
+func parseFirewallLogWindow(window string) (entries []config.FirewallLogEntry, truncated bool) {
+	args := []string{"-k", "--no-pager", "-o", "short-iso", "-g", "SH-(ACCEPT|DENY)-"}
+	if window != "" && firewallLogWindowRe.MatchString(window) {
+		args = append(args, "--since", "-"+window)
+	} else {
+		args = append(args, "-n", "500")
 	}
 
-	var entries []config.FirewallLogEntry
+	out, err := exec.Command("journalctl", args...).CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return []config.FirewallLogEntry{}, false
+	}
+
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -2054,7 +2092,14 @@ func parseFirewallLog() []config.FirewallLogEntry {
 			entries = append(entries, entry)
 		}
 	}
-	return entries
+
+	// Taket appliceras på de NYASTE posterna: journalctl skriver i
+	// kronologisk ordning, så det är slutet av listan som är intressant.
+	if len(entries) > firewallLogMaxEntries {
+		entries = entries[len(entries)-firewallLogMaxEntries:]
+		truncated = true
+	}
+	return entries, truncated
 }
 
 type NetDevStat struct {
