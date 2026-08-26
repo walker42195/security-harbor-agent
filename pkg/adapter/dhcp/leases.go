@@ -52,6 +52,27 @@ func ParseLeasesDetailed(path string) ([]LeaseDetail, error) {
 		}
 		expire := parseInt("expire")
 		validLifetime := parseInt("valid_lifetime")
+
+		// valid_lifetime = 0 är Kea:s markör för en FRISLÄPPT lease: klienten
+		// skickade DHCPRELEASE och adressen är tillbaka i poolen. Kea låter
+		// raden ligga kvar med state 0, så en kontroll av bara state räckte
+		// inte — de här utlåningarna listades som aktiva för alltid och
+		// försvann aldrig ur DHCP-klientvyn (rapporterat 2026-08-26: två
+		// google-enheter syntes på både sin gamla och sin nya adress).
+		//
+		// Skiljer sig från en UTGÅNGEN lease (expire i det förflutna men
+		// lifetime > 0): den lever kvar tills Kea hinner återta den, vilket
+		// sker inom sekunder och då ger en rad med state != 0. Sådana visas
+		// medvetet under den korta stunden — de är fortfarande giltiga tills
+		// de återtas.
+		// Villkoret är medvetet "kolumnen FINNS och är 0", inte "det tolkade
+		// talet är 0": saknas kolumnen helt (en fil skriven av en annan
+		// Kea-version) betyder det att vi inte vet något om livslängden, inte
+		// att leasen är frisläppt.
+		if get("valid_lifetime") == "0" {
+			delete(byIP, addr)
+			return
+		}
 		var start int64
 		if expire > 0 && validLifetime > 0 {
 			start = expire - validLifetime // Kea lagrar utgång + livslängd; startpunkten (cltt) är differensen

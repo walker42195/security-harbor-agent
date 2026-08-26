@@ -157,3 +157,52 @@ func TestDifferentColumnOrderPerFile(t *testing.T) {
 		t.Fatalf("fick %+v", leases)
 	}
 }
+
+// Kea markerar en FRISLÄPPT lease (DHCPRELEASE) med valid_lifetime 0 men
+// låter state stå kvar på 0. En kontroll av bara state räckte därför inte:
+// adressen listades som aktiv för alltid och försvann aldrig ur vyn.
+func TestReleasedLeaseWithZeroLifetimeIsDropped(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "kea-leases4.csv")
+
+	// Exakt formen från den skarpa rapporten 2026-08-26.
+	writeLeases(t, current+".2",
+		"10.9.9.113,00:f6:20:dc:97:5a,,7200,1787740582,2,0,0,google-home-stora,0,,0",
+		"10.9.9.101,00:f6:20:dc:97:5a,,7200,1787750000,2,0,0,google-home-stora,0,,0")
+	writeLeases(t, current,
+		"10.9.9.113,00:f6:20:dc:97:5a,,0,1787733382,2,0,0,google-home-stora,0,,0")
+
+	leases, err := ParseLeasesDetailed(current)
+	if err != nil {
+		t.Fatalf("ParseLeasesDetailed: %v", err)
+	}
+	if got := ips(leases); len(got) != 1 || got[0] != "10.9.9.101" {
+		t.Fatalf("den frisläppta adressen låg kvar: %v", got)
+	}
+
+	named, err := ParseLeaseFile(current)
+	if err != nil {
+		t.Fatalf("ParseLeaseFile: %v", err)
+	}
+	if len(named) != 1 || named[0].IP != "10.9.9.101" {
+		t.Fatalf("frisläppt adress låg kvar i DNS-registreringen: %+v", named)
+	}
+}
+
+// En UTGÅNGEN lease (expire passerad men lifetime > 0) ska däremot vara kvar:
+// den är giltig tills Kea hinner återta den, vilket sker inom sekunder och då
+// ger en rad med state != 0.
+func TestExpiredButNotReclaimedLeaseIsKept(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "kea-leases4.csv")
+	writeLeases(t, current,
+		"10.9.9.120,aa:bb:cc:dd:ee:01,,7200,1000000000,2,0,0,gammal,0,,0")
+
+	leases, err := ParseLeasesDetailed(current)
+	if err != nil {
+		t.Fatalf("ParseLeasesDetailed: %v", err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("utgången men ej återtagen lease togs bort: %+v", leases)
+	}
+}
