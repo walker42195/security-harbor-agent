@@ -257,3 +257,55 @@ func RuleUpdateStatus(ctx context.Context) string {
 	}
 	return st
 }
+
+// ReadDisableConf läser en befintlig disable.conf och återvinner tystade
+// signaturer och kategorier om konfigurationsfilen skulle sakna dem.
+func ReadDisableConf(disableConfPath string) ([]config.DisabledSignature, []string) {
+	if disableConfPath == "" {
+		disableConfPath = DisableConfPath
+	}
+	f, err := os.Open(disableConfPath)
+	if err != nil {
+		return nil, nil
+	}
+	defer f.Close()
+
+	var sigs []config.DisabledSignature
+	var cats []string
+	scanner := bufio.NewScanner(f)
+	var lastComment string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			comment := strings.TrimSpace(strings.TrimPrefix(line, "#"))
+			if !strings.HasPrefix(comment, "Genererad") && !strings.HasPrefix(comment, "Ändra") && !strings.HasPrefix(comment, "Tystade") && !strings.HasPrefix(comment, "Avstängda") {
+				lastComment = comment
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "re:msg:\"") {
+			raw := strings.TrimPrefix(line, "re:msg:\"")
+			raw = strings.TrimSuffix(raw, " ")
+			raw = strings.TrimSuffix(raw, "\"")
+			if raw != "" {
+				cats = append(cats, raw)
+			}
+			continue
+		}
+		if sid, err := strconv.Atoi(line); err == nil && sid > 0 {
+			sigText := lastComment
+			if sigText == "" {
+				sigText, _ = LookupSignature(RulesPath, sid)
+			}
+			sigs = append(sigs, config.DisabledSignature{
+				SID:       sid,
+				Signature: sigText,
+			})
+			lastComment = ""
+		}
+	}
+	return sigs, cats
+}

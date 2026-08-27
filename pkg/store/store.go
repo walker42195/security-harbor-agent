@@ -14,6 +14,7 @@ import (
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/openvpn"
+	"github.com/walker42195/security-harbor-agent/pkg/adapter/suricata"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
@@ -119,6 +120,9 @@ func (s *Store) loadOrInit(seedMode string) error {
 	// avstängd. Sparas direkt så den överlever omstart.
 	changed := ensureDefaultAutoBlock(&cfg)
 	if ensureDefaultMgmtAPIPolicy(&cfg) {
+		changed = true
+	}
+	if ensureDisabledRulesPreserved(&cfg) {
 		changed = true
 	}
 	if changed {
@@ -483,6 +487,24 @@ func ensureDefaultAutoBlock(cfg *config.Config) bool {
 	}
 
 	return changed
+}
+
+// ensureDisabledRulesPreserved läser disable.conf om running.json saknar
+// DisabledSignatures/DisabledCategories men disable.conf innehåller tystade regler.
+func ensureDisabledRulesPreserved(cfg *config.Config) bool {
+	if cfg == nil || cfg.IDS == nil {
+		return false
+	}
+	if len(cfg.IDS.DisabledSignatures) > 0 || len(cfg.IDS.DisabledCategories) > 0 {
+		return false
+	}
+	sigs, cats := suricata.ReadDisableConf(suricata.DisableConfPath)
+	if len(sigs) == 0 && len(cats) == 0 {
+		return false
+	}
+	cfg.IDS.DisabledSignatures = sigs
+	cfg.IDS.DisabledCategories = cats
+	return true
 }
 
 func (s *Store) saveConfigLocked(path string, cfg *config.Config) error {
