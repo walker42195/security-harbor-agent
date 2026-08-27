@@ -1223,7 +1223,10 @@ type trafficTypesResponse struct {
 	Categories []traffic.CategoryTotal            `json:"categories"`
 	PerDevice  map[string][]traffic.CategoryTotal `json:"per_device"`
 	TopDomains []traffic.DomainTotal              `json:"top_domains"`
-	Resolution string                             `json:"resolution"`
+	// DeviceNames är IP -> visningsnamn. Statistiken är nycklad på IP, men en
+	// adress säger sällan någon någonting.
+	DeviceNames map[string]string `json:"device_names"`
+	Resolution  string            `json:"resolution"`
 	// IDSOnInside är falskt när Suricata lyssnar på WAN-kortet. Då finns
 	// ingen klassificerbar trafik alls, eftersom allt syns efter NAT med
 	// brandväggens egen adress som källa — GUI:t visar en förklaring i
@@ -1260,6 +1263,7 @@ func (s *Server) handleTrafficTypes(w http.ResponseWriter, r *http.Request) {
 		Categories:  s.engine.TrafficCategories(res, ip),
 		PerDevice:   s.engine.TrafficCategoriesPerDevice(res),
 		TopDomains:  s.engine.TopDomains(ip, limit),
+		DeviceNames: s.engine.DeviceNames(r.Context()),
 		Resolution:  res,
 		IDSOnInside: s.engine.IDSOnInside(),
 	})

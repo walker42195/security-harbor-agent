@@ -166,6 +166,54 @@ func (e *Engine) TrafficCategoriesPerDevice(resolution string) map[string][]traf
 	return e.catStore.PerDevice(resolution)
 }
 
+// DeviceNames är IP -> visningsnamn för de enheter vi känner till.
+//
+// Kategoristatistiken är nycklad på IP eftersom det är vad flödena innehåller,
+// men en IP-adress säger sällan någon någonting. Namnen slås upp separat och
+// följer samma ordning som i enhetsvyn: manuell DNS-post, därefter DHCP-
+// utlåningens värdnamn. Saknas båda utelämnas adressen, och GUI:t visar IP.
+func (e *Engine) DeviceNames(ctx context.Context) map[string]string {
+	cfg := e.store.GetRunningConfig()
+	staticNames := map[string]string{}
+	if cfg != nil && cfg.DNS != nil {
+		for _, r := range cfg.DNS.StaticRecords {
+			if r.IP != "" && r.Hostname != "" {
+				staticNames[r.IP] = r.Hostname
+			}
+		}
+	}
+	zoneOf := func(dev string) string {
+		if cfg == nil {
+			return ""
+		}
+		for _, i := range cfg.Interfaces {
+			if i.Device == dev {
+				return i.Zone
+			}
+		}
+		return ""
+	}
+
+	out := map[string]string{}
+	for _, d := range e.inventory.Scan(ctx, dhcpLeasePath, staticNames, zoneOf) {
+		if d.Hostname != "" {
+			out[d.IP] = d.Hostname
+		}
+	}
+	// Brandväggen själv syns som motpart i intern trafik och finns inte i
+	// grannbordet — namnge den uttryckligen så den inte står som naken IP.
+	if cfg != nil {
+		for _, i := range cfg.Interfaces {
+			if i.Enabled && i.IPv4 != "" && !strings.EqualFold(i.Zone, "WAN") {
+				if ip, _, err := net.ParseCIDR(i.IPv4); err == nil {
+					out[ip.String()] = "security-harbor (" + i.Device + ")"
+				}
+			}
+		}
+	}
+	return out
+}
+
 // TopDomains returnerar de mest trafikerade domänerna.
 func (e *Engine) TopDomains(ip string, limit int) []traffic.DomainTotal {
 	return e.catStore.TopDomains(ip, limit)
