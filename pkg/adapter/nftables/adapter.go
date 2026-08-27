@@ -513,7 +513,10 @@ func (r *setRegistry) sets() []Set {
 			// "interval" krävs så snart något element är ett prefix
 			// (CIDR) eller ett intervall — vilket hot-flöden alltid har.
 			Flags: []string{"interval"},
-			Elem:  r.elems[name],
+			// Utan auto-merge avvisar nft HELA transaktionen så snart två
+			// element överlappar, vilket hot-flöden alltid har.
+			AutoMerge: true,
+			Elem:      r.elems[name],
 		})
 	}
 	return out

@@ -26,12 +26,22 @@ type NFTElement struct {
 // Deklarationen måste ligga FÖRE de regler som refererar den i samma
 // nft-transaktion (se spliceSets i adapter.go).
 type Set struct {
-	Family string        `json:"family"`          // "inet"
-	Table  string        `json:"table"`           // "security_harbor"
-	Name   string        `json:"name"`            // nft-identifierare, se setNameFor
-	Type   string        `json:"type"`            // "ipv4_addr"
-	Flags  []string      `json:"flags,omitempty"` // "interval" krävs för prefix
-	Elem   []interface{} `json:"elem,omitempty"`
+	Family string   `json:"family"`          // "inet"
+	Table  string   `json:"table"`           // "security_harbor"
+	Name   string   `json:"name"`            // nft-identifierare, se setNameFor
+	Type   string   `json:"type"`            // "ipv4_addr"
+	Flags  []string `json:"flags,omitempty"` // "interval" krävs för prefix
+	// AutoMerge låter nft slå ihop överlappande intervall i stället för att
+	// avvisa hela transaktionen med "Error: conflicting intervals specified".
+	//
+	// Obligatoriskt för hot-flöden: de innehåller regelmässigt både ett
+	// nät och enskilda adresser inuti samma nät (t.ex. 1.19.0.0/16 plus
+	// 1.19.5.3). En ANONYM mängd tolererade det, en NAMNGIVEN gör det inte —
+	// upptäckt i skarp drift 2026-08-27 när agenten inte kunde applicera sitt
+	// regelset och brandväggen blev stående på det fail-closed
+	// failsafe-regelsetet. För en blocklista är unionen exakt rätt semantik.
+	AutoMerge bool          `json:"auto-merge,omitempty"`
+	Elem      []interface{} `json:"elem,omitempty"`
 }
 
 type MetaInfo struct {

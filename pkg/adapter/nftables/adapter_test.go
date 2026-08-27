@@ -1398,3 +1398,70 @@ func TestRenderJSONEmptyObjectStillSkipsRule(t *testing.T) {
 		t.Errorf("en namngiven mängd deklarerades för ett tomt objekt: %s", s)
 	}
 }
+
+// TestRenderJSONNamedSetHandlesOverlappingIntervals är regressionsvakten för
+// driftstoppet 2026-08-27: hot-flöden innehåller regelmässigt både ett nät
+// och enskilda adresser inuti samma nät. En ANONYM mängd tolererade det, men
+// en NAMNGIVEN avvisas av nft med "Error: conflicting intervals specified" om
+// inte auto-merge är satt — hela transaktionen föll, agenten kunde inte
+// applicera sitt regelset, och brandväggen blev stående på det fail-closed
+// failsafe-regelsetet utan att släppa igenom någon trafik.
+func TestRenderJSONNamedSetHandlesOverlappingIntervals(t *testing.T) {
+	adapter := NewAdapter()
+
+	// Överlappande med flit: ett /16, ett /24 inuti det, och en enskild
+	// adress inuti /24:an.
+	vals := []string{"1.19.0.0/16", "1.19.4.0/24", "1.19.5.3"}
+	for i := 0; len(vals) < namedSetThreshold; i++ {
+		vals = append(vals, fmt.Sprintf("203.%d.%d.0/24", i/256, i%256))
+	}
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Objects: []config.Object{
+			{ID: "feed-overlap", Name: "Överlappande flöde", Type: config.ObjectTypeIPList, Values: vals},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-overlap", Name: "Blockera", Enabled: true,
+				SourceObj: "feed-overlap", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop,
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var root struct {
+		Nftables []struct {
+			Set *struct {
+				Flags     []string `json:"flags"`
+				AutoMerge bool     `json:"auto-merge"`
+			} `json:"set"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("kunde inte parsa genererad JSON: %v", err)
+	}
+
+	found := false
+	for _, e := range root.Nftables {
+		if e.Set == nil {
+			continue
+		}
+		found = true
+		if !e.Set.AutoMerge {
+			t.Error(`auto-merge saknas på den namngivna mängden — nft avvisar hela transaktionen med "conflicting intervals specified" så snart två element överlappar`)
+		}
+	}
+	if !found {
+		t.Fatal("ingen namngiven mängd genererades")
+	}
+}
