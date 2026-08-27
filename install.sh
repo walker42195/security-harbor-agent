@@ -328,9 +328,12 @@ if [ -f "$SCRIPT_DIR/systemd/journald-security-harbor.conf" ]; then
   install -D -m 0644 "$SCRIPT_DIR/systemd/journald-security-harbor.conf" \
     /etc/systemd/journald.conf.d/security-harbor.conf
   echo "-> journal-tak: SystemMaxUse=512M (drop-in)"
-  # Verkställ direkt så att en redan uppsvälld journal krymper nu och inte
-  # först vid nästa omstart.
-  systemctl kill --kill-whom=main --signal=SIGUSR2 systemd-journald.service 2>/dev/null || true
+  systemctl restart systemd-journald.service 2>/dev/null || true
+  # Verkställ direkt. En omstart av journald läser in taket men BESKÄR inte
+  # en redan uppsvälld journal — retentionen tillämpas först när nya filer
+  # roteras. journalctl --vacuum-size gör det nu i stället för om flera dygn.
+  journalctl --vacuum-size=512M >/dev/null 2>&1 || true
+  journalctl --vacuum-time=2weeks >/dev/null 2>&1 || true
 fi
 
 if [ -f "$SCRIPT_DIR/systemd/logrotate-suricata.conf" ] && [ -d /etc/logrotate.d ]; then
