@@ -64,7 +64,13 @@ type neighEntry struct {
 }
 
 // Scan bygger enhetslistan.
-func (inv *Inventory) Scan(ctx context.Context, leasePath string, zoneOf zoneLookup) []Device {
+//
+// staticNames är manuellt registrerade DNS-poster, nyckel IP. De har FÖRETRÄDE
+// framför DHCP-utlåningens värdnamn: en post som någon skrivit in för hand är
+// ett medvetet val, medan lease-namnet är vad klienten själv råkade skicka.
+// Utan dem saknade manuellt registrerade värdar namn helt i vyn, eftersom
+// utlåningarna är nycklade på MAC och de statiska posterna på IP.
+func (inv *Inventory) Scan(ctx context.Context, leasePath string, staticNames map[string]string, zoneOf zoneLookup) []Device {
 	now := time.Now().Unix()
 	leases := readLeases(leasePath)
 
@@ -103,7 +109,7 @@ func (inv *Inventory) Scan(ctx context.Context, leasePath string, zoneOf zoneLoo
 		d := Device{
 			IP:            e.Dst,
 			MAC:           mac,
-			Hostname:      leases[mac],
+			Hostname:      hostnameFor(e.Dst, mac, staticNames, leases),
 			Vendor:        inv.vendorOf(mac),
 			Interface:     e.Dev,
 			Zone:          zone,
@@ -253,4 +259,14 @@ func (inv *Inventory) LoadFirstSeen() {
 	inv.mu.Lock()
 	inv.firstSeen = m
 	inv.mu.Unlock()
+}
+
+// hostnameFor väljer namn i ordningen: manuell DNS-post, därefter DHCP-
+// utlåningens värdnamn. Tom sträng om ingendera finns — då visar GUI:t
+// IP-adressen i stället.
+func hostnameFor(ip, mac string, staticNames, leases map[string]string) string {
+	if n := staticNames[ip]; n != "" {
+		return n
+	}
+	return leases[mac]
 }

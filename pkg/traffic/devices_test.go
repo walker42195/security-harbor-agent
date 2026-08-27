@@ -113,3 +113,27 @@ func TestFirstSeenSurvivesRestart(t *testing.T) {
 		t.Errorf("first_seen = %d efter omstart", got)
 	}
 }
+
+func TestHostnameForPrefersStaticRecord(t *testing.T) {
+	statics := map[string]string{"10.7.7.7": "nx4.novabase.se"}
+	leases := map[string]string{"aa:bb:cc:dd:ee:ff": "fran-dhcp"}
+
+	// Manuell post vinner över DHCP-namnet: den är ett medvetet val, medan
+	// lease-namnet är vad klienten själv råkade skicka.
+	if got := hostnameFor("10.7.7.7", "aa:bb:cc:dd:ee:ff", statics, leases); got != "nx4.novabase.se" {
+		t.Errorf("fick %q, ville ha nx4.novabase.se", got)
+	}
+	// Utan manuell post används DHCP-namnet.
+	if got := hostnameFor("10.0.0.5", "aa:bb:cc:dd:ee:ff", statics, leases); got != "fran-dhcp" {
+		t.Errorf("fick %q, ville ha fran-dhcp", got)
+	}
+	// Varken eller: tom sträng, så GUI:t visar IP.
+	if got := hostnameFor("10.0.0.9", "11:22:33:44:55:66", statics, leases); got != "" {
+		t.Errorf("fick %q, ville ha tom sträng", got)
+	}
+	// En enhet som bara finns som statisk post, utan lease alls — exakt fallet
+	// som saknade namn i vyn innan.
+	if got := hostnameFor("10.7.7.7", "", statics, nil); got != "nx4.novabase.se" {
+		t.Errorf("fick %q", got)
+	}
+}

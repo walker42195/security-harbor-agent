@@ -135,7 +135,18 @@ func (e *Engine) GetDashboard(ctx context.Context, resolution string, sparklineP
 		return ""
 	}
 
-	devices := e.inventory.Scan(ctx, dhcpLeasePath, zoneOf)
+	// Manuellt registrerade DNS-poster, nyckel IP. Utan dem saknar en värd som
+	// bara finns som statisk post namn i vyn — utlåningarna är nycklade på MAC.
+	staticNames := map[string]string{}
+	if cfg != nil && cfg.DNS != nil {
+		for _, r := range cfg.DNS.StaticRecords {
+			if r.IP != "" && r.Hostname != "" {
+				staticNames[r.IP] = r.Hostname
+			}
+		}
+	}
+
+	devices := e.inventory.Scan(ctx, dhcpLeasePath, staticNames, zoneOf)
 	totals := e.trafficStore.Totals(resolution)
 	rates := e.trafficColl.Rates()
 	blocked, _ := traffic.CountBlockedPerDevice(ctx, "1h")

@@ -127,7 +127,11 @@ func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.
 // WireGuard) för en given konfiguration. Delas mellan ApplyCandidate och
 // rollback så att en rollback verkligen återställer DHCP/VPN, inte bara
 // brandväggsreglerna.
-func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun bool) error {
+// applyBackends applicerar alla icke-nftables-backends.
+//
+// atBoot styr om tjänster som binder mot nätverkskort ska startas om även vid
+// oförändrad konfiguration — se dhcp.ApplyConfig.
+func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun bool, atBoot bool) error {
 	// warnings samlar icke-blockerande fel (se IDS-blocket längre ned).
 	var warnings []BackendWarning
 	if !dryRun {
@@ -186,7 +190,7 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 	// configen råkar innehålla (ett host-läges-install har dem inte ens
 	// installerade, se install.sh).
 	if !cfg.IsHostMode() {
-		if err := e.dhcpAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
+		if err := e.dhcpAdapter.ApplyConfig(ctx, cfg, dryRun, atBoot); err != nil {
 			return fmt.Errorf("dhcp: %w", err)
 		}
 	}
@@ -617,7 +621,9 @@ func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
 	// applyInterfaces.
 	e.applyInterfaces(ctx, running, nil)
 	e.applyStaticRoutes(ctx, running, nil)
-	return e.applyBackends(ctx, running, false)
+	// atBoot=true: gränssnitten konfigurerades precis om ovan, så tjänster
+	// som binder mot dem måste startas om även om deras konfig är oförändrad.
+	return e.applyBackends(ctx, running, false, true)
 }
 
 // UpdateIDSRuleSelection sparar regelurvalet och startar om regeluppdateringen
@@ -753,7 +759,7 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 
 	// Därefter backendarnas egen dry-run (nft -c, Kea, Unbound m.fl.), som
 	// fångar allt vi inte modellerar själva.
-	if err := e.applyBackends(ctx, cfg, true); err != nil {
+	if err := e.applyBackends(ctx, cfg, true, false); err != nil {
 		return fmt.Errorf("validering misslyckades: %w", err)
 	}
 
@@ -1285,7 +1291,7 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 	// automatik rullade tillbaka. Nu återställs running-konfigurationen
 	// omedelbart vid ett misslyckat apply, så systemet alltid landar i ett
 	// känt tillstånd.
-	if err := e.applyBackends(ctx, candidate, false); err != nil {
+	if err := e.applyBackends(ctx, candidate, false, false); err != nil {
 		applyErr := err
 		// applyInterfaces MÅSTE köras även vid återställning, inte bara
 		// applyBackends — annars återställs bara nftables/DNS/DHCP/
@@ -1300,7 +1306,7 @@ func (e *Engine) ApplyCandidate(ctx context.Context, user string) error {
 		// nere), och lämnade brandväggen med running.json som sa
 		// "WAN aktiverat" medan kortet i verkligheten var nedstängt.
 		e.applyInterfaces(ctx, e.store.GetRunningConfig(), candidate)
-		if rbErr := e.applyBackends(ctx, e.store.GetRunningConfig(), false); rbErr != nil {
+		if rbErr := e.applyBackends(ctx, e.store.GetRunningConfig(), false, false); rbErr != nil {
 			log.Printf("[SAFE APPLY] KRITISKT: apply misslyckades (%v) OCH återställningen till running config misslyckades (%v) — systemet kan vara halvapplicerat", applyErr, rbErr)
 			return fmt.Errorf("misslyckades applicera konfiguration: %w (återställningen misslyckades också: %v)", applyErr, rbErr)
 		}
@@ -1393,7 +1399,7 @@ func (e *Engine) rollbackLocked(ctx context.Context, user string) error {
 	// gränssnitts länkstatus (ip link up/down) som faktiskt behöver
 	// återställas, annars återställs bara backend-konfigurationen.
 	e.applyInterfaces(ctx, running, e.unconfirmedCfg)
-	if err := e.applyBackends(ctx, running, false); err != nil {
+	if err := e.applyBackends(ctx, running, false, false); err != nil {
 		fmt.Printf("[SAFE APPLY] fel vid återställning till running config: %v\n", err)
 	}
 

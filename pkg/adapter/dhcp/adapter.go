@@ -150,7 +150,18 @@ func (a *Adapter) GenerateKeaConfig(cfg *config.Config) ([]byte, error) {
 }
 
 // ApplyConfig skriver kea-dhcp4.conf och startar om Kea DHCP-servern om DHCP-scopes finns.
-func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bool) error {
+//
+// forceRestart tvingar en omstart även när konfigurationen är oförändrad.
+// Används vid UPPSTART, där agenten konfigurerar gränssnitten EFTER att Kea
+// redan startat: Kea öppnar råa AF_PACKET-socketar mot varje gränssnitt vid
+// start, och ett gränssnitt som ännu inte var uppe ger
+// "DHCPSRV_OPEN_SOCKET_FAIL failed to open socket: the interface X is down".
+// Kea upptäcker aldrig att kortet kommer upp senare och fortsätter med
+// trasiga socketar — den tar emot förfrågningar men får aldrig ut sina svar,
+// så klienterna DISCOVER:ar om och om igen, leases går ut och alla värdnamn
+// försvinner. Uppmätt skarpt 2026-08-27: fyra av fem gränssnitt nere vid
+// Keas start, 952 LEASE_OFFER mot 1 LEASE_ALLOC.
+func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bool, forceRestart bool) error {
 	data, err := a.GenerateKeaConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("misslyckades generera Kea konfiguration: %w", err)
@@ -175,7 +186,7 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 	// Kea startas om bara när konfigurationen ändrats (eller om den inte redan
 	// kör). En omstart tar DHCP ur drift, och konfigurationen är typiskt
 	// identisk vid t.ex. en agentuppdatering.
-	restarted, err := svc.RestartIfNeeded(ctx, "kea-dhcp4-server.service", changed)
+	restarted, err := svc.RestartIfNeeded(ctx, "kea-dhcp4-server.service", changed || forceRestart)
 	if err != nil {
 		return err
 	}
