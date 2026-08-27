@@ -37,6 +37,11 @@ ProtectKernelTunables=false
 ProtectKernelModules=false
 ProtectControlGroups=true
 MemoryDenyWriteExecute=true
+# Negativt värde = kärnans OOM-killare undviker den här processen. Suricata
+# har motsvarande +500 och är det utpekade offret vid minnesbrist: förlorar
+# man IDS är man blind, men förlorar man agenten är brandväggen inte längre
+# administrerbar på distans. Se systemd/suricata-memory.conf.tmpl.
+OOMScoreAdjust=-500
 RestrictRealtime=true
 RestrictNamespaces=true
 

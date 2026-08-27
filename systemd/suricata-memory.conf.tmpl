@@ -1,0 +1,29 @@
+# Drop-in för suricata.service. Installeras av install.sh till
+#   /etc/systemd/system/suricata.service.d/security-harbor-memory.conf
+# med {{MEMORY_HIGH}} / {{MEMORY_MAX}} beräknade utifrån maskinens RAM.
+#
+# VARFÖR INTE MEMCAPS: uppmätt på en skarp installation 2026-08-27 använde
+# Suricatas memcap-pooler tillsammans ~44 MB av ~528 MB tilldelat tak
+# (tcp.reassembly 2,7 MB av 256 MiB, flow 7,2 MB av 128 MiB, stream 1,2 MB av
+# 64 MiB). Memcaps är TAK, inte allokeringar — att sänka dem frigör ingenting.
+# De 423 MB Suricata faktiskt använder ligger i detect-motorn: 52 624 regler
+# varav 46 577 inspekterar applikationslagret. mpm-algo är redan Hyperscan
+# (mpm-hs), så där finns heller inget att hämta.
+#
+# Den enda meningsfulla hävstången på minnet är att minska REGELSETET, vilket
+# är ett säkerhetsbeslut och inte något installern ska fatta åt någon.
+#
+# Vad den här filen gör i stället: gör Suricata till det utpekade offret vid
+# minnesbrist. Vid haveriet 2026-08-27 valde OOM-killaren Suricata — men det
+# var tur. Hade den valt security-harbor-agent hade hela styrplanet försvunnit
+# och brandväggen blivit omöjlig att administrera på distans. OOMScoreAdjust
+# gör det valet deterministiskt i stället för heuristiskt.
+[Service]
+MemoryAccounting=yes
+# MemoryHigh är MJUK: kärnan strypar och återvinner i stället för att döda.
+# En IDS som lever men är långsam är bättre än en IDS som är borta.
+MemoryHigh={{MEMORY_HIGH}}
+{{MEMORY_MAX_LINE}}
+# Positivt värde = kärnans OOM-killare föredrar den här processen.
+# Motsvarande negativt värde sätts på security-harbor-agent.
+OOMScoreAdjust=500

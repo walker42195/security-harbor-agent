@@ -4,6 +4,14 @@ Description=Security Harbor - hämta uppdaterat Suricata-regelset (ET Open)
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/suricata-update
+# Ladda in de nyhämtade reglerna i den KÖRANDE Suricata. Utan detta skrevs
+# nya regler till /var/lib/suricata/rules men började gälla först vid nästa
+# omstart av tjänsten — på en brandvägg som sällan startas om innebar det att
+# dagliga signaturuppdateringar aldrig aktiverades (upptäckt 2026-08-27).
+# suricata.service har ExecReload=suricatasc -c reload-rules, vilket är en
+# live-reload utan paketförlust. "-" gör att en misslyckad omladdning (t.ex.
+# Suricata är stoppad) inte får uppdateringen att fallera.
+ExecStartPost=-/usr/bin/systemctl reload suricata.service
 # Körs som root (systemd default) — suricata-update behöver skriva till
 # /var/lib/suricata/rules. Fristående, syftesbyggd process precis som
 # uppdatering av hot-listor/GeoIP (Fas 5) — agenten triggar bara körningen

@@ -66,7 +66,7 @@ cp systemd/*.service systemd/*.timer systemd/*.rules systemd/*.nft.tmpl "$DIST_D
 # inte .nft.tmpl. Utelämnas de här avbryts en NYinstallation på en saknad
 # fil, medan uppgradering från en git-checkout fortsätter fungera; det är
 # precis den sortens skillnad som annars upptäcks först hos en kund.
-cp systemd/modules-load.d-security-harbor.conf systemd/wait-online-no-dns.conf.tmpl "$DIST_DIR/systemd/"
+cp systemd/modules-load.d-security-harbor.conf systemd/wait-online-no-dns.conf.tmpl systemd/suricata-memory.conf.tmpl "$DIST_DIR/systemd/"
 cp systemd/update-runner.sh systemd/rollback-runner.sh systemd/lib-archive-version.sh "$DIST_DIR/systemd/"
 chmod +x "$DIST_DIR/systemd/update-runner.sh" "$DIST_DIR/systemd/rollback-runner.sh"
 

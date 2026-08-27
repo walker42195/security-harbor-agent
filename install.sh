@@ -317,6 +317,51 @@ else
   echo "VARNING: modules-load.d-security-harbor.conf saknas i paketet." >&2
 fi
 
+# Suricata: minnestak skalat efter maskinens RAM.
+#
+# Memcaps i suricata.yaml lämnas medvetet orörda — uppmätt använder poolerna
+# ~44 MB av ~528 MB tilldelat tak, så en sänkning frigör ingenting. Minnet
+# ligger i detect-motorn (52 000+ regler) och den enda riktiga hävstången där
+# är att minska regelsetet, vilket är ett säkerhetsbeslut installern inte ska
+# fatta åt någon.
+if [ -f "$SCRIPT_DIR/systemd/suricata-memory.conf.tmpl" ] && [ "$MODE" = "gateway" ]; then
+  TOTAL_MB=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
+  # MJUKT tak: stryper och återvinner, dödar inte.
+  #
+  # Golvet 1024 MB är MÄTT, inte valt: med ET Open (~52 600 regler) ligger
+  # Suricata på ~425 MB vid kall start, men en live-reload av regelsetet höjer
+  # det stationära till ~650 MB och toppar på ~858 MB. Värdet planar ut där —
+  # tre reload-cykler i rad gav 647/640/667 MB stationärt och 795/856/858 MB
+  # topp, alltså ingen läcka. Ett MemoryHigh under ~900 MB hade strypt
+  # Suricata vid varje daglig regeluppdatering.
+  HIGH_MB=$(( TOTAL_MB * 30 / 100 ))
+  [ "$HIGH_MB" -lt 1024 ] && HIGH_MB=1024
+  [ "$HIGH_MB" -gt 1536 ] && HIGH_MB=1536
+
+  # HÅRT tak sätts bara när maskinen har råd med det. En live-reload av
+  # regelsetet håller två detect-motorer samtidigt (~2x stationärt, uppmätt
+  # ~423 MB stationärt => ~850 MB topp). Ett hårt tak under den toppen hade
+  # dödat Suricata vid varje daglig regeluppdatering, så på små maskiner
+  # stryper vi bara.
+  MAX_LINE="# MemoryMax utelamnat: $TOTAL_MB MB RAM racker inte for ett hart tak ovanfor"
+  MAX_LINE="$MAX_LINE den uppmatta toppen (~858 MB) vid regel-reload."
+  if [ "$TOTAL_MB" -ge 3000 ]; then
+    MAX_MB=$(( TOTAL_MB * 45 / 100 ))
+    [ "$MAX_MB" -lt 1536 ] && MAX_MB=1536
+    [ "$MAX_MB" -gt 2560 ] && MAX_MB=2560
+    MAX_LINE="MemoryMax=${MAX_MB}M"
+    echo "-> Suricata minnestak: MemoryHigh=${HIGH_MB}M MemoryMax=${MAX_MB}M (RAM: ${TOTAL_MB} MB)"
+  else
+    echo "-> Suricata minnestak: MemoryHigh=${HIGH_MB}M, inget hårt tak (RAM: ${TOTAL_MB} MB)"
+  fi
+
+  install -d -m 0755 /etc/systemd/system/suricata.service.d
+  sed -e "s|{{MEMORY_HIGH}}|${HIGH_MB}M|g" \
+      -e "s|{{MEMORY_MAX_LINE}}|${MAX_LINE}|g" \
+      "$SCRIPT_DIR/systemd/suricata-memory.conf.tmpl" \
+      > /etc/systemd/system/suricata.service.d/security-harbor-memory.conf
+fi
+
 # systemd-networkd-wait-online: ta bort --dns. På en router som äger sin egen
 # DNS är beroendet cirkulärt (Unbound konfigureras av agenten, som startar
 # efter network-online.target). Mätt 2026-08-27 blockerade det
