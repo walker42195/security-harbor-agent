@@ -196,6 +196,13 @@ func main() {
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
+	// Trafikmätning per enhet (dashboarden). Kärnan räknar via nftables
+	// dynamiska mängder; den här loopen läser bara av dem, lagrar deltan och
+	// sparar historiken med jämna mellanrum.
+	trafficCtx, stopTraffic := context.WithCancel(context.Background())
+	defer stopTraffic()
+	go eng.StartTrafficCollection(trafficCtx)
+
 	go func() {
 		if err := server.Start(); err != nil {
 			log.Printf("API Server stoppad: %v", err)
@@ -204,6 +211,7 @@ func main() {
 
 	<-stopChan
 	fmt.Println("\n[SHUTDOWN] Stänger ner Security Harbor Agent...")
+	stopTraffic() // låter trafikloopen spara historiken innan vi går ner
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

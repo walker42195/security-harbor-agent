@@ -83,6 +83,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
 	mux.HandleFunc("/api/v1/diagnostics/security-events", s.authMiddleware(s.handleSecurityEvents))
 	// IDS-regelurval (kategorier + tystade signaturer).
+	// Dashboard: trafik per enhet.
+	mux.HandleFunc("/api/v1/dashboard/devices", s.authMiddleware(s.handleDashboardDevices))
+	mux.HandleFunc("/api/v1/dashboard/device-history", s.authMiddleware(s.handleDeviceHistory))
 	mux.HandleFunc("/api/v1/ids/rules", s.authMiddleware(s.handleIDSRules))
 	mux.HandleFunc("/api/v1/ids/rules/status", s.authMiddleware(s.handleIDSRuleStatus))
 	mux.HandleFunc("/api/v1/vpn/wireguard/server-info", s.authMiddleware(s.handleWireGuardServerInfo))
@@ -1147,6 +1150,70 @@ func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(events)
+}
+
+// handleDashboardDevices returnerar trafik per enhet för dashboarden.
+//
+// Frågeparametrar:
+//
+//	res    "1m" | "5m" | "1h" | "1d"  (fönster/upplösning, default "5m")
+//	spark  antal minutpunkter för minigrafen i varje rad (0 = ingen)
+func (s *Server) handleDashboardDevices(w http.ResponseWriter, r *http.Request) {
+	res := r.URL.Query().Get("res")
+	switch res {
+	case "", "1m", "5m", "1h", "1d":
+	default:
+		http.Error(w, "ogiltig upplösning", http.StatusBadRequest)
+		return
+	}
+
+	spark := 0
+	if v := r.URL.Query().Get("spark"); v != "" {
+		n, err := strconv.Atoi(v)
+		// Taket finns för att en klient inte ska kunna be om godtyckligt
+		// mycket data per rad — 60 punkter är en timme i minutupplösning.
+		if err != nil || n < 0 || n > 60 {
+			http.Error(w, "spark måste vara 0-60", http.StatusBadRequest)
+			return
+		}
+		spark = n
+	}
+
+	data := s.engine.GetDashboard(r.Context(), res, spark)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+// handleDeviceHistory returnerar tidsserien för EN enhet.
+func (s *Server) handleDeviceHistory(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	ip := q.Get("ip")
+	if net.ParseIP(ip) == nil {
+		http.Error(w, "ogiltig ip", http.StatusBadRequest)
+		return
+	}
+	res := q.Get("res")
+	switch res {
+	case "", "1m", "5m", "1h", "1d":
+	default:
+		http.Error(w, "ogiltig upplösning", http.StatusBadRequest)
+		return
+	}
+	if res == "" {
+		res = "1m"
+	}
+	points := 120
+	if v := q.Get("points"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 2160 {
+			http.Error(w, "points måste vara 1-2160", http.StatusBadRequest)
+			return
+		}
+		points = n
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.engine.DeviceHistory(res, ip, points))
 }
 
 // idsRulesResponse är svaret från GET /api/v1/ids/rules: alla kategorier med

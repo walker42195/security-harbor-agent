@@ -499,6 +499,11 @@ func (s *Store) saveConfigLocked(path string, cfg *config.Config) error {
 	return os.Rename(tmpPath, path)
 }
 
+// BaseDir är katalogen där agentens tillstånd ligger (/var/lib/security-harbor).
+// Trafikhistoriken och enhetsregistret lagras här, inte under /etc — agenten
+// äger den här katalogen och kan skapa filer i den.
+func (s *Store) BaseDir() string { return s.baseDir }
+
 func (s *Store) GetRunningConfig() *config.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

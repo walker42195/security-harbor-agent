@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
 	"github.com/walker42195/security-harbor-agent/pkg/threatfeed"
+	"github.com/walker42195/security-harbor-agent/pkg/traffic"
 )
 
 type State string
@@ -50,6 +52,12 @@ type Engine struct {
 	state           State
 	confirmTimer    *time.Timer
 	unconfirmedCfg  *config.Config
+
+	// Trafikmätning per enhet (dashboarden). Kärnan räknar via nftables
+	// dynamiska mängder; agenten läser bara av och lagrar deltan.
+	trafficStore *traffic.Store
+	trafficColl  *traffic.Collector
+	inventory    *traffic.Inventory
 
 	// idsLastAlertTS håller den senaste larm-tidsstämpeln vi redan hanterat
 	// för auto-block (Fas 9), så samma larm inte blockeras om och om igen.
@@ -92,7 +100,15 @@ func (e *Engine) DegradedBackends() []BackendWarning {
 }
 
 func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.Adapter, wgAdapter *wireguard.Adapter, ovpnAdapter *openvpn.Adapter, dnsAdapter *dns.Adapter, syslogAdapter *syslog.Adapter, suricataAdapter *suricata.Adapter, haproxyAdapter *haproxy.Adapter) *Engine {
+	ts := traffic.NewStore(st.BaseDir())
+	ts.Load()
+	inv := traffic.NewInventory(filepath.Join(st.BaseDir(), "device_first_seen.json"))
+	inv.LoadFirstSeen()
+
 	return &Engine{
+		trafficStore:    ts,
+		trafficColl:     traffic.NewCollector(ts),
+		inventory:       inv,
 		store:           st,
 		nftAdapter:      nftAdapter,
 		dhcpAdapter:     dhcpAdapter,
@@ -120,6 +136,17 @@ func (e *Engine) applyBackends(ctx context.Context, cfg *config.Config, dryRun b
 
 	if _, err := e.nftAdapter.ApplyConfig(ctx, cfg, dryRun); err != nil {
 		return fmt.Errorf("nftables: %w", err)
+	}
+
+	// Mättabellen för trafik per enhet ligger i en EGEN nftables-tabell och
+	// sveps därför bort av huvudregelsetets "flush ruleset" ovan. Den måste
+	// återskapas här, annars slutar dashboarden räkna så fort någon sparar
+	// en brandväggsregel. Ett fel här får aldrig stoppa en applicering —
+	// statistik är trevligt, brandväggsregler är kritiska.
+	if !dryRun {
+		if err := nftables.ApplyAccounting(ctx, cfg, "inet"); err != nil {
+			log.Printf("[VARNING] trafikmätning kunde inte aktiveras: %v", err)
+		}
 	}
 
 	// Kärnans IPv4-forwarding MÅSTE vara på i gateway-läge, annars
