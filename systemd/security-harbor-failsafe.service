@@ -1,7 +1,14 @@
 [Unit]
 Description=Security Harbor Failsafe Boot Ruleset
 DefaultDependencies=no
-After=systemd-modules-load.service
+# Vänta på nf_tables — men BARA på nf_tables. Ett tidigare
+# After=systemd-modules-load.service band enheten till att HELA
+# modulinladdningen blev klar, vilket mätt på riktiga bootar skedde först vid
+# ~4,04 s: failsafe startade 18 ms senare, vid 4,06 s, medan networkd redan
+# var uppe vid 1,42 s. modprobe@.service laddar en enskild modul och
+# synkroniserar på just den, vilket är precis vad som behövs här.
+Wants=modprobe@nf_tables.service
+After=modprobe@nf_tables.service
 Before=network-pre.target security-harbor-agent.service
 Wants=network-pre.target
 # Explicit ordning mot de faktiska nätverkshanterarna. Enbart
@@ -17,10 +24,13 @@ ExecStart=/sbin/nft -f /etc/security-harbor/security-harbor-failsafe.nft
 ExecReload=/sbin/nft -f /etc/security-harbor/security-harbor-failsafe.nft
 
 [Install]
-# network-pre.target — INTE multi-user.target. multi-user.target nås sent i
-# booten, så systemd hade ingen anledning att dra in enheten förrän
-# gränssnitten redan var uppe: mätt på en riktig boot 2026-08-27 startade
-# systemd-networkd vid 1.469 s medan failsafe laddades först vid 4.228 s,
-# alltså 2,75 s med uppe gränssnitt och noll nftables-regler. Samma mönster
-# som nftables.service och firewalld använder.
+# network-pre.target — INTE multi-user.target. Det är det semantiskt riktiga
+# målet för en enhet som ska vara på plats innan nätverket konfigureras, och
+# samma mönster som nftables.service och firewalld använder.
+#
+# OBS: detta var INTE orsaken till boot-glappet som mättes 2026-08-27 (2,75 s
+# med uppe gränssnitt och noll nftables-regler). Den orsaken var
+# After=systemd-modules-load.service, se kommentaren i [Unit] ovan. Enheten
+# schemalades i tid även med multi-user.target; den satt fast på
+# modulinladdningen.
 WantedBy=network-pre.target
