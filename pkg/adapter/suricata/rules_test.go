@@ -124,3 +124,52 @@ func TestGenerateDisableConfEmptyIsSafe(t *testing.T) {
 		}
 	}
 }
+
+// TestDisableConfPathIsAgentWritable vaktar buggen från 2026-08-27: filen låg
+// i /etc/suricata, en katalog som ägs av root med 0755. Agenten kan ändra
+// suricata.yaml där (install.sh gruppskriver den FILEN) men aldrig skapa
+// något nytt, så den atomiska skrivningen föll på
+// "open /etc/suricata/disable.conf.tmp: permission denied".
+//
+// systemd-enhetens ReadWritePaths=/etc/suricata räcker inte — den lyfter bara
+// den skrivskyddade monteringen, inte filrättigheterna.
+func TestDisableConfPathIsAgentWritable(t *testing.T) {
+	if strings.HasPrefix(DisableConfPath, "/etc/") {
+		t.Fatalf("DisableConfPath = %q ligger under /etc — agenten kan inte skapa filer där", DisableConfPath)
+	}
+	const dataDir = "/var/lib/security-harbor/"
+	if !strings.HasPrefix(DisableConfPath, dataDir) {
+		t.Errorf("DisableConfPath = %q, ville ha något under %s (agentens egen katalog, som finns i ReadWritePaths)", DisableConfPath, dataDir)
+	}
+}
+
+// TestWriteDisableConfIsAtomic bevisar att skrivningen går via en temp-fil i
+// SAMMA katalog — det är själva anledningen att katalogen måste vara skrivbar,
+// och det som gjorde att buggen ovan syntes som ".tmp: permission denied".
+func TestWriteDisableConfIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "disable.conf")
+
+	if err := WriteDisableConf(path, "2200121\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "2200121\n" {
+		t.Fatalf("innehåll = %q, err = %v", string(got), err)
+	}
+	// Ingen temp-fil ska ligga kvar efter en lyckad skrivning.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("temp-filen %q lämnades kvar", e.Name())
+		}
+	}
+	// Skrivning nummer två ska ersätta, inte lägga till.
+	if err := WriteDisableConf(path, "x\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(path)
+	if string(got) != "x\n" {
+		t.Errorf("andra skrivningen gav %q", string(got))
+	}
+}

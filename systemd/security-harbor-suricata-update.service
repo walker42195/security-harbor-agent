@@ -3,7 +3,15 @@ Description=Security Harbor - hämta uppdaterat Suricata-regelset (ET Open)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/suricata-update
+# --disable-conf pekar på agentens egen fil i stället för standardsökvägen
+# /etc/suricata/disable.conf: katalogen /etc/suricata ägs av root 0755 och
+# agenten kan därför inte skapa filer där (se pkg/adapter/suricata/rules.go).
+# Saknas filen loggar suricata-update bara en varning och fortsätter — det är
+# alltså ofarligt innan användaren har stängt av något.
+#
+# OBS: när flaggan anges läses INTE /etc/suricata/disable.conf. En
+# handskriven sådan fil ignoreras därmed; regelurvalet ägs av GUI:t.
+ExecStart=/usr/bin/suricata-update --disable-conf /var/lib/security-harbor/disable.conf
 # Ladda in de nyhämtade reglerna i den KÖRANDE Suricata. Utan detta skrevs
 # nya regler till /var/lib/suricata/rules men började gälla först vid nästa
 # omstart av tjänsten — på en brandvägg som sällan startas om innebar det att

@@ -17,7 +17,20 @@ import (
 // DisableConfPath är filen suricata-update läser för att veta vilka regler som
 // ska stängas av. Den regenereras i sin helhet ur konfigurationen vid varje
 // applicering — handredigering skrivs alltså över, vilket är avsikten.
-const DisableConfPath = "/etc/suricata/disable.conf"
+//
+// Ligger i agentens EGEN datakatalog, inte /etc/suricata. Katalogen
+// /etc/suricata ägs av root med rättigheterna 0755, och även om agentens
+// systemd-enhet har ReadWritePaths=/etc/suricata lyfter det bara den
+// skrivskyddade monteringen — det ändrar inga filrättigheter. install.sh
+// gruppskriver bara suricata.yaml, alltså FILEN, inte katalogen, så agenten
+// kan läsa och ändra den men aldrig SKAPA något nytt där. Ett försök gav
+// "open /etc/suricata/disable.conf.tmp: permission denied" (2026-08-27).
+//
+// Alternativet hade varit att öppna hela /etc/suricata för tjänstekontot.
+// Det vore en onödig utvidgning av vad agenten får röra på en brandvägg —
+// suricata-update tar sökvägen som flagga, så det behövs inte.
+// Se systemd/security-harbor-suricata-update.service.
+const DisableConfPath = "/var/lib/security-harbor/disable.conf"
 
 // RulesPath är den sammanslagna regelfil suricata-update skriver.
 const RulesPath = "/var/lib/suricata/rules/suricata.rules"
