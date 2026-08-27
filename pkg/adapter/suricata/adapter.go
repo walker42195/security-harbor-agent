@@ -25,24 +25,30 @@ import (
 )
 
 type Adapter struct {
-	yamlPath string
-	evePath  string
+	yamlPath    string
+	evePath     string
+	fastLogPath string
 }
 
 const (
-	defaultYamlPath = "/etc/suricata/suricata.yaml"
-	defaultEvePath  = "/var/log/suricata/eve.json"
-	unit            = "suricata.service"
+	defaultYamlPath    = "/etc/suricata/suricata.yaml"
+	defaultEvePath     = "/var/log/suricata/eve.json"
+	defaultFastLogPath = "/var/log/suricata/fast.log"
+	unit               = "suricata.service"
 )
 
-func NewAdapter(yamlPath, evePath string) *Adapter {
+func NewAdapter(yamlPath, evePath string, fastLogPath ...string) *Adapter {
 	if yamlPath == "" {
 		yamlPath = defaultYamlPath
 	}
 	if evePath == "" {
 		evePath = defaultEvePath
 	}
-	return &Adapter{yamlPath: yamlPath, evePath: evePath}
+	flp := defaultFastLogPath
+	if len(fastLogPath) > 0 && fastLogPath[0] != "" {
+		flp = fastLogPath[0]
+	}
+	return &Adapter{yamlPath: yamlPath, evePath: evePath, fastLogPath: flp}
 }
 
 // afPacketInterfaceRe matchar ENDAST det första listobjektets interface-rad
@@ -229,6 +235,9 @@ func ReadRecentAlerts(evePath string, maxLines int) ([]config.SecurityEvent, err
 // auto-block-bevakningen, som behöver samma fil men sin egen
 // "sedan senast"-vattenmärkning).
 func (a *Adapter) EvePath() string { return a.evePath }
+
+// FastLogPath returnerar sökvägen till fast.log (för larmhistorik).
+func (a *Adapter) FastLogPath() string { return a.fastLogPath }
 
 // eveTailInitialWindow / eveTailMaxWindow styr hur långt bakåt i eve.json som
 // läses. 8 MiB rymmer i storleksordningen 15 000 rader, alltså gott och väl de

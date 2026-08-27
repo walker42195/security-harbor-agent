@@ -1144,8 +1144,23 @@ func (s *Server) handleFirewallLog(w http.ResponseWriter, r *http.Request) {
 // handleSecurityEvents returnerar de senaste Suricata-larmen (Fas 9).
 // Läsrättighet räcker (admin+viewer) — precis som conntrack/firewall-log,
 // det är bara diagnostik, ingen handling utförs.
+//
+// Frågeparametrar:
+//
+//	source: "live" (default, ur eve.json) | "history" / "fast" (ur fast.log)
+//	limit:  antal rader att läsa (default 1000, max 5000)
 func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
-	events, err := s.engine.GetSecurityEvents(1000)
+	source := r.URL.Query().Get("source")
+	if source == "" {
+		source = "live"
+	}
+	limit := 1000
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 5000 {
+			limit = l
+		}
+	}
+	events, err := s.engine.GetSecurityEvents(source, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

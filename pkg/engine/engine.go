@@ -1617,10 +1617,16 @@ func (e *Engine) ReapplyNftablesOnly(ctx context.Context) error {
 	return nil
 }
 
-// GetSecurityEvents returnerar de senaste Suricata-larmen (Fas 9), läst
-// direkt ur eve.json vid varje anrop — samma "ingen egen lagring, läs om
-// vid behov"-princip som parseFirewallLog använder mot journald.
-func (e *Engine) GetSecurityEvents(maxLines int) ([]config.SecurityEvent, error) {
+// GetSecurityEvents returnerar de senaste Suricata-larmen (Fas 9).
+// source="live" (default) läser ur eve.json för realtidsövervakning.
+// source="history" / "fast" läser ur fast.log för långsiktig larmhistorik.
+func (e *Engine) GetSecurityEvents(source string, maxLines int) ([]config.SecurityEvent, error) {
+	if maxLines <= 0 {
+		maxLines = 1000
+	}
+	if source == "history" || source == "fast" {
+		return suricata.ReadFastLogAlerts(e.suricataAdapter.FastLogPath(), maxLines)
+	}
 	return suricata.ReadRecentAlerts(e.suricataAdapter.EvePath(), maxLines)
 }
 
@@ -1637,7 +1643,7 @@ func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
 		return nil
 	}
 
-	events, err := e.GetSecurityEvents(2000)
+	events, err := e.GetSecurityEvents("live", 2000)
 	if err != nil {
 		return fmt.Errorf("ids: kunde inte läsa larm: %w", err)
 	}
