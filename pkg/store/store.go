@@ -615,6 +615,43 @@ func (s *Store) UpdateObjectValuesDirect(objID string, values []string) error {
 	return nil
 }
 
+// UpdateIDSRuleSelection skriver regelurvalet (tystade signaturer och
+// avstängda kategorier) direkt till BÅDE running och candidate, samma mönster
+// som UpdateObjectValuesDirect ovan.
+//
+// Skälet till att det inte går via candidate + commit: att tysta en signatur
+// från IDS-vyn är en enskild, omedelbar åtgärd på ett larm man just tittar på
+// — den ska inte ligga och vänta i en oapplicerad candidate tillsammans med
+// halvfärdiga brandväggsregler, och den ska inte heller råka applicera dem.
+func (s *Store) UpdateIDSRuleSelection(sigs []config.DisabledSignature, cats []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	apply := func(cfg *config.Config) {
+		if cfg == nil || cfg.IDS == nil {
+			return
+		}
+		cfg.IDS.DisabledSignatures = sigs
+		cfg.IDS.DisabledCategories = cats
+	}
+	apply(s.runningCfg)
+	apply(s.candidateCfg)
+
+	if s.runningCfg == nil || s.runningCfg.IDS == nil {
+		return fmt.Errorf("IDS är inte konfigurerat")
+	}
+
+	if err := s.saveConfigLocked(filepath.Join(s.baseDir, "running.json"), s.runningCfg); err != nil {
+		return err
+	}
+	if s.candidateCfg != nil {
+		if err := s.saveConfigLocked(filepath.Join(s.baseDir, "candidate.json"), s.candidateCfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // blocklistIDPattern är en sträng ALLOWLIST för DNSBlocklistSource.ID —
 // den kommer direkt från klienten (admin-API:t, se handleCandidateConfig)
 // och används för att bygga ett filnamn. Utan denna spärr kan ett ID som

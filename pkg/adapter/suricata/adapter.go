@@ -172,6 +172,8 @@ type eveAlert struct {
 		Signature string `json:"signature"`
 		Category  string `json:"category"`
 		Severity  int    `json:"severity"`
+		// SID behövs för att kunna tysta EN signatur från larmvyn i GUI:t.
+		SID int `json:"signature_id"`
 	} `json:"alert"`
 }
 
@@ -211,6 +213,7 @@ func ReadRecentAlerts(evePath string, maxLines int) ([]config.SecurityEvent, err
 			Timestamp: a.Timestamp,
 			Severity:  a.Alert.Severity,
 			Signature: a.Alert.Signature,
+			SID:       a.Alert.SID,
 			Category:  a.Alert.Category,
 			SrcIP:     a.SrcIP,
 			SrcPort:   a.SrcPort,

@@ -593,6 +593,37 @@ func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
 	return e.applyBackends(ctx, running, false)
 }
 
+// UpdateIDSRuleSelection sparar regelurvalet och startar om regeluppdateringen
+// (suricata-update + live-reload). Uppdateringen kör i bakgrunden — följ den
+// via IDSRuleUpdateStatus.
+func (e *Engine) UpdateIDSRuleSelection(ctx context.Context, sigs []config.DisabledSignature, cats []string) error {
+	if err := e.store.UpdateIDSRuleSelection(sigs, cats); err != nil {
+		return err
+	}
+	cfg := e.store.GetRunningConfig()
+	if cfg == nil || cfg.IDS == nil {
+		return fmt.Errorf("IDS är inte konfigurerat")
+	}
+	return suricata.ApplyRuleSelection(ctx, cfg.IDS, "")
+}
+
+// IDSRuleUpdateStatus: "activating"/"active" = pågår, "inactive" = klar,
+// "failed" = misslyckades.
+func (e *Engine) IDSRuleUpdateStatus(ctx context.Context) string {
+	return suricata.RuleUpdateStatus(ctx)
+}
+
+// IDSCategories listar regelkategorier med antal regler och hur många som är
+// aktiva just nu.
+func (e *Engine) IDSCategories() ([]suricata.Category, error) {
+	return suricata.ListCategories(suricata.RulesPath)
+}
+
+// IDSLookupSignature slår upp msg-texten för ett SID.
+func (e *Engine) IDSLookupSignature(sid int) (string, error) {
+	return suricata.LookupSignature(suricata.RulesPath, sid)
+}
+
 func (e *Engine) GetRunningConfig() *config.Config {
 	return e.store.GetRunningConfig()
 }

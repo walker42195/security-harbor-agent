@@ -64,6 +64,24 @@ type IDSConfig struct {
 	AutoBlock         bool   `json:"auto_block"`
 	AutoBlockObjectID string `json:"auto_block_object_id,omitempty"`
 	AutoBlockSeverity int    `json:"auto_block_severity"` // t.ex. 2 — bara larm med severity <= detta värde triggar block (1=högst allvarlighetsgrad)
+
+	// Regelurval. Renderas till /etc/suricata/disable.conf, varefter
+	// suricata-update körs om och Suricata laddar om reglerna live.
+	//
+	// Avstängda regler tas INTE bort ur suricata.rules — suricata-update
+	// skriver dem utkommenterade ("# alert ..."), vilket är varför
+	// kategoriräkningen skiljer på rader som börjar med "alert" och "# alert".
+	DisabledSignatures []DisabledSignature `json:"disabled_signatures,omitempty"`
+	DisabledCategories []string            `json:"disabled_categories,omitempty"` // msg-prefix, t.ex. "ET DYN_DNS"
+}
+
+// DisabledSignature är en enskild tystad Suricata-signatur. Signature sparas
+// enbart för att GUI:t ska kunna visa VAD som tystades utan att behöva slå upp
+// SID:t i regelfilen — den används aldrig för matchning.
+type DisabledSignature struct {
+	SID        int    `json:"sid"`
+	Signature  string `json:"signature,omitempty"`
+	DisabledAt string `json:"disabled_at,omitempty"`
 }
 
 // SyslogConfig styr vidarebefordran av brandväggens systemloggar (bl.a.
@@ -539,10 +557,13 @@ type SecurityEvent struct {
 	Timestamp string `json:"timestamp"`
 	Severity  int    `json:"severity"` // 1 (högst) - 3 (lägst), Suricatas egen skala
 	Signature string `json:"signature"`
-	Category  string `json:"category,omitempty"`
-	SrcIP     string `json:"src_ip"`
-	SrcPort   int    `json:"src_port,omitempty"`
-	DstIP     string `json:"dst_ip"`
-	DstPort   int    `json:"dst_port,omitempty"`
-	Protocol  string `json:"protocol,omitempty"`
+	// SID är Suricatas signatur-ID. Det är nyckeln GUI:t skickar till
+	// POST /api/v1/ids/rules för att tysta just den här signaturen.
+	SID      int    `json:"sid,omitempty"`
+	Category string `json:"category,omitempty"`
+	SrcIP    string `json:"src_ip"`
+	SrcPort  int    `json:"src_port,omitempty"`
+	DstIP    string `json:"dst_ip"`
+	DstPort  int    `json:"dst_port,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
 }

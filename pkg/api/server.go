@@ -82,6 +82,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/diagnostics/firewall-log", s.authMiddleware(s.handleFirewallLog))
 	mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.authMiddleware(s.handleBandwidthStats))
 	mux.HandleFunc("/api/v1/diagnostics/security-events", s.authMiddleware(s.handleSecurityEvents))
+	// IDS-regelurval (kategorier + tystade signaturer).
+	mux.HandleFunc("/api/v1/ids/rules", s.authMiddleware(s.handleIDSRules))
+	mux.HandleFunc("/api/v1/ids/rules/status", s.authMiddleware(s.handleIDSRuleStatus))
 	mux.HandleFunc("/api/v1/vpn/wireguard/server-info", s.authMiddleware(s.handleWireGuardServerInfo))
 	mux.HandleFunc("/api/v1/vpn/openvpn/ca-info", s.authMiddleware(s.handleOpenVPNCAInfo))
 	mux.HandleFunc("/api/v1/policies/hit-counts", s.authMiddleware(s.handleHitCounts))
@@ -1144,6 +1147,179 @@ func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(events)
+}
+
+// idsRulesResponse är svaret från GET /api/v1/ids/rules: alla kategorier med
+// antal regler och nuvarande status, plus listan över enskilt tystade
+// signaturer.
+type idsRulesResponse struct {
+	Categories         []suricataCategoryView     `json:"categories"`
+	DisabledSignatures []config.DisabledSignature `json:"disabled_signatures"`
+	UpdateStatus       string                     `json:"update_status"`
+}
+
+type suricataCategoryView struct {
+	Name    string `json:"name"`
+	Total   int    `json:"total"`
+	Enabled int    `json:"enabled"`
+	// Disabled speglar konfigurationen, INTE regelfilen: efter att en
+	// kategori stängts av tar det ~40-60 s innan suricata-update skrivit om
+	// filen, och GUI:t ska visa användarens val direkt.
+	Disabled bool `json:"disabled"`
+}
+
+// idsRulesRequest är kroppen till POST /api/v1/ids/rules.
+//
+// Kategori- och signaturändringar skickas som deltan snarare än hela listor,
+// så att två samtidiga admins inte råkar radera varandras val genom att skicka
+// en lista som var färsk när deras vy laddades.
+type idsRulesRequest struct {
+	DisableCategory string `json:"disable_category,omitempty"`
+	EnableCategory  string `json:"enable_category,omitempty"`
+	SilenceSID      int    `json:"silence_sid,omitempty"`
+	UnsilenceSID    int    `json:"unsilence_sid,omitempty"`
+}
+
+func (s *Server) handleIDSRules(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.getIDSRules(w, r)
+	case http.MethodPost:
+		s.postIDSRules(w, r)
+	default:
+		http.Error(w, "metod stöds inte", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) getIDSRules(w http.ResponseWriter, r *http.Request) {
+	cats, err := s.engine.IDSCategories()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	cfg := s.engine.GetRunningConfig()
+	disabled := map[string]bool{}
+	var sigs []config.DisabledSignature
+	if cfg != nil && cfg.IDS != nil {
+		for _, c := range cfg.IDS.DisabledCategories {
+			disabled[c] = true
+		}
+		sigs = cfg.IDS.DisabledSignatures
+	}
+	if sigs == nil {
+		sigs = []config.DisabledSignature{}
+	}
+
+	views := make([]suricataCategoryView, 0, len(cats))
+	for _, c := range cats {
+		views = append(views, suricataCategoryView{
+			Name: c.Name, Total: c.Total, Enabled: c.Enabled, Disabled: disabled[c.Name],
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(idsRulesResponse{
+		Categories:         views,
+		DisabledSignatures: sigs,
+		UpdateStatus:       s.engine.IDSRuleUpdateStatus(r.Context()),
+	})
+}
+
+func (s *Server) postIDSRules(w http.ResponseWriter, r *http.Request) {
+	var req idsRulesRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+		http.Error(w, "ogiltig JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	cfg := s.engine.GetRunningConfig()
+	if cfg == nil || cfg.IDS == nil {
+		http.Error(w, "IDS är inte konfigurerat", http.StatusConflict)
+		return
+	}
+
+	cats := append([]string(nil), cfg.IDS.DisabledCategories...)
+	sigs := append([]config.DisabledSignature(nil), cfg.IDS.DisabledSignatures...)
+
+	switch {
+	case req.DisableCategory != "":
+		if !containsString(cats, req.DisableCategory) {
+			cats = append(cats, req.DisableCategory)
+		}
+	case req.EnableCategory != "":
+		cats = removeString(cats, req.EnableCategory)
+	case req.SilenceSID > 0:
+		already := false
+		for _, sg := range sigs {
+			if sg.SID == req.SilenceSID {
+				already = true
+			}
+		}
+		if !already {
+			// Slå upp signaturtexten så att GUI:t kan visa VAD som tystades
+			// utan att läsa om regelfilen. Misslyckas uppslaget är det inte
+			// ett fel — SID:t stängs av ändå.
+			name, _ := s.engine.IDSLookupSignature(req.SilenceSID)
+			sigs = append(sigs, config.DisabledSignature{
+				SID:        req.SilenceSID,
+				Signature:  name,
+				DisabledAt: time.Now().UTC().Format(time.RFC3339),
+			})
+		}
+	case req.UnsilenceSID > 0:
+		out := sigs[:0]
+		for _, sg := range sigs {
+			if sg.SID != req.UnsilenceSID {
+				out = append(out, sg)
+			}
+		}
+		sigs = out
+	default:
+		http.Error(w, "ingen åtgärd angiven", http.StatusBadRequest)
+		return
+	}
+
+	// Sparar urvalet OCH startar regeluppdateringen. Den kör i bakgrunden
+	// (~40-60 s) — GUI:t följer den via /api/v1/ids/rules/status.
+	if err := s.engine.UpdateIDSRuleSelection(r.Context(), sigs, cats); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":              "applying",
+		"disabled_categories": cats,
+		"disabled_signatures": sigs,
+	})
+}
+
+func (s *Server) handleIDSRuleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status": s.engine.IDSRuleUpdateStatus(r.Context()),
+	})
+}
+
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(list []string, v string) []string {
+	out := list[:0]
+	for _, s := range list {
+		if s != v {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // diagnosticHostPattern är en ALLOWLIST för mål till ping/traceroute/nmap:

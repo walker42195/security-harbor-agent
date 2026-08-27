@@ -8,7 +8,12 @@
 // admin-grupp.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit") == "suricata.service" &&
+        (action.lookup("unit") == "suricata.service" ||
+         // Regeluppdateringen (suricata-update + live-reload) körs som en
+         // privilegierad oneshot-enhet — agenten är inte root och
+         // suricata-update skriver till /var/lib/suricata. Triggas från
+         // IDS-regelvyn i GUI:t när kategorier eller signaturer ändras.
+         action.lookup("unit") == "security-harbor-suricata-update.service") &&
         subject.user == "security-harbor") {
         return polkit.Result.YES;
     }
