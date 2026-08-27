@@ -1,0 +1,18 @@
+# Drop-in för systemd-networkd-wait-online.service.
+# Installeras av install.sh till
+#   /etc/systemd/system/systemd-networkd-wait-online.service.d/security-harbor.conf
+# med {{WAIT_ONLINE_BIN}} ersatt av den faktiska binärsökvägen (skiljer sig
+# mellan distributioner: /usr/lib/systemd/ vs /lib/systemd/).
+#
+# Varför: Ubuntus default är "--any --dns", alltså vänta tills DNS är
+# operativt. På en router som själv äger sin DNS är det cirkulärt — Unbound
+# konfigureras av agenten, som startar efter network-online.target. Mätt på
+# en riktig boot 2026-08-27 blockerade det network-online.target i 2 min 0,9 s,
+# och eftersom suricata.service är After=network-online.target var IDS blind
+# de första 2 min 21 s efter boot.
+#
+# --timeout=30 är en bakkant så att en enskild trasig länk aldrig kan
+# blockera booten i minuter igen.
+[Service]
+ExecStart=
+ExecStart={{WAIT_ONLINE_BIN}} --any --timeout=30

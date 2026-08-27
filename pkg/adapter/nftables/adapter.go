@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os/exec"
 	"strconv"
@@ -386,7 +387,10 @@ func resolveObjectCIDRs(cfg *config.Config, objID string, visited map[string]boo
 // (annars matchar "match ingenting" == matcha allt i nftables semantik för
 // en tom uttryckslista, vilket är motsatsen till vad en tom hot-lista ska
 // betyda).
-func objectMatchExpr(cfg *config.Config, objID, field string) (expr []interface{}, isAny bool) {
+// Stora listor (>= namedSetThreshold element) läggs i en NAMNGIVEN mängd via
+// reg och refereras med "@namn"; små listor inlineas som anonym mängd som
+// förut. reg får vara nil, vilket tvingar fram det gamla beteendet.
+func objectMatchExpr(cfg *config.Config, objID, field string, reg *setRegistry) (expr []interface{}, isAny bool) {
 	if objID == "" || strings.EqualFold(objID, "ANY") {
 		return nil, true
 	}
@@ -395,15 +399,124 @@ func objectMatchExpr(cfg *config.Config, objID, field string) (expr []interface{
 	if len(elements) == 0 {
 		return nil, false
 	}
+
+	var right interface{} = map[string]interface{}{"set": elements}
+	if reg != nil && len(elements) >= namedSetThreshold {
+		right = "@" + reg.register(objID, elements)
+	}
+
 	return []interface{}{
 		map[string]interface{}{
 			"match": map[string]interface{}{
 				"op":    "==",
 				"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": field}},
-				"right": map[string]interface{}{"set": elements},
+				"right": right,
 			},
 		},
 	}, false
+}
+
+// ---------------------------------------------------------------------------
+// Namngivna mängder för stora IP-listor
+// ---------------------------------------------------------------------------
+
+// namedSetThreshold är gränsen där en IP-lista slutar inlineas som anonym
+// mängd och i stället deklareras som en namngiven mängd.
+//
+// Under gränsen är anonyma mängder att föredra: de syns direkt i regeln när
+// en administratör läser `nft list ruleset`, och de flesta objekt (enskilda
+// värdar, ett par nät) är små. Över gränsen dominerar kostnaden i stället:
+// en anonym mängd byggs om per regel som refererar objektet, och hot-flöden
+// har storleksordningen 10^5 poster.
+const namedSetThreshold = 64
+
+// setRegistry samlar de namngivna mängder som en enskild render behöver.
+// Nyckeln är objekt-ID:t, så att samma lista refererad från flera policies —
+// och från både saddr och daddr — delar EN deklaration.
+type setRegistry struct {
+	family string
+	table  string
+	order  []string                 // registreringsordning, för determinism
+	byObj  map[string]string        // objekt-ID -> mängdnamn
+	elems  map[string][]interface{} // mängdnamn -> element
+	taken  map[string]bool          // mängdnamn -> upptaget
+}
+
+func newSetRegistry(family, table string) *setRegistry {
+	return &setRegistry{
+		family: family,
+		table:  table,
+		byObj:  map[string]string{},
+		elems:  map[string][]interface{}{},
+		taken:  map[string]bool{},
+	}
+}
+
+// register returnerar mängdnamnet för ett objekt och deklarerar mängden
+// första gången objektet ses.
+func (r *setRegistry) register(objID string, elements []interface{}) string {
+	if name, ok := r.byObj[objID]; ok {
+		return name
+	}
+	name := r.uniqueName(objID)
+	r.byObj[objID] = name
+	r.elems[name] = elements
+	r.taken[name] = true
+	r.order = append(r.order, objID)
+	return name
+}
+
+// uniqueName härleder en giltig nft-identifierare ur ett objekt-ID. Objekt-ID
+// är fritt satta av användaren och kan innehålla tecken nft inte accepterar,
+// så de saniteras och kortas — hashsuffixet gör att två ID som saniteras till
+// samma sträng ändå får skilda mängdnamn.
+func (r *setRegistry) uniqueName(objID string) string {
+	var b strings.Builder
+	for _, ch := range objID {
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+			b.WriteRune(ch)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	stem := b.String()
+	if len(stem) > 20 {
+		stem = stem[:20]
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(objID))
+	name := fmt.Sprintf("sh_%s_%07x", stem, h.Sum32()&0xfffffff)
+
+	// Kollisionsvakt. Ska i praktiken aldrig slå till (hashen är på hela
+	// objekt-ID:t) men en tyst namnkrock hade tystlåtet gett två objekt samma
+	// hot-lista, vilket är exakt fel sorts bugg i en brandvägg.
+	for i := 1; r.taken[name]; i++ {
+		name = fmt.Sprintf("sh_%s_%07x_%d", stem, h.Sum32()&0xfffffff, i)
+	}
+	return name
+}
+
+// sets returnerar deklarationerna i registreringsordning.
+func (r *setRegistry) sets() []Set {
+	out := make([]Set, 0, len(r.order))
+	for _, objID := range r.order {
+		name := r.byObj[objID]
+		out = append(out, Set{
+			Family: r.family,
+			Table:  r.table,
+			Name:   name,
+			// Enbart IPv4: matchuttrycken nedan är hårdkodade på
+			// {"payload":{"protocol":"ip"}}, så en v6-mängd hade aldrig
+			// kunnat refereras. Ändras det ska den här raden följa med.
+			Type: "ipv4_addr",
+			// "interval" krävs så snart något element är ett prefix
+			// (CIDR) eller ett intervall — vilket hot-flöden alltid har.
+			Flags: []string{"interval"},
+			Elem:  r.elems[name],
+		})
+	}
+	return out
 }
 
 // cidrsToSetElements omvandlar en lista av IP/CIDR-strängar till nftables
@@ -666,6 +779,11 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			{Table: &Table{Family: a.family, Name: a.tableName}},
 		},
 	}
+
+	// Namngivna mängder för stora IP-listor. Fylls på medan reglerna byggs
+	// och splitsas in efter tabelldeklarationen precis före marshalling —
+	// nft kräver att en mängd deklareras före regeln som refererar den.
+	reg := newSetRegistry(a.family, a.tableName)
 
 	// hostMode: enkelkorts-/värddator-läge (Fas 13) — bara INPUT/OUTPUT-
 	// hårdning, inga FORWARD/NAT-kedjor alls. En administratör som granskar
@@ -954,7 +1072,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		//
 		// Exakt samma buggklass rättades för FORWARD-kedjan 2026-08-19 (se
 		// kommentaren på zoneMatchExpr); INPUT-kedjan glömdes bort då.
-		srcObjExpr, srcObjIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+		srcObjExpr, srcObjIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr", reg)
 		if !srcObjIsAny && len(srcObjExpr) == 0 {
 			// Objektet är tomt eller kunde inte lösas upp. Att då släppa
 			// igenom ALLT vore raka motsatsen till avsikten — hoppa över
@@ -1276,11 +1394,11 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			// misslyckades) hoppar över hela regeln — annars skulle en trasig
 			// hot-lista av misstag matcha ALL trafik (tom uttryckslista i
 			// nftables = "matcha allt"), vilket är motsatsen till avsikten.
-			srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+			srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr", reg)
 			if !srcIsAny && srcExpr == nil {
 				continue
 			}
-			dstExpr, dstIsAny := objectMatchExpr(cfg, pol.DestObj, "daddr")
+			dstExpr, dstIsAny := objectMatchExpr(cfg, pol.DestObj, "daddr", reg)
 			if !dstIsAny && dstExpr == nil {
 				continue
 			}
@@ -1480,7 +1598,7 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			if !pol.Enabled || pol.Action != config.ActionSNAT || pol.NAT == nil || pol.NAT.ExternalIP == "" {
 				continue
 			}
-			srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr")
+			srcExpr, srcIsAny := objectMatchExpr(cfg, pol.SourceObj, "saddr", reg)
 			if !srcIsAny && srcExpr == nil {
 				continue
 			}
@@ -1583,7 +1701,33 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		}
 	} // !hostMode
 
+	root.Nftables = spliceSets(root.Nftables, reg)
+
 	return json.MarshalIndent(root, "", "  ")
+}
+
+// spliceSets lägger in mängddeklarationerna direkt efter tabelldeklarationen.
+// nft avvisar en regel som refererar en mängd som inte deklarerats tidigare i
+// samma transaktion, så positionen är inte kosmetisk.
+func spliceSets(elems []NFTElement, reg *setRegistry) []NFTElement {
+	sets := reg.sets()
+	if len(sets) == 0 {
+		return elems
+	}
+	insertAt := 0
+	for i, e := range elems {
+		if e.Table != nil {
+			insertAt = i + 1
+			break
+		}
+	}
+	out := make([]NFTElement, 0, len(elems)+len(sets))
+	out = append(out, elems[:insertAt]...)
+	for i := range sets {
+		st := sets[i]
+		out = append(out, NFTElement{Set: &st})
+	}
+	return append(out, elems[insertAt:]...)
 }
 
 // ApplyConfig applicerar eller dry-run validerar en konfiguration.

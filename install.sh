@@ -306,6 +306,37 @@ fi
 echo "=== 6. Installerar systemd-enheter och polkit-regler ==="
 cp "$SCRIPT_DIR"/systemd/*.service "$SCRIPT_DIR"/systemd/*.timer /etc/systemd/system/
 cp "$SCRIPT_DIR"/systemd/*.rules /etc/polkit-1/rules.d/
+
+# nf_tables tidigt, innan systemd-networkd startar. Utan detta loggar
+# networkd "Failed to open nftables netlink socket ... Protocol not
+# supported" och hoppar över IPMasquerade=/NFTSet=.
+if [ -f "$SCRIPT_DIR/systemd/modules-load.d-security-harbor.conf" ]; then
+  install -D -m 0644 "$SCRIPT_DIR/systemd/modules-load.d-security-harbor.conf" \
+    /etc/modules-load.d/security-harbor.conf
+else
+  echo "VARNING: modules-load.d-security-harbor.conf saknas i paketet." >&2
+fi
+
+# systemd-networkd-wait-online: ta bort --dns. På en router som äger sin egen
+# DNS är beroendet cirkulärt (Unbound konfigureras av agenten, som startar
+# efter network-online.target). Mätt 2026-08-27 blockerade det
+# network-online.target i 2 min 0,9 s, vilket i sin tur gjorde Suricata blind
+# de första 2 min 21 s efter boot.
+WAIT_ONLINE_BIN=""
+for _cand in /usr/lib/systemd/systemd-networkd-wait-online \
+             /lib/systemd/systemd-networkd-wait-online; do
+  [ -x "$_cand" ] && { WAIT_ONLINE_BIN="$_cand"; break; }
+done
+if [ -n "$WAIT_ONLINE_BIN" ] && [ -f "$SCRIPT_DIR/systemd/wait-online-no-dns.conf.tmpl" ]; then
+  echo "-> systemd-networkd-wait-online: $WAIT_ONLINE_BIN (--any --timeout=30, utan --dns)"
+  install -d -m 0755 /etc/systemd/system/systemd-networkd-wait-online.service.d
+  sed "s|{{WAIT_ONLINE_BIN}}|$WAIT_ONLINE_BIN|g" \
+    "$SCRIPT_DIR/systemd/wait-online-no-dns.conf.tmpl" \
+    > /etc/systemd/system/systemd-networkd-wait-online.service.d/security-harbor.conf
+else
+  echo "VARNING: hoppar över wait-online-drop-in (binären eller mallen saknas)." >&2
+  echo "         Suricata kan då starta flera minuter efter boot." >&2
+fi
 if [ "$MODE" = "host" ] && ! grep -q -- '--mode=host' /etc/systemd/system/security-harbor-agent.service; then
   # --mode styr bara SEEDNINGEN av en helt ny installation (se
   # store.NewStore) - ofarligt att lämna kvar på ExecStart permanent,
@@ -323,6 +354,13 @@ echo "=== 7. Startar (eller startar OM) tjänster ==="
 # 0.16.0-processen fortsatte köra med den hårdkodade 10.0.0.163-bindningen).
 # Använd därför enable + restart så att den nya binären och de nya
 # konfig-/failsafe-filerna faktiskt laddas.
+# Failsafe-enheten flyttades från WantedBy=multi-user.target till
+# WantedBy=network-pre.target (annars var den inte schemalagd förrän
+# gränssnitten redan var uppe — 2,75 s utan regeluppsättning, mätt
+# 2026-08-27). Ett blott `enable` skapar den nya symlänken men lämnar den
+# gamla kvar under multi-user.target.wants, så disable först.
+systemctl disable security-harbor-failsafe.service >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/multi-user.target.wants/security-harbor-failsafe.service
 systemctl enable security-harbor-failsafe.service
 systemctl restart security-harbor-failsafe.service
 systemctl enable security-harbor-agent.service

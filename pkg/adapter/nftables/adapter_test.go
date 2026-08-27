@@ -2,6 +2,7 @@ package nftables
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1186,5 +1187,214 @@ func TestParseMultiProtocolServiceSets(t *testing.T) {
 
 	if _, ok := parseMultiProtocolServiceSets("TCP:53,udp:abc"); ok {
 		t.Errorf("en lista med en otolkbar del ska avvisas i sin helhet")
+	}
+}
+
+// TestRenderJSONLargeObjectUsesNamedSet täcker övergången från anonym till
+// namngiven mängd. Bakgrunden är minnesincidenten 2026-08-27: hot-flöden
+// inlinades som anonyma mängder och byggdes om per regel som refererade dem,
+// vilket mätte agenten till 1,4 GB RSS på en skarp installation.
+func TestRenderJSONLargeObjectUsesNamedSet(t *testing.T) {
+	adapter := NewAdapter()
+
+	// namedSetThreshold element räcker precis för att utlösa namngiven mängd.
+	large := make([]string, 0, namedSetThreshold)
+	for i := 0; i < namedSetThreshold; i++ {
+		large = append(large, fmt.Sprintf("10.%d.%d.0/24", i/256, i%256))
+	}
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Objects: []config.Object{
+			{ID: "feed-abuse", Name: "AbuseIPDB", Type: config.ObjectTypeIPList, Values: large},
+			{ID: "small-host", Name: "En värd", Type: config.ObjectTypeHost, Values: []string{"192.168.10.10"}},
+		},
+		Policies: []config.Policy{
+			// Samma objekt från BÅDA riktningarna: ska ge EN deklaration.
+			{
+				ID: "pol-src", Name: "Blockera inkommande", Enabled: true,
+				SourceObj: "feed-abuse", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop,
+			},
+			{
+				ID: "pol-dst", Name: "Blockera utgående", Enabled: true,
+				SourceObj: "ANY", DestObj: "feed-abuse", Service: "ANY", Action: config.ActionDrop,
+			},
+			{
+				ID: "pol-small", Name: "Liten lista", Enabled: true,
+				SourceObj: "small-host", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop,
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+
+	var root struct {
+		Nftables []struct {
+			Table *json.RawMessage `json:"table"`
+			Rule  *json.RawMessage `json:"rule"`
+			Set   *struct {
+				Name  string            `json:"name"`
+				Type  string            `json:"type"`
+				Flags []string          `json:"flags"`
+				Elem  []json.RawMessage `json:"elem"`
+			} `json:"set"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("kunde inte parsa genererad JSON: %v", err)
+	}
+
+	var setName string
+	setCount, tableIdx, setIdx, firstRuleIdx := 0, -1, -1, -1
+	for i, e := range root.Nftables {
+		switch {
+		case e.Table != nil && tableIdx == -1:
+			tableIdx = i
+		case e.Set != nil:
+			setCount++
+			setIdx, setName = i, e.Set.Name
+			if e.Set.Type != "ipv4_addr" {
+				t.Errorf("mängdens typ = %q, ville ha ipv4_addr", e.Set.Type)
+			}
+			// Utan "interval" avvisar nft prefix-element.
+			if len(e.Set.Flags) != 1 || e.Set.Flags[0] != "interval" {
+				t.Errorf("mängdens flaggor = %v, ville ha [interval]", e.Set.Flags)
+			}
+			if len(e.Set.Elem) != namedSetThreshold {
+				t.Errorf("mängden har %d element, ville ha %d", len(e.Set.Elem), namedSetThreshold)
+			}
+		case e.Rule != nil && firstRuleIdx == -1:
+			firstRuleIdx = i
+		}
+	}
+
+	// Samma objekt refererat från två policies ska dela EN deklaration —
+	// det är hela poängen med ändringen.
+	if setCount != 1 {
+		t.Fatalf("antal mängddeklarationer = %d, ville ha 1", setCount)
+	}
+	// nft avvisar en regel som refererar en mängd som inte deklarerats
+	// tidigare i samma transaktion.
+	if !(tableIdx < setIdx && setIdx < firstRuleIdx) {
+		t.Errorf("fel ordning: tabell=%d mängd=%d första regel=%d — mängden måste ligga efter tabellen och före reglerna", tableIdx, setIdx, firstRuleIdx)
+	}
+
+	s := string(data)
+	// Båda reglerna ska referera mängden, inte inlinea den.
+	if refs := strings.Count(s, `"@`+setName+`"`); refs != 2 {
+		t.Errorf("antal @%s-referenser = %d, ville ha 2", setName, refs)
+	}
+	// Det stora objektets element får bara förekomma EN gång (i deklarationen).
+	if n := strings.Count(s, `"addr": "10.0.5.0"`); n != 1 {
+		t.Errorf("element ur den stora listan förekommer %d gånger, ville ha 1 (annars inlineas den fortfarande per regel)", n)
+	}
+	// Små objekt ska däremot fortfarande inlineas som anonym mängd, så att
+	// en administratör ser dem direkt i `nft list ruleset`.
+	if !strings.Contains(s, `"192.168.10.10"`) {
+		t.Errorf("det lilla objektet saknas: %s", s)
+	}
+	// setCount ovan är redan 1, alltså lyftes bara det stora objektet. Kvar
+	// att visa: det lilla ligger inlinat i sin regel och inte bakom en
+	// @-referens.
+	if strings.Count(s, `"@sh_`) != 2 {
+		t.Errorf("antal @-referenser totalt = %d, ville ha 2 (bara det stora objektet ska refereras)", strings.Count(s, `"@sh_`))
+	}
+}
+
+// TestRenderJSONNamedSetThresholdBoundary pinnar SJÄLVA GRÄNSEN. Testet
+// ovan bygger sin lista utifrån namedSetThreshold och skulle därför passera
+// oavsett vad tröskeln sätts till — det här testet gör inte det.
+func TestRenderJSONNamedSetThresholdBoundary(t *testing.T) {
+	adapter := NewAdapter()
+
+	values := func(n int) []string {
+		out := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, fmt.Sprintf("172.%d.%d.1", 16+i/256, i%256))
+		}
+		return out
+	}
+	render := func(t *testing.T, n int) string {
+		t.Helper()
+		cfg := &config.Config{
+			Version: 1,
+			Interfaces: []config.Interface{
+				{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+				{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+			},
+			Objects: []config.Object{
+				{ID: "feed-grans", Name: "Gränsflöde", Type: config.ObjectTypeIPList, Values: values(n)},
+			},
+			Policies: []config.Policy{
+				{
+					ID: "pol-grans", Name: "Blockera gränsflöde", Enabled: true,
+					SourceObj: "feed-grans", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop,
+				},
+			},
+			Settings: config.Settings{APIPort: 8443},
+		}
+		data, err := adapter.RenderJSON(cfg)
+		if err != nil {
+			t.Fatalf("RenderJSON misslyckades: %v", err)
+		}
+		return string(data)
+	}
+
+	t.Run("ett element under tröskeln inlineas fortfarande", func(t *testing.T) {
+		if got := render(t, namedSetThreshold-1); strings.Contains(got, `"@sh_`) {
+			t.Errorf("en namngiven mängd skapades för %d element, tröskeln är %d", namedSetThreshold-1, namedSetThreshold)
+		}
+	})
+
+	t.Run("exakt på tröskeln blir namngiven", func(t *testing.T) {
+		if got := render(t, namedSetThreshold); !strings.Contains(got, `"@sh_`) {
+			t.Errorf("ingen namngiven mängd skapades för %d element, tröskeln är %d", namedSetThreshold, namedSetThreshold)
+		}
+	})
+}
+
+// TestRenderJSONEmptyObjectStillSkipsRule vaktar tom-lista-semantiken genom
+// ändringen: ett objekt som löser upp till en TOM lista får inte ge en
+// tandlös regel, eftersom en tom uttryckslista i nftables betyder "matcha
+// allt" — motsatsen till vad en tom hot-lista ska betyda.
+func TestRenderJSONEmptyObjectStillSkipsRule(t *testing.T) {
+	adapter := NewAdapter()
+
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.0.0.163/24"},
+		},
+		Objects: []config.Object{
+			{ID: "feed-tom", Name: "Tomt flöde", Type: config.ObjectTypeIPList, Values: nil},
+		},
+		Policies: []config.Policy{
+			{
+				ID: "pol-tom", Name: "Blockera tomt flöde", Enabled: true,
+				SourceObj: "feed-tom", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop,
+			},
+		},
+		Settings: config.Settings{APIPort: 8443},
+	}
+
+	data, err := adapter.RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON misslyckades: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "Blockera tomt flöde") {
+		t.Errorf("en regel genererades för ett objekt med tom lista — den hade matchat ALL trafik: %s", s)
+	}
+	if strings.Contains(s, `"set":`) && strings.Contains(s, "sh_feed") {
+		t.Errorf("en namngiven mängd deklarerades för ett tomt objekt: %s", s)
 	}
 }

@@ -4,6 +4,11 @@ DefaultDependencies=no
 After=systemd-modules-load.service
 Before=network-pre.target security-harbor-agent.service
 Wants=network-pre.target
+# Explicit ordning mot de faktiska nätverkshanterarna. Enbart
+# Before=network-pre.target räcker inte i praktiken: enheten måste också
+# vara schemalagd tillräckligt tidigt (se WantedBy nedan), annars är
+# ordningsrelationen korrekt men verkningslös.
+Before=systemd-networkd.service NetworkManager.service
 
 [Service]
 Type=oneshot
@@ -12,4 +17,10 @@ ExecStart=/sbin/nft -f /etc/security-harbor/security-harbor-failsafe.nft
 ExecReload=/sbin/nft -f /etc/security-harbor/security-harbor-failsafe.nft
 
 [Install]
-WantedBy=multi-user.target
+# network-pre.target — INTE multi-user.target. multi-user.target nås sent i
+# booten, så systemd hade ingen anledning att dra in enheten förrän
+# gränssnitten redan var uppe: mätt på en riktig boot 2026-08-27 startade
+# systemd-networkd vid 1.469 s medan failsafe laddades först vid 4.228 s,
+# alltså 2,75 s med uppe gränssnitt och noll nftables-regler. Samma mönster
+# som nftables.service och firewalld använder.
+WantedBy=network-pre.target
