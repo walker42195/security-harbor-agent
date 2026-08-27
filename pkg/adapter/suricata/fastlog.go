@@ -76,8 +76,14 @@ func ParseFastLogLine(line string) (*config.SecurityEvent, error) {
 	}, nil
 }
 
-// ReadFastLogAlerts läser de sista maxLines raderna ur fast.log bakifrån.
+// ReadFastLogAlerts läser de sista raderna ur fast.log bakifrån.
+// Den läser ett stort fönster (upp till 50 000 rader) för att inte
+// dränkas av eventuellt decoder- eller stream-brus, och returnerar de
+// senaste maxLines larmen.
 func ReadFastLogAlerts(fastLogPath string, maxLines int) ([]config.SecurityEvent, error) {
+	if maxLines <= 0 {
+		maxLines = 1000
+	}
 	f, err := os.Open(fastLogPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -87,7 +93,11 @@ func ReadFastLogAlerts(fastLogPath string, maxLines int) ([]config.SecurityEvent
 	}
 	defer f.Close()
 
-	lines, err := tailLines(f, maxLines)
+	scanLimit := 50000
+	if maxLines*10 > scanLimit {
+		scanLimit = maxLines * 10
+	}
+	lines, err := tailLines(f, scanLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -100,5 +110,10 @@ func ReadFastLogAlerts(fastLogPath string, maxLines int) ([]config.SecurityEvent
 		}
 		events = append(events, *ev)
 	}
+
+	if len(events) > maxLines {
+		events = events[len(events)-maxLines:]
+	}
+
 	return events, nil
 }
