@@ -103,20 +103,31 @@ func TestReadFastLogAlerts(t *testing.T) {
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "fast.log")
 	content := "08/27/2026-22:20:00.100000  [**] [1:1001:1] Alert 1 [**] [Priority: 1] {TCP} 10.0.0.1:10 -> 10.0.0.2:20\n" +
-		"08/27/2026-22:21:00.200000  [**] [1:1002:1] Alert 2 [**] [Priority: 2] {UDP} 10.0.0.3:30 -> 10.0.0.4:40\n"
+		"08/27/2026-22:21:00.200000  [**] [1:1002:1] Alert 2 [**] [Priority: 2] {UDP} 10.0.0.3:30 -> 10.0.0.4:40\n" +
+		"08/27/2026-22:22:00.300000  [**] [1:1003:1] Alert 3 Noise [**] [Priority: 3] {TCP} 10.0.0.5:50 -> 10.0.0.6:60\n"
 
 	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	events, err := ReadFastLogAlerts(logFile, 10)
+	// 1. All events
+	events, err := ReadFastLogAlerts(logFile, 10, 0)
 	if err != nil {
 		t.Fatalf("ReadFastLogAlerts error: %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("Got %d events, want 2", len(events))
+	if len(events) != 3 {
+		t.Fatalf("Got %d events, want 3", len(events))
 	}
-	if events[0].Signature != "Alert 1" || events[1].Signature != "Alert 2" {
-		t.Errorf("Unexpected signatures: %+v", events)
+
+	// 2. Only blocking/severity 1 & 2
+	blockingEvents, err := ReadFastLogAlerts(logFile, 10, 2)
+	if err != nil {
+		t.Fatalf("ReadFastLogAlerts error: %v", err)
+	}
+	if len(blockingEvents) != 2 {
+		t.Fatalf("Got %d blocking events, want 2", len(blockingEvents))
+	}
+	if blockingEvents[0].Signature != "Alert 2" || blockingEvents[1].Signature != "Alert 1" {
+		t.Errorf("Unexpected blocking events order: %+v", blockingEvents)
 	}
 }

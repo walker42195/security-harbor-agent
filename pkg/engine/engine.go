@@ -1620,14 +1620,28 @@ func (e *Engine) ReapplyNftablesOnly(ctx context.Context) error {
 // GetSecurityEvents returnerar de senaste Suricata-larmen (Fas 9).
 // source="live" (default) läser ur eve.json för realtidsövervakning.
 // source="history" / "fast" läser ur fast.log för långsiktig larmhistorik.
-func (e *Engine) GetSecurityEvents(source string, maxLines int) ([]config.SecurityEvent, error) {
+// maxSeverity > 0 filtrerar direkt vid inläsning (t.ex. 2 för Severity 1 & 2).
+func (e *Engine) GetSecurityEvents(source string, maxLines int, maxSeverity int) ([]config.SecurityEvent, error) {
 	if maxLines <= 0 {
 		maxLines = 1000
 	}
 	if source == "history" || source == "fast" {
-		return suricata.ReadFastLogAlerts(e.suricataAdapter.FastLogPath(), maxLines)
+		return suricata.ReadFastLogAlerts(e.suricataAdapter.FastLogPath(), maxLines, maxSeverity)
 	}
-	return suricata.ReadRecentAlerts(e.suricataAdapter.EvePath(), maxLines)
+	events, err := suricata.ReadRecentAlerts(e.suricataAdapter.EvePath(), maxLines)
+	if err != nil {
+		return nil, err
+	}
+	if maxSeverity > 0 {
+		filtered := make([]config.SecurityEvent, 0, len(events))
+		for _, ev := range events {
+			if ev.Severity <= maxSeverity {
+				filtered = append(filtered, ev)
+			}
+		}
+		return filtered, nil
+	}
+	return events, nil
 }
 
 // ProcessIDSAutoBlock läser larm sedan senast (idsLastAlertTS) och lägger
@@ -1643,7 +1657,7 @@ func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
 		return nil
 	}
 
-	events, err := e.GetSecurityEvents("live", 2000)
+	events, err := e.GetSecurityEvents("live", 2000, 0)
 	if err != nil {
 		return fmt.Errorf("ids: kunde inte läsa larm: %w", err)
 	}

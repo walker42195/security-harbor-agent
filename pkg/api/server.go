@@ -1160,7 +1160,15 @@ func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
 			limit = l
 		}
 	}
-	events, err := s.engine.GetSecurityEvents(source, limit)
+	maxSeverity := 0
+	if sev := r.URL.Query().Get("severity"); sev != "" {
+		if sev == "blocking" {
+			maxSeverity = 2
+		} else if l, err := strconv.Atoi(sev); err == nil && l > 0 {
+			maxSeverity = l
+		}
+	}
+	events, err := s.engine.GetSecurityEvents(source, limit, maxSeverity)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

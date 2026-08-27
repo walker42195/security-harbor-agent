@@ -356,7 +356,7 @@ func (e *Engine) GetDashboard(ctx context.Context, resolution string, sparklineP
 // idsAlertsPerDevice räknar Suricata-larm per käll-IP.
 func (e *Engine) idsAlertsPerDevice() map[string]int {
 	counts := map[string]int{}
-	events, err := e.GetSecurityEvents("live", 1000)
+	events, err := e.GetSecurityEvents("live", 1000, 0)
 	if err != nil {
 		return counts
 	}

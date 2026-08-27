@@ -76,11 +76,12 @@ func ParseFastLogLine(line string) (*config.SecurityEvent, error) {
 	}, nil
 }
 
-// ReadFastLogAlerts läser de sista raderna ur fast.log bakifrån.
-// Den läser ett stort fönster (upp till 50 000 rader) för att inte
-// dränkas av eventuellt decoder- eller stream-brus, och returnerar de
-// senaste maxLines larmen.
-func ReadFastLogAlerts(fastLogPath string, maxLines int) ([]config.SecurityEvent, error) {
+// ReadFastLogAlerts läser larm ur fast.log bakifrån.
+// Om maxSeverity > 0 (t.ex. 2 för Severity 1 och 2) filtreras lägre
+// allvarlighetsgrader (som L2/decoder/stream-brus på Severity 3) bort
+// under skanningen så att alla relevanta säkerhetslarm i hela loggens
+// historik samlas in.
+func ReadFastLogAlerts(fastLogPath string, maxLines int, maxSeverity int) ([]config.SecurityEvent, error) {
 	if maxLines <= 0 {
 		maxLines = 1000
 	}
@@ -93,26 +94,76 @@ func ReadFastLogAlerts(fastLogPath string, maxLines int) ([]config.SecurityEvent
 	}
 	defer f.Close()
 
-	scanLimit := 50000
-	if maxLines*10 > scanLimit {
-		scanLimit = maxLines * 10
-	}
-	lines, err := tailLines(f, scanLimit)
+	st, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
-
-	events := make([]config.SecurityEvent, 0, len(lines))
-	for _, l := range lines {
-		ev, err := ParseFastLogLine(l)
-		if err != nil {
-			continue
-		}
-		events = append(events, *ev)
+	size := st.Size()
+	if size == 0 {
+		return []config.SecurityEvent{}, nil
 	}
 
-	if len(events) > maxLines {
-		events = events[len(events)-maxLines:]
+	const chunkSize = 512 * 1024
+	var events []config.SecurityEvent
+	var leftover []byte
+
+	offset := size
+	for offset > 0 && len(events) < maxLines {
+		readSize := int64(chunkSize)
+		if offset < readSize {
+			readSize = offset
+		}
+		offset -= readSize
+
+		buf := make([]byte, readSize)
+		if _, err := f.ReadAt(buf, offset); err != nil {
+			break
+		}
+
+		if len(leftover) > 0 {
+			buf = append(buf, leftover...)
+			leftover = nil
+		}
+
+		for {
+			lastNL := strings.LastIndexByte(string(buf), '\n')
+			if lastNL == -1 {
+				if offset > 0 {
+					leftover = buf
+				} else {
+					line := strings.TrimSpace(string(buf))
+					if line != "" {
+						if ev, err := ParseFastLogLine(line); err == nil {
+							if maxSeverity <= 0 || ev.Severity <= maxSeverity {
+								events = append(events, *ev)
+							}
+						}
+					}
+				}
+				break
+			}
+
+			line := strings.TrimSpace(string(buf[lastNL+1:]))
+			buf = buf[:lastNL]
+
+			if line == "" {
+				continue
+			}
+
+			ev, err := ParseFastLogLine(line)
+			if err != nil {
+				continue
+			}
+
+			if maxSeverity > 0 && ev.Severity > maxSeverity {
+				continue
+			}
+
+			events = append(events, *ev)
+			if len(events) >= maxLines {
+				break
+			}
+		}
 	}
 
 	return events, nil
