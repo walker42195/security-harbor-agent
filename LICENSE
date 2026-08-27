@@ -1,0 +1,85 @@
+SECURITY HARBOR COMMUNITY & COMMERCIAL LICENSE (SH-CCL)
+Version 1.0, August 2026
+
+Copyright (c) 2026 Fredrik / Security Harbor. All rights reserved.
+
+================================================================================
+1. PREAMBLE & DEFINITIONS
+================================================================================
+This License Agreement ("Agreement") governs the use, copying, and installation
+of the Security Harbor software, including its source code, binaries,
+documentation, graphical user interfaces, and associated scripts
+(collectively, the "Software").
+
+"Commercial Use" means any use of the Software by a business, corporation,
+sole proprietorship, partnership, non-profit organization with paid staff,
+educational institution for institutional administration, or government entity,
+or any use in connection with commercial operations, consulting, or revenue-
+generating activities.
+
+"Personal Use" means non-commercial use by a private individual strictly on
+hardware owned or operated for personal, private home network, hobby, or
+personal learning purposes.
+
+================================================================================
+2. GRANT OF LICENSE FOR PERSONAL USE
+================================================================================
+Subject to the terms and conditions of this Agreement, the Copyright Holder
+hereby grants to private individuals a free of charge, non-exclusive, non-
+transferable license to install, execute, and use the Software solely for
+Personal Use.
+
+Voluntary financial contributions and donations from private users are
+warmly welcomed and accepted to support continued development, but are not
+mandatory for personal home use.
+
+================================================================================
+3. COMMERCIAL USE RESTRICTIONS & LICENSING
+================================================================================
+Commercial Use of the Software is STRICTLY PROHIBITED without a valid, paid
+commercial license purchased directly from the Copyright Holder.
+
+Any company, organization, contractor, MSP (Managed Service Provider), or
+commercial entity wishing to evaluate, test, deploy, run, or integrate the
+Software must obtain a written commercial license agreement prior to deployment.
+
+================================================================================
+4. PROHIBITION OF MODIFICATIONS & DERIVATIVE WORKS
+================================================================================
+You may NOT modify, alter, adapt, patch, decompile, disassemble, translate, or
+create derivative works based on the Software (in whole or in part) without the
+prior express written consent of the Copyright Holder.
+
+Bug fixes, enhancements, or proposed changes must be submitted to the official
+upstream repository for review and potential inclusion by the Copyright Holder.
+
+================================================================================
+5. REDISTRIBUTION & RESALE RESTRICTIONS
+================================================================================
+You may NOT:
+a) Sell, rent, lease, sublicense, distribute, or host the Software as a paid
+   managed/cloud service (SaaS / MSP) to third parties.
+b) Bundle or pre-install the Software onto hardware appliances or virtual
+   machine images intended for distribution or sale to others without an
+   explicit OEM/reseller agreement.
+c) Remove, obscure, or alter any copyright notices, trademarks, license texts,
+   or branding elements present in the Software.
+
+================================================================================
+6. TERMINATION
+================================================================================
+This license terminates automatically without notice if you fail to comply with
+any of the terms and conditions outlined in this Agreement. Upon termination,
+you must immediately cease all use of the Software and destroy all copies in
+your possession.
+
+================================================================================
+7. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY
+================================================================================
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+================================================================================
