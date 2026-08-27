@@ -174,6 +174,19 @@ func (s *Store) loadCandidateOrFallback(candidatePath string, running *config.Co
 	if ensureDefaultMgmtAPIPolicy(&cand) {
 		changed = true
 	}
+	if ensureDisabledRulesPreserved(&cand) {
+		changed = true
+	}
+	if running != nil && running.IDS != nil && cand.IDS != nil {
+		if len(cand.IDS.DisabledSignatures) == 0 && len(running.IDS.DisabledSignatures) > 0 {
+			cand.IDS.DisabledSignatures = append([]config.DisabledSignature(nil), running.IDS.DisabledSignatures...)
+			changed = true
+		}
+		if len(cand.IDS.DisabledCategories) == 0 && len(running.IDS.DisabledCategories) > 0 {
+			cand.IDS.DisabledCategories = append([]string(nil), running.IDS.DisabledCategories...)
+			changed = true
+		}
+	}
 	if changed {
 		if err := s.saveConfigLocked(candidatePath, &cand); err != nil {
 			log.Printf("[STORE] kunde inte spara migrerad kandidat %s: %v", candidatePath, err)

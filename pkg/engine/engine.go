@@ -680,7 +680,23 @@ func (e *Engine) UpdateCandidate(cfg *config.Config) error {
 	// listan var hämtad). Återställ dem från den nu kända serversidan.
 	preserveObjectSourceStatus(cfg, e.store.GetRunningConfig())
 	preserveDNSBlocklistStatus(cfg, e.store.GetRunningConfig())
+	preserveIDSRuleSelection(cfg, e.store.GetRunningConfig())
 	return e.store.SetCandidateConfig(cfg)
+}
+
+// preserveIDSRuleSelection kopierar DisabledSignatures och DisabledCategories
+// från running till incoming kandidatkonfiguration om incoming saknar dem eller
+// har färre regler än vad som sparats direkt via rules-API:t.
+func preserveIDSRuleSelection(incoming, prev *config.Config) {
+	if incoming == nil || prev == nil || incoming.IDS == nil || prev.IDS == nil {
+		return
+	}
+	if len(incoming.IDS.DisabledSignatures) == 0 && len(prev.IDS.DisabledSignatures) > 0 {
+		incoming.IDS.DisabledSignatures = append([]config.DisabledSignature(nil), prev.IDS.DisabledSignatures...)
+	}
+	if len(incoming.IDS.DisabledCategories) == 0 && len(prev.IDS.DisabledCategories) > 0 {
+		incoming.IDS.DisabledCategories = append([]string(nil), prev.IDS.DisabledCategories...)
+	}
 }
 
 // preserveObjectSourceStatus kopierar de agent-ägda status-fälten från
