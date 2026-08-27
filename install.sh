@@ -317,6 +317,41 @@ else
   echo "VARNING: modules-load.d-security-harbor.conf saknas i paketet." >&2
 fi
 
+# Loggtak: journalen och Suricatas loggar.
+#
+# Mätt 2026-08-27 på en skarp installation: journalen 2 GB med
+# SystemMaxUse=8G tillåtet, eve.json 1,47 GB, stats.log 393 MB, fast.log
+# 77 MB — efter fyra dygns drift, på en 30 GB-disk. Distributionens
+# logrotate-fil för Suricata saknar frekvensdirektiv och ärver global
+# "weekly" med rotate 14, alltså fjorton veckors loggar.
+if [ -f "$SCRIPT_DIR/systemd/journald-security-harbor.conf" ]; then
+  install -D -m 0644 "$SCRIPT_DIR/systemd/journald-security-harbor.conf" \
+    /etc/systemd/journald.conf.d/security-harbor.conf
+  echo "-> journal-tak: SystemMaxUse=512M (drop-in)"
+  # Verkställ direkt så att en redan uppsvälld journal krymper nu och inte
+  # först vid nästa omstart.
+  systemctl kill --kill-whom=main --signal=SIGUSR2 systemd-journald.service 2>/dev/null || true
+fi
+
+if [ -f "$SCRIPT_DIR/systemd/logrotate-suricata.conf" ] && [ -d /etc/logrotate.d ]; then
+  if [ -f /etc/logrotate.d/suricata ] && [ ! -f /etc/logrotate.d/suricata.security-harbor-orig ]; then
+    cp /etc/logrotate.d/suricata /etc/logrotate.d/suricata.security-harbor-orig
+  fi
+  install -m 0644 "$SCRIPT_DIR/systemd/logrotate-suricata.conf" /etc/logrotate.d/suricata
+  echo "-> Suricata-loggar: daily + size 100M, rotate 5 (original sparat som .security-harbor-orig)"
+  # Kontrollera att regeluppsättningen är giltig och kör en gång direkt, så
+  # att befintliga jättefiler beskärs vid installation i stället för i natt.
+  if command -v logrotate >/dev/null 2>&1; then
+    if logrotate -d /etc/logrotate.d/suricata >/dev/null 2>&1; then
+      logrotate /etc/logrotate.d/suricata 2>/dev/null || true
+    else
+      echo "VARNING: logrotate avvisade den nya Suricata-konfigurationen; återställer originalet." >&2
+      [ -f /etc/logrotate.d/suricata.security-harbor-orig ] && \
+        cp /etc/logrotate.d/suricata.security-harbor-orig /etc/logrotate.d/suricata
+    fi
+  fi
+fi
+
 # Suricata: minnestak skalat efter maskinens RAM.
 #
 # Memcaps i suricata.yaml lämnas medvetet orörda — uppmätt använder poolerna

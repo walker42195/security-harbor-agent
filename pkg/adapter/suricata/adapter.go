@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -187,16 +188,16 @@ func ReadRecentAlerts(evePath string, maxLines int) ([]config.SecurityEvent, err
 	}
 	defer f.Close()
 
-	lines := make([]string, 0, maxLines)
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-		if len(lines) > maxLines {
-			lines = lines[1:]
-		}
-	}
-	if err := scanner.Err(); err != nil {
+	// Läs från SLUTET av filen i stället för att skanna den från början.
+	// eve.json mättes till 1,47 GB på en skarp installation efter fyra dygn,
+	// och den här funktionen anropas var 5:e sekund av IDS-vyn och var 30:e
+	// sekund av ProcessIDSAutoBlock — en full genomläsning per anrop innebar
+	// att lådan läste gigabyte i sekunden helt i onödan.
+	//
+	// Semantiken är oförändrad: de sista maxLines RADERNA behålls och filtreras
+	// därefter på larm. Fönstret växer om det inte råkade rymma så många rader.
+	lines, err := tailLines(f, maxLines)
+	if err != nil {
 		return nil, err
 	}
 
@@ -225,3 +226,57 @@ func ReadRecentAlerts(evePath string, maxLines int) ([]config.SecurityEvent, err
 // auto-block-bevakningen, som behöver samma fil men sin egen
 // "sedan senast"-vattenmärkning).
 func (a *Adapter) EvePath() string { return a.evePath }
+
+// eveTailInitialWindow / eveTailMaxWindow styr hur långt bakåt i eve.json som
+// läses. 8 MiB rymmer i storleksordningen 15 000 rader, alltså gott och väl de
+// 1000-2000 rader anroparna ber om. Taket finns för att en fil som består av
+// EN enda ofattbart lång rad inte ska få oss att läsa in allt igen.
+const (
+	eveTailInitialWindow = 8 << 20
+	eveTailMaxWindow     = 256 << 20
+)
+
+// tailLines returnerar de sista maxLines raderna ur f, läst bakifrån.
+// Fönstret fyrdubblas tills det rymmer tillräckligt många rader, filens början
+// nås, eller taket slår i.
+func tailLines(f *os.File, maxLines int) ([]string, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := st.Size()
+
+	for window := int64(eveTailInitialWindow); ; window *= 4 {
+		start := size - window
+		atStart := start <= 0
+		if atStart {
+			start = 0
+		}
+		if _, err := f.Seek(start, io.SeekStart); err != nil {
+			return nil, err
+		}
+
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		// Hoppade vi in mitt i filen är första raden med all sannolikhet
+		// avhuggen — kasta den.
+		if !atStart && scanner.Scan() {
+			_ = scanner.Text()
+		}
+
+		lines := make([]string, 0, maxLines)
+		for scanner.Scan() {
+			lines = append(lines, scanner.Text())
+			if len(lines) > maxLines {
+				lines = lines[1:]
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
+
+		if len(lines) >= maxLines || atStart || window >= eveTailMaxWindow {
+			return lines, nil
+		}
+	}
+}
