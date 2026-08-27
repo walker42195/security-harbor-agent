@@ -30,6 +30,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/engine"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
+	"github.com/walker42195/security-harbor-agent/pkg/traffic"
 	"github.com/walker42195/security-harbor-agent/pkg/updater"
 )
 
@@ -86,6 +87,7 @@ func (s *Server) Start() error {
 	// Dashboard: trafik per enhet.
 	mux.HandleFunc("/api/v1/dashboard/devices", s.authMiddleware(s.handleDashboardDevices))
 	mux.HandleFunc("/api/v1/dashboard/device-history", s.authMiddleware(s.handleDeviceHistory))
+	mux.HandleFunc("/api/v1/dashboard/traffic-types", s.authMiddleware(s.handleTrafficTypes))
 	mux.HandleFunc("/api/v1/ids/rules", s.authMiddleware(s.handleIDSRules))
 	mux.HandleFunc("/api/v1/ids/rules/status", s.authMiddleware(s.handleIDSRuleStatus))
 	mux.HandleFunc("/api/v1/vpn/wireguard/server-info", s.authMiddleware(s.handleWireGuardServerInfo))
@@ -1214,6 +1216,53 @@ func (s *Server) handleDeviceHistory(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.engine.DeviceHistory(res, ip, points))
+}
+
+// trafficTypesResponse är svaret från GET /api/v1/dashboard/traffic-types.
+type trafficTypesResponse struct {
+	Categories []traffic.CategoryTotal            `json:"categories"`
+	PerDevice  map[string][]traffic.CategoryTotal `json:"per_device"`
+	TopDomains []traffic.DomainTotal              `json:"top_domains"`
+	Resolution string                             `json:"resolution"`
+	// IDSOnInside är falskt när Suricata lyssnar på WAN-kortet. Då finns
+	// ingen klassificerbar trafik alls, eftersom allt syns efter NAT med
+	// brandväggens egen adress som källa — GUI:t visar en förklaring i
+	// stället för en tom vy.
+	IDSOnInside bool `json:"ids_on_inside"`
+}
+
+func (s *Server) handleTrafficTypes(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	res := q.Get("res")
+	switch res {
+	case "", "1h", "1d":
+	default:
+		http.Error(w, "ogiltig upplösning (1h eller 1d)", http.StatusBadRequest)
+		return
+	}
+	ip := q.Get("ip")
+	if ip != "" && net.ParseIP(ip) == nil {
+		http.Error(w, "ogiltig ip", http.StatusBadRequest)
+		return
+	}
+	limit := 20
+	if v := q.Get("domains"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 100 {
+			http.Error(w, "domains måste vara 0-100", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(trafficTypesResponse{
+		Categories:  s.engine.TrafficCategories(res, ip),
+		PerDevice:   s.engine.TrafficCategoriesPerDevice(res),
+		TopDomains:  s.engine.TopDomains(ip, limit),
+		Resolution:  res,
+		IDSOnInside: s.engine.IDSOnInside(),
+	})
 }
 
 // idsRulesResponse är svaret från GET /api/v1/ids/rules: alla kategorier med

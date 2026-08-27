@@ -2,10 +2,13 @@ package engine
 
 import (
 	"context"
+	"net"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/nftables"
+	"github.com/walker42195/security-harbor-agent/pkg/config"
 	"github.com/walker42195/security-harbor-agent/pkg/traffic"
 )
 
@@ -27,6 +30,10 @@ const (
 	// där). Används bara för att slå upp värdnamn — saknas filen visas
 	// enheterna med IP och tillverkare i stället.
 	dhcpLeasePath = "/var/lib/kea/kea-leases4.csv"
+
+	// evePath är Suricatas händelselogg. Den läses INKREMENTELLT: bara det
+	// som tillkommit sedan förra avläsningen, aldrig hela filen.
+	evePath = "/var/log/suricata/eve.json"
 )
 
 // StartTrafficCollection kör avläsning, sparning och städning tills ctx avbryts.
@@ -44,12 +51,15 @@ func (e *Engine) StartTrafficCollection(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			_ = e.trafficStore.Save()
+			_ = e.catStore.Save()
 			_ = e.inventory.SaveFirstSeen()
 			return
 		case <-sample.C:
 			e.sampleTraffic(ctx)
+			e.classifyTraffic()
 		case <-save.C:
 			_ = e.trafficStore.Save()
+			_ = e.catStore.Save()
 			_ = e.inventory.SaveFirstSeen()
 		case <-prune.C:
 			e.trafficStore.Prune(time.Now(), trafficRetention)
@@ -84,6 +94,97 @@ func (e *Engine) sampleTraffic(ctx context.Context) {
 		cur[ip] = traffic.Counters{RxBytes: c.RxBytes, TxBytes: c.TxBytes}
 	}
 	e.trafficColl.Sample(time.Now(), cur)
+}
+
+// classifyTraffic läser nya rader ur eve.json, knyter SNI/domännamn till
+// flödenas byte och bokför dem per kategori.
+//
+// Kräver att Suricata lyssnar på INSIDAN. Sniffar den WAN-kortet ser den bara
+// trafik efter NAT, där varje flöde har brandväggens WAN-adress som källa —
+// då går ingenting att knyta till en enhet, och isLocal filtrerar bort allt.
+func (e *Engine) classifyTraffic() {
+	if e.eveReader == nil {
+		cfg := e.store.GetRunningConfig()
+		if cfg == nil {
+			return
+		}
+		nets := localNets(cfg)
+		if len(nets) == 0 {
+			return
+		}
+		e.eveReader = traffic.NewEveReader(evePath, func(ip string) bool {
+			addr := net.ParseIP(ip)
+			if addr == nil {
+				return false
+			}
+			for _, n := range nets {
+				if n.Contains(addr) {
+					return true
+				}
+			}
+			return false
+		})
+	}
+
+	hits, err := e.eveReader.Read()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, h := range hits {
+		e.catStore.Add(now, h)
+	}
+}
+
+// localNets är de interna näten, alltså allt utom WAN.
+func localNets(cfg *config.Config) []*net.IPNet {
+	var out []*net.IPNet
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled || strings.EqualFold(iface.Zone, "WAN") || iface.IPv4 == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(iface.IPv4); err == nil && n != nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// TrafficCategories returnerar kategorifördelningen, valfritt för EN enhet.
+func (e *Engine) TrafficCategories(resolution, ip string) []traffic.CategoryTotal {
+	if resolution == "" {
+		resolution = "1h"
+	}
+	return e.catStore.Totals(resolution, ip)
+}
+
+// TrafficCategoriesPerDevice returnerar fördelningen för alla enheter.
+func (e *Engine) TrafficCategoriesPerDevice(resolution string) map[string][]traffic.CategoryTotal {
+	if resolution == "" {
+		resolution = "1h"
+	}
+	return e.catStore.PerDevice(resolution)
+}
+
+// TopDomains returnerar de mest trafikerade domänerna.
+func (e *Engine) TopDomains(ip string, limit int) []traffic.DomainTotal {
+	return e.catStore.TopDomains(ip, limit)
+}
+
+// IDSOnInside svarar på om Suricata lyssnar på insidan. Är den på WAN kan
+// ingen trafik knytas till en enhet, och GUI:t ska säga det rakt ut i stället
+// för att visa en tom vy.
+func (e *Engine) IDSOnInside() bool {
+	cfg := e.store.GetRunningConfig()
+	if cfg == nil || cfg.IDS == nil || cfg.IDS.Interface == "" {
+		return false
+	}
+	for _, iface := range cfg.Interfaces {
+		if iface.Device == cfg.IDS.Interface {
+			return !strings.EqualFold(iface.Zone, "WAN")
+		}
+	}
+	return false
 }
 
 // DeviceStat är en rad i dashboardens enhetstabell.

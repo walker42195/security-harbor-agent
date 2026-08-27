@@ -58,6 +58,8 @@ type Engine struct {
 	trafficStore *traffic.Store
 	trafficColl  *traffic.Collector
 	inventory    *traffic.Inventory
+	catStore     *traffic.CategoryStore
+	eveReader    *traffic.EveReader
 
 	// idsLastAlertTS håller den senaste larm-tidsstämpeln vi redan hanterat
 	// för auto-block (Fas 9), så samma larm inte blockeras om och om igen.
@@ -104,11 +106,14 @@ func NewEngine(st *store.Store, nftAdapter *nftables.Adapter, dhcpAdapter *dhcp.
 	ts.Load()
 	inv := traffic.NewInventory(filepath.Join(st.BaseDir(), "device_first_seen.json"))
 	inv.LoadFirstSeen()
+	cs := traffic.NewCategoryStore(st.BaseDir())
+	cs.Load()
 
 	return &Engine{
 		trafficStore:    ts,
 		trafficColl:     traffic.NewCollector(ts),
 		inventory:       inv,
+		catStore:        cs,
 		store:           st,
 		nftAdapter:      nftAdapter,
 		dhcpAdapter:     dhcpAdapter,
