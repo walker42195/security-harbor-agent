@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/dhcp"
@@ -57,6 +58,12 @@ type Engine struct {
 	// dynamiska mängder; agenten läser bara av och lagrar deltan.
 	trafficStore *traffic.Store
 	trafficColl  *traffic.Collector
+	// trafficLiveUntil är unix-nanotiden då den snabba avläsningstakten
+	// upphör. Atomär, inte skyddad av e.mu: den skrivs från varje
+	// dashboard-anrop (HTTP-handlern) och läses av insamlingsloopen, och att
+	// ta den stora engine-mutexen i båda vore att låta en realtidsvy vänta på
+	// en pågående konfigurationsapplicering.
+	trafficLiveUntil atomic.Int64
 	inventory    *traffic.Inventory
 	catStore     *traffic.CategoryStore
 	eveReader    *traffic.EveReader

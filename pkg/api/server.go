@@ -1183,7 +1183,14 @@ func (s *Server) handleSecurityEvents(w http.ResponseWriter, r *http.Request) {
 //
 //	res    "1m" | "5m" | "1h" | "1d"  (fönster/upplösning, default "5m")
 //	spark  antal minutpunkter för minigrafen i varje rad (0 = ingen)
+//	live   "1" = klienten visar en realtidsvy och vill att agenten läser av
+//	       trafikräknarna i snabb takt en kort stund framåt (se
+//	       Engine.RequestLiveTraffic). Utan den kan bps-siffrorna aldrig
+//	       ändras oftare än var 10:e sekund, hur ofta klienten än pollar.
 func (s *Server) handleDashboardDevices(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("live") == "1" {
+		s.engine.RequestLiveTraffic()
+	}
 	res := r.URL.Query().Get("res")
 	switch res {
 	case "", "1m", "5m", "1h", "1d":

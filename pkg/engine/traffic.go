@@ -17,6 +17,18 @@ const (
 	// minutupplösningen blir. 10 s ger läsbar realtid utan att avläsningen
 	// (en nft-listning av två mängder) blir en märkbar last.
 	trafficSampleInterval = 10 * time.Second
+	// trafficSampleIntervalLive är takten medan en klient tittar på en
+	// realtidsvy (Tactical HUD). Bandbreddssiffrorna kan aldrig ändras
+	// snabbare än avläsningen sker — en klient som pollar var 2:e sekund fick
+	// därför ändå samma värde fem gånger i rad. Den här takten begärs
+	// EXPLICIT av klienten (?live=1) och gäller bara så länge den fortsätter
+	// begära den, så vilolasten på lådan är oförändrad.
+	trafficSampleIntervalLive = 2 * time.Second
+	// trafficLiveWindow är hur länge en live-begäran håller den snabba takten
+	// vid liv. Den måste vara komfortabelt längre än klientens pollintervall
+	// så att takten inte hackar mellan snabb och långsam mellan två anrop,
+	// men kort nog att den faller tillbaka nästan direkt när vyn stängs.
+	trafficLiveWindow = 15 * time.Second
 	// trafficSaveInterval: historiken sparas sällan, eftersom Save är en
 	// no-op när inget ändrats och en full omskrivning när något har det.
 	trafficSaveInterval = 2 * time.Minute
@@ -40,12 +52,18 @@ const (
 func (e *Engine) StartTrafficCollection(ctx context.Context) {
 	e.ensureAccounting(ctx)
 
-	sample := time.NewTicker(trafficSampleInterval)
+	// Tickern går alltid i den SNABBA takten; hur ofta den faktiskt leder till
+	// en avläsning avgörs av trafficSampleDue nedan. Att i stället byta ut
+	// tickern när live-läget slås på/av vore både mer kod och en kapplöpning
+	// mot pågående tick.
+	sample := time.NewTicker(trafficSampleIntervalLive)
 	save := time.NewTicker(trafficSaveInterval)
 	prune := time.NewTicker(24 * time.Hour)
 	defer sample.Stop()
 	defer save.Stop()
 	defer prune.Stop()
+
+	var lastSample time.Time
 
 	for {
 		select {
@@ -54,7 +72,11 @@ func (e *Engine) StartTrafficCollection(ctx context.Context) {
 			_ = e.catStore.Save()
 			_ = e.inventory.SaveFirstSeen()
 			return
-		case <-sample.C:
+		case now := <-sample.C:
+			if !e.trafficSampleDue(now, lastSample) {
+				continue
+			}
+			lastSample = now
 			e.sampleTraffic(ctx)
 			e.classifyTraffic()
 		case <-save.C:
@@ -65,6 +87,29 @@ func (e *Engine) StartTrafficCollection(ctx context.Context) {
 			e.trafficStore.Prune(time.Now(), trafficRetention)
 		}
 	}
+}
+
+// RequestLiveTraffic ber om den snabba avläsningstakten
+// (trafficSampleIntervalLive) under trafficLiveWindow framåt. Anropas av
+// dashboard-endpointen när klienten skickar ?live=1, dvs. när någon faktiskt
+// tittar på en realtidsvy. Slutar klienten fråga faller takten tillbaka till
+// trafficSampleInterval av sig själv — det finns medvetet inget "stäng av
+// live"-anrop att glömma bort eller tappa när en flik stängs.
+func (e *Engine) RequestLiveTraffic() {
+	e.trafficLiveUntil.Store(time.Now().Add(trafficLiveWindow).UnixNano())
+}
+
+// trafficSampleDue avgör om det är dags för en avläsning, givet om någon
+// begärt live-takt nyligen.
+func (e *Engine) trafficSampleDue(now, last time.Time) bool {
+	interval := trafficSampleInterval
+	if until := e.trafficLiveUntil.Load(); until > 0 && now.UnixNano() < until {
+		interval = trafficSampleIntervalLive
+	}
+	// Halva tickperioden i marginal: tickern och intervallet är inte i fas
+	// (10 s mot 2 s-tick driver isär med schemaläggningsjitter), och utan
+	// marginalen hoppar var femte avläsning över en hel tick och blir 12 s.
+	return now.Sub(last) >= interval-trafficSampleIntervalLive/2
 }
 
 // ensureAccounting (åter)skapar mättabellen. Måste köras efter varje
