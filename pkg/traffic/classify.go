@@ -42,6 +42,13 @@ var domainRules = map[string]Category{
 	"primevideo.com": CatStreaming, "aiv-cdn.net": CatStreaming, "twitch.tv": CatStreaming,
 	"spotify.com": CatStreaming, "scdn.co": CatStreaming, "sc-cdn.net": CatStreaming,
 	"plex.tv": CatStreaming, "sr.se": CatStreaming, "ttvnw.net": CatStreaming,
+	// CDN- och API-domäner som bär SJÄLVA videoströmmen. Utan dem hamnade all
+	// faktisk uppspelning i CatWeb medan bara tjänstens telemetri (som ligger
+	// på huvuddomänen) blev CatStreaming — uppmätt 2026-08-29 på en skarp
+	// låda: 15,86 GB Prime Video bokfört som "web", 0,01 GB som "streaming".
+	"amazonvideo.com": CatStreaming, "pv-cdn.net": CatStreaming,
+	"skyshowtime.com": CatStreaming, "incomet.io": CatStreaming,
+	"dr.dk": CatStreaming, "nrk.no": CatStreaming,
 
 	// Sociala nätverk
 	"facebook.com": CatSocial, "fbcdn.net": CatSocial, "instagram.com": CatSocial,
@@ -90,6 +97,23 @@ var domainRules = map[string]Category{
 	"ewelink.cc": CatSmartHome, "home-assistant.io": CatSmartHome,
 }
 
+// hostPatterns fångar tjänster som ligger på ett DELAT CDN, där suffixet inte
+// säger något men värdnamnet gör det. Prime Videos segment levereras t.ex. från
+// "a203vod-dash-pv-ta-amazon.akamaized.net" — och akamaized.net i sig får ALDRIG
+// klassas som streaming, det är ett generellt CDN som bär allt från bilder till
+// programvara. Mönstren måste därför vara specifika nog att inte råka matcha
+// vanlig webbtrafik.
+//
+// Körs bara när suffixuppslagningen missat, precis före CatWeb-fallbacken.
+var hostPatterns = []struct {
+	substr string
+	cat    Category
+}{
+	{"vod-dash", CatStreaming},   // ...vod-dash-pv-ta-amazon..., vod-dash.main.amazon...
+	{"avoddash", CatStreaming},   // avoddashs3ww-a.akamaihd.net
+	{"-pv-ta-amazon", CatStreaming},
+}
+
 // Classify avgör kategori för ett domännamn.
 //
 // Okända domäner blir CatWeb, inte CatOther: en uppslagen domän ÄR
@@ -114,6 +138,14 @@ func Classify(domain string) Category {
 		d = d[i+1:]
 		if !strings.Contains(d, ".") {
 			break // kvar är bara toppdomänen
+		}
+	}
+	// Suffixet sa inget — pröva värdnamnsmönstren mot HELA namnet (d är
+	// nedtuggat av loopen ovan).
+	full := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	for _, p := range hostPatterns {
+		if strings.Contains(full, p.substr) {
+			return p.cat
 		}
 	}
 	return CatWeb

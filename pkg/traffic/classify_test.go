@@ -50,3 +50,43 @@ func TestClassifyIsCaseAndDotInsensitive(t *testing.T) {
 		}
 	}
 }
+
+// Domänerna nedan är de som faktiskt bar trafiken från en Prime Video-strömmande
+// enhet på en skarp installation 2026-08-29 (10.0.0.124, 15,1 GB på ett dygn).
+// Innan hostPatterns fanns hamnade 15,86 GB av dem i CatWeb och bara 0,01 GB
+// (Netflix telemetri på huvuddomänen) i CatStreaming.
+func TestClassifyStreamingCDNs(t *testing.T) {
+	streaming := []string{
+		"a203vod-dash-pv-ta-amazon.akamaized.net",
+		"a57vod-dash-pv-ta-amazon.akamaized.net",
+		"avoddashs3ww-a.akamaihd.net",
+		"a99avoddashs3ww-a.akamaihd.net",
+		"abjwbecaaaaaaaamfdyvcdwqyxvt5.vod-dash.main.amazon.pv-cdn.net",
+		"abjwbecaaaaaaaamaqemnxccjklfj.ta.mid-pop-vod-dash.main.amazon.pv-cdn.net",
+		"piv-ignx-a2cvvmldxggrii-0.api.amazonvideo.com",
+		"ab8mt4dd97et.api.amazonvideo.com",
+		"pixel.disco.skyshowtime.com",
+		"img.tv4.incomet.io",
+		"nrdp26.logs.netflix.com",
+	}
+	for _, d := range streaming {
+		if got := Classify(d); got != CatStreaming {
+			t.Errorf("Classify(%q) = %q, ville ha %q", d, got, CatStreaming)
+		}
+	}
+
+	// Delade CDN:er får ALDRIG blanketklassas som streaming — de bär allt.
+	// Bara värdnamn med ett streaming-specifikt mönster ska fångas.
+	web := []string{
+		"images-eu.ssl-images-amazon.com",
+		"www.gstatic.com",
+		"cdn.example.akamaized.net",
+		"static.akamaihd.net",
+		"a1234.g.akamai.net",
+	}
+	for _, d := range web {
+		if got := Classify(d); got == CatStreaming {
+			t.Errorf("Classify(%q) = %q, skulle INTE vara streaming", d, got)
+		}
+	}
+}
