@@ -42,6 +42,20 @@ MemoryDenyWriteExecute=true
 # man IDS är man blind, men förlorar man agenten är brandväggen inte längre
 # administrerbar på distans. Se systemd/suricata-memory.conf.tmpl.
 OOMScoreAdjust=-500
+# Minnestak för agenten. OOMScoreAdjust=-500 ovan skyddar fjärradministrationen
+# — men skyddet gjorde också att en minnesbugg i AGENTEN aldrig drabbade
+# agenten: kärnan sköt i stället ner Suricata (OOMScoreAdjust=500 i dess
+# drop-in) om och om igen. Vid haveriet 2026-08-29 växte agenten till 3,5 GB på
+# en enda loggsökning, Suricata hamnade i omstartsloop (12 försök) och load
+# nådde 19 på 2 vCPU innan kärnan till slut tog agenten ändå.
+#
+# GOMEMLIMIT är den viktiga raden: den ger Gos GC ett mjukt tak att arbeta mot
+# så heapen inte växer fritt. MemoryMax är backstop — slår det till dödas och
+# startas BARA agenten om (Restart=always ovan), i stället för att hela lådan
+# får slut på minne och IDS:en blir offret.
+Environment=GOMEMLIMIT=768MiB
+MemoryAccounting=yes
+MemoryMax=1024M
 RestrictRealtime=true
 RestrictNamespaces=true
 

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -2362,6 +2363,7 @@ const firewallLogMaxEntries = 3000
 // bara omkring 45 sekunder — man kunde inte titta på något som hänt för fem
 // minuter sedan.
 func parseFirewallLogWindow(window string) (entries []config.FirewallLogEntry, truncated bool) {
+	entries = make([]config.FirewallLogEntry, 0, firewallLogMaxEntries)
 	args := []string{"-k", "--no-pager", "-o", "short-iso", "-g", "SH-(ACCEPT|DENY)-"}
 	if window != "" && firewallLogWindowRe.MatchString(window) {
 		args = append(args, "--since", "-"+window)
@@ -2369,12 +2371,39 @@ func parseFirewallLogWindow(window string) (entries []config.FirewallLogEntry, t
 		args = append(args, "-n", "500")
 	}
 
-	out, err := exec.Command("journalctl", args...).CombinedOutput()
-	if err != nil && len(out) == 0 {
+	// Journalen läses STRÖMMANDE, inte via CombinedOutput. Ett långt fönster
+	// (--since -2d) på en brandvägg som loggar varje ACCEPT/DENY kan ge
+	// gigabyte, och CombinedOutput höll hela utdatan i minnet — varpå
+	// string(out) tog en ANDRA full kopia. Toppminnet blev 2x journalutdatan
+	// i en process som dessutom är undantagen OOM-killaren
+	// (OOMScoreAdjust=-500), så kärnan sköt ner Suricata i stället och den
+	// hamnade i omstartsloop. Uppmätt 2026-08-29: 3,5 GB anon-rss / 8,7 GB
+	// virtuellt på en enda loggsökning.
+	//
+	// Taket nedan (firewallLogMaxEntries) fanns redan, men applicerades
+	// FÖRST EFTER att allt låg i RAM — det begränsade svaret, inte
+	// inläsningen. Nu hålls bara de senaste posterna kvar medan vi läser.
+	cmd := exec.Command("journalctl", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
 		return []config.FirewallLogEntry{}, false
 	}
+	if err := cmd.Start(); err != nil {
+		return []config.FirewallLogEntry{}, false
+	}
+	// Processen måste alltid skördas, och stdout dräneras, annars blir
+	// journalctl kvar som zombie om vi lämnar loopen tidigt.
+	defer func() {
+		_, _ = io.Copy(io.Discard, stdout)
+		_ = cmd.Wait()
+	}()
 
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	scanner := bufio.NewScanner(stdout)
+	// nftables-loggrader är långa (MAC-fältet ensamt är 14 oktetter), men
+	// aldrig i närheten av 1 MB. Default-bufferten på 64 kB räcker; taket
+	// finns bara så att en oväntat lång rad avbryter läsningen i stället för
+	// att växa fritt.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		header := firewallLogHeaderRe.FindStringSubmatch(line)
@@ -2425,16 +2454,20 @@ func parseFirewallLogWindow(window string) (entries []config.FirewallLogEntry, t
 		}
 
 		if entry.SrcIP != "" {
-			entries = append(entries, entry)
+			// Taket appliceras LÖPANDE, på de nyaste posterna: journalctl
+			// skriver kronologiskt, så det är slutet som är intressant. Att
+			// i stället samla allt och klippa efteråt är precis det som lät
+			// ett långt fönster växa obegränsat i minnet.
+			if len(entries) == firewallLogMaxEntries {
+				copy(entries, entries[1:])
+				entries[len(entries)-1] = entry
+				truncated = true
+			} else {
+				entries = append(entries, entry)
+			}
 		}
 	}
 
-	// Taket appliceras på de NYASTE posterna: journalctl skriver i
-	// kronologisk ordning, så det är slutet av listan som är intressant.
-	if len(entries) > firewallLogMaxEntries {
-		entries = entries[len(entries)-firewallLogMaxEntries:]
-		truncated = true
-	}
 	return entries, truncated
 }
 
