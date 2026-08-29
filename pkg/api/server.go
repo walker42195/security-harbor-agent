@@ -365,6 +365,17 @@ func (s *Server) authMiddlewareAdmin(next http.HandlerFunc) http.HandlerFunc {
 	})
 }
 
+const (
+	// defaultSessionTTL är ett arbetspass. Utan "Kom ihåg inloggning" ska en
+	// glömd session inte överleva särskilt länge på en delad dator.
+	defaultSessionTTL = 24 * time.Hour
+	// rememberedSessionTTL används när klienten kryssat i "Kom ihåg
+	// inloggning". Det är fortfarande en session med utgång och den går att
+	// återkalla serversidan — till skillnad från att spara lösenordet på
+	// klienten, som varken går att återkalla eller ta tillbaka.
+	rememberedSessionTTL = 30 * 24 * time.Hour
+)
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -375,6 +386,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var creds struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		// Remember = klientens "Kom ihåg inloggning". Ger en LÅNG session i
+		// stället för dygnssessionen. Lösenordet lagras aldrig någonstans —
+		// det enda som sparas hos klienten är den serversignerade token, och
+		// den kan återkallas här (sessionerna är spårade per användare).
+		Remember bool `json:"remember"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
@@ -392,7 +408,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	user, err := s.engine.VerifyUserCredentials(creds.Username, creds.Password)
 	if err == nil {
-		token, tokenErr := s.auth.CreateSession(user.Username, string(user.Role), 24*time.Hour)
+		sessionTTL := defaultSessionTTL
+		if creds.Remember {
+			sessionTTL = rememberedSessionTTL
+		}
+		token, tokenErr := s.auth.CreateSession(user.Username, string(user.Role), sessionTTL)
 		if tokenErr != nil {
 			log.Printf("[LOGIN] MISSLYCKADES (kunde inte skapa session): käll-IP=%s användarnamn=%q fel=%v", ip, creds.Username, tokenErr)
 			http.Error(w, tokenErr.Error(), http.StatusInternalServerError)
