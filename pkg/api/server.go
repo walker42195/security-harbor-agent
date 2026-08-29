@@ -2353,6 +2353,12 @@ var firewallLogWindowRe = regexp.MustCompile(`^[0-9]{1,4}[mhd]$`)
 // NYASTE posterna, och svaret säger att det klipptes.
 const firewallLogMaxEntries = 3000
 
+// firewallLogScanLimit är hur många journalrader vi ber journald om. Taket
+// ovan gäller POSTER vi behåller; marginalen däremellan finns för att kunna
+// avgöra om det fanns mer att visa (truncated) och för rader som inte blir
+// någon post (t.ex. saknad SRC=).
+const firewallLogScanLimit = firewallLogMaxEntries + 500
+
 // ParseFirewallLogWindow läser brandväggsloggen för ett tidsfönster.
 //
 // window är t.ex. "15m", "6h", "2d". Tomt värde ger de senaste 500 raderna,
@@ -2363,10 +2369,19 @@ const firewallLogMaxEntries = 3000
 // bara omkring 45 sekunder — man kunde inte titta på något som hänt för fem
 // minuter sedan.
 func parseFirewallLogWindow(window string) (entries []config.FirewallLogEntry, truncated bool) {
-	entries = make([]config.FirewallLogEntry, 0, firewallLogMaxEntries)
 	args := []string{"-k", "--no-pager", "-o", "short-iso", "-g", "SH-(ACCEPT|DENY)-"}
 	if window != "" && firewallLogWindowRe.MatchString(window) {
-		args = append(args, "--since", "-"+window)
+		// -n TILLSAMMANS med --since är det som gör långa fönster billiga:
+		// journald söker bakifrån och slutar när den har så många träffar,
+		// i stället för att vi läser hela perioden och kastar nästan allt.
+		// Utan den här raden skannade ett 7-dagarsfönster hela journalen vid
+		// VARJE poll från loggvyn — uppmätt 2026-08-29: fem samtidiga
+		// journalctl-processer som aldrig blev klara, agenten på 134 % CPU och
+		// en loggvy som bara visade tomt eftersom inget svar hann fram.
+		//
+		// Marginalen mot taket finns för att kunna sätta `truncated`: får vi
+		// fler poster än taket vet vi att det fanns mer att visa.
+		args = append(args, "--since", "-"+window, "-n", strconv.Itoa(firewallLogScanLimit))
 	} else {
 		args = append(args, "-n", "500")
 	}
@@ -2404,6 +2419,11 @@ func parseFirewallLogWindow(window string) (entries []config.FirewallLogEntry, t
 	// finns bara så att en oväntat lång rad avbryter läsningen i stället för
 	// att växa fritt.
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	ring := make([]config.FirewallLogEntry, 0, firewallLogMaxEntries)
+	head := 0
+	full := false
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		header := firewallLogHeaderRe.FindStringSubmatch(line)
@@ -2454,20 +2474,33 @@ func parseFirewallLogWindow(window string) (entries []config.FirewallLogEntry, t
 		}
 
 		if entry.SrcIP != "" {
-			// Taket appliceras LÖPANDE, på de nyaste posterna: journalctl
-			// skriver kronologiskt, så det är slutet som är intressant. Att
-			// i stället samla allt och klippa efteråt är precis det som lät
-			// ett långt fönster växa obegränsat i minnet.
-			if len(entries) == firewallLogMaxEntries {
-				copy(entries, entries[1:])
-				entries[len(entries)-1] = entry
-				truncated = true
+			// Äkta cirkulär buffert: skrivpositionen flyttas, inte innehållet.
+			// Första försöket sköt i stället hela bufferten ett steg med
+			// copy(entries, entries[1:]) för varje post efter de första 3000 —
+			// en memmove på 2 999 structar PER RAD. På ett kort fönster märks
+			// det inte (färre poster än taket), men på ett långt blev det
+			// O(n*tak) och pinnade en kärna i minuter.
+			if !full {
+				ring = append(ring, entry)
+				if len(ring) == firewallLogMaxEntries {
+					full = true
+					head = 0
+				}
 			} else {
-				entries = append(entries, entry)
+				ring[head] = entry
+				head = (head + 1) % firewallLogMaxEntries
+				truncated = true
 			}
 		}
 	}
 
+	// Packa upp ringen i kronologisk ordning: äldsta posten ligger på head.
+	if !full {
+		return ring, truncated
+	}
+	entries = make([]config.FirewallLogEntry, 0, firewallLogMaxEntries)
+	entries = append(entries, ring[head:]...)
+	entries = append(entries, ring[:head]...)
 	return entries, truncated
 }
 
