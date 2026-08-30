@@ -2,6 +2,7 @@ package nftables
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/walker42195/security-harbor-agent/pkg/config"
 )
@@ -28,6 +29,18 @@ type ImplicitRule struct {
 	Reason string `json:"reason"`
 }
 
+// sshLifelineFrom beskriver var livlineregeln gäller, i samma ordalag som
+// resten av listan. I gateway-läge är den "alla utom WAN"; i host-läge finns
+// ingen WAN-zon och den gäller överallt.
+func sshLifelineFrom(cfg *config.Config) string {
+	for _, iface := range cfg.Interfaces {
+		if iface.Enabled && strings.EqualFold(iface.Zone, "WAN") {
+			return "Alla utom WAN"
+		}
+	}
+	return "ANY"
+}
+
 // DescribeImplicitRules beskriver de implicita INPUT-reglerna för en given
 // konfiguration.
 //
@@ -50,6 +63,22 @@ func DescribeImplicitRules(cfg *config.Config) []ImplicitRule {
 			Name: "Etablerade anslutningar", Chain: "input", Action: "accept", Service: "ANY",
 			From: "ANY", To: "SELF", Logged: false,
 			Reason: "Svarstrafik på anslutningar brandväggen själv öppnat. Loggas inte — det skulle bli en loggrad per paket.",
+		},
+		ImplicitRule{
+			Name: "Garanterad SSH-åtkomst", Chain: "input", Action: "accept", Service: "TCP:22",
+			From: sshLifelineFrom(cfg), To: "SELF", Logged: true,
+			Reason: "Administratörens livlina: SSH till brandväggen släpps alltid in, oberoende av policylistan, och ligger före HARD WAN DROP. Finns för att en felaktig policy eller ett kort som bytt namn aldrig ska kunna låsa ute den som administrerar brandväggen. Gäller ALDRIG WAN-sidan, så SSH exponeras inte mot internet.",
+		},
+		// Utgående trafik. Beskrivs som en regel därför att den ÄR en regel i
+		// praktiken — OUTPUT-kedjans policy är accept, alltså är allt
+		// brandväggen själv skickar tillåtet. Utan den här posten går det
+		// inte att svara på "vad får brandväggen själv nå?" i GUI:t, och det
+		// är inte självklart för någon som bara ser INPUT- och
+		// FORWARD-reglerna att utgående är helt oreglerat.
+		ImplicitRule{
+			Name: "Utgående trafik från brandväggen", Chain: "output", Action: "accept", Service: "ANY",
+			From: "SELF", To: "ANY", Logged: false,
+			Reason: "All trafik som brandväggen själv skickar är tillåten — DNS-uppslag, tidssynk, paket- och regeluppdateringar, hämtning av hotlistor. OUTPUT-kedjan har policy accept och innehåller inga begränsande regler. Loggas inte: det skulle bli en loggrad per paket. Kan inte begränsas i GUI:t i dag.",
 		},
 	)
 

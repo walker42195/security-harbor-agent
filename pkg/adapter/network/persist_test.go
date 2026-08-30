@@ -12,6 +12,18 @@ import (
 // lanStatic är gränssnittet från den skarpa incidenten 2026-08-26: LAN-kortet
 // som ska ligga fast på 10.0.0.9 men som tappade adressen till en DHCP-lease
 // vid varje omstart av agenten.
+// gatewayIfaces är en tvåkorts-gateway-konfiguration. Behövs som `all`-
+// argument till renderarna: "internt kort" betyder numera "det finns ett
+// WAN-kort som är att föredra för default-rutten", inte bara "zonen är inte
+// WAN" — annars hade host-lägets enda kort felaktigt räknats som internt och
+// blivit av med både default-rutt och DNS (se CarriesDefaultRoute).
+func gatewayIfaces() []config.Interface {
+	return []config.Interface{
+		{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+		lanStatic(),
+	}
+}
+
 func lanStatic() config.Interface {
 	return config.Interface{
 		ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true,
@@ -63,7 +75,11 @@ func TestRenderNetplanInternalDHCPNeverTakesRoutesOrDNS(t *testing.T) {
 	lan.AddressType = "dhcp"
 	lan.IPv4 = ""
 
-	out, err := RenderNetplan([]config.Interface{lan})
+	// WAN måste finnas med: "internt kort" betyder att det finns ett WAN som
+	// är att föredra för default-rutten. Ett ENSAMT kort utan WAN är
+	// host-läge och ska tvärtom behålla rutt och DNS (se testet nedan).
+	wan := config.Interface{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"}
+	out, err := RenderNetplan([]config.Interface{wan, lan})
 	if err != nil {
 		t.Fatalf("RenderNetplan: %v", err)
 	}
@@ -218,7 +234,10 @@ func TestRenderNetworkdInternalDHCPDropsRoutesAndDNS(t *testing.T) {
 	lan.AddressType = "dhcp"
 	lan.IPv4 = ""
 
-	files, err := renderNetworkdFiles([]config.Interface{lan})
+	// Se kommentaren i netplan-motsvarigheten: WAN måste finnas med för att
+	// kortet ska räknas som internt.
+	wan := config.Interface{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"}
+	files, err := renderNetworkdFiles([]config.Interface{wan, lan})
 	if err != nil {
 		t.Fatalf("renderNetworkdFiles: %v", err)
 	}
@@ -231,7 +250,7 @@ func TestRenderNetworkdInternalDHCPDropsRoutesAndDNS(t *testing.T) {
 }
 
 func TestNMSettingsNeverDefaultOnInternalInterfaces(t *testing.T) {
-	s, err := nmSettingsFor(lanStatic(), "ens19", false)
+	s, err := nmSettingsFor(lanStatic(), "ens19", false, gatewayIfaces())
 	if err != nil {
 		t.Fatalf("nmSettingsFor: %v", err)
 	}
@@ -255,7 +274,7 @@ func TestNMSettingsNeverDefaultOnInternalInterfaces(t *testing.T) {
 	wan, err := nmSettingsFor(config.Interface{
 		Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "static",
 		IPv4: "192.0.2.10/24", Gateway: "192.0.2.1", DNSServers: []string{"1.1.1.1"},
-	}, "ens18", false)
+	}, "ens18", false, gatewayIfaces())
 	if err != nil {
 		t.Fatalf("nmSettingsFor: %v", err)
 	}
@@ -275,7 +294,7 @@ func TestNMSettingsClearStaleStaticValuesOnDHCP(t *testing.T) {
 	lan := lanStatic()
 	lan.AddressType = "dhcp"
 
-	s, err := nmSettingsFor(lan, "ens19", false)
+	s, err := nmSettingsFor(lan, "ens19", false, gatewayIfaces())
 	if err != nil {
 		t.Fatalf("nmSettingsFor: %v", err)
 	}
@@ -327,5 +346,78 @@ func TestWaitForAddressSkipsDisabledInterface(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("waitForAddress väntade på ett avstängt kort")
+	}
+}
+
+// hostIface är host-lägets seed: ETT kort, zon HOST, ingen WAN-zon någonstans.
+func hostIface() config.Interface {
+	return config.Interface{
+		ID: "host0", Device: "ens19", Zone: "HOST", Enabled: true, AddressType: "dhcp",
+	}
+}
+
+// Regression (skarpt 2026-08-30 på 10.0.0.152): i host-läge finns ingen
+// WAN-zon, och villkoret `zone == "WAN"` gjorde att maskinens ENDA kort
+// behandlades som ett internt gateway-kort. Alla tre persistenslagren satte
+// då "ta inte emot default-rutt eller DNS" på den enda uppkoppling maskinen
+// hade: default-rutten försvann och /etc/resolv.conf blev tom. Maskinen nådde
+// sitt eget subnät men ingenting annat, och namnuppslag slutade fungera.
+func TestHostModeInterfaceKeepsRouteAndDNS(t *testing.T) {
+	host := hostIface()
+	all := []config.Interface{host}
+
+	if !CarriesDefaultRoute(host, all) {
+		t.Fatal("host-lägets kort ska få bära default-rutt")
+	}
+
+	t.Run("netplan", func(t *testing.T) {
+		out, err := RenderNetplan(all)
+		if err != nil {
+			t.Fatalf("RenderNetplan: %v", err)
+		}
+		for _, forbidden := range []string{"use-routes: false", "use-dns: false", "accept-ra: false"} {
+			if strings.Contains(out, forbidden) {
+				t.Errorf("host-lägets kort fick %q:\n%s", forbidden, out)
+			}
+		}
+	})
+
+	t.Run("networkd", func(t *testing.T) {
+		files, err := renderNetworkdFiles(all)
+		if err != nil {
+			t.Fatalf("renderNetworkdFiles: %v", err)
+		}
+		body := files[networkdPrefix+"ens19.network"]
+		for _, forbidden := range []string{"UseRoutes=no", "UseGateway=no", "UseDNS=no"} {
+			if strings.Contains(body, forbidden) {
+				t.Errorf("host-lägets kort fick %q:\n%s", forbidden, body)
+			}
+		}
+	})
+
+	t.Run("networkmanager", func(t *testing.T) {
+		s, err := nmSettingsFor(host, "ens19", false, all)
+		if err != nil {
+			t.Fatalf("nmSettingsFor: %v", err)
+		}
+		if s["ipv4.never-default"] != "no" {
+			t.Errorf("host-lägets kort fick never-default: %v", s)
+		}
+		if s["ipv4.ignore-auto-dns"] != "no" {
+			t.Errorf("host-lägets kort fick ignore-auto-dns: %v", s)
+		}
+	})
+}
+
+// Motsatsen måste fortfarande gälla: så fort det FINNS ett WAN-kort är alla
+// andra kort interna och får varken default-rutt eller DHCP-DNS.
+func TestGatewayInternalInterfaceStillLosesRouteAndDNS(t *testing.T) {
+	all := gatewayIfaces()
+	for _, iface := range all {
+		want := strings.EqualFold(iface.Zone, "WAN")
+		if got := CarriesDefaultRoute(iface, all); got != want {
+			t.Errorf("%s (zon %s): CarriesDefaultRoute=%v, ville %v",
+				iface.Device, iface.Zone, got, want)
+		}
 	}
 }

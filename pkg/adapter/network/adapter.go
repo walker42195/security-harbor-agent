@@ -144,7 +144,7 @@ func defaultGatewayFor(device string) string {
 }
 
 // ApplyInterfaceConfig tillämpar IP-adresser, länkstatus och VLAN-gränssnitt på Linux.
-func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interface) error {
+func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interface, all []config.Interface) error {
 	if iface.Device == "" {
 		return fmt.Errorf("interface device saknas")
 	}
@@ -257,7 +257,10 @@ func (a *Adapter) ApplyInterfaceConfig(ctx context.Context, iface config.Interfa
 	// addr flush`). Ta bort ev. default-rutt via icke-WAN-gränssnitt synkront
 	// här; DHCP-fallet hanteras dessutom inne i goroutinen ovan efter att
 	// dhclient hunnit installera sin rutt.
-	if iface.Enabled && !strings.EqualFold(iface.Zone, "WAN") {
+	// I host-läge finns ingen WAN-zon och kortet ÄR maskinens väg ut — då
+	// skulle det här ta bort den enda default-rutten som finns. Se
+	// CarriesDefaultRoute.
+	if iface.Enabled && !CarriesDefaultRoute(iface, all) {
 		a.RemoveDefaultRoute(ctx, iface.Device)
 	}
 
@@ -537,7 +540,7 @@ func (a *Adapter) ApplyDNSConfig(ctx context.Context, interfaces []config.Interf
 // jämförs mot systemets faktiska tillstånd i stället, så ett kort som
 // glidit ifrån sin konfiguration rättas — medan ett kort som redan stämmer
 // lämnas helt orört (ingen flush, ingen bruten session).
-func (a *Adapter) MatchesSystemState(iface config.Interface) bool {
+func (a *Adapter) MatchesSystemState(iface config.Interface, all []config.Interface) bool {
 	device := iface.Device
 	if iface.VLANID > 0 && iface.Parent != "" {
 		device = fmt.Sprintf("%s.%d", iface.Parent, iface.VLANID)
@@ -561,11 +564,31 @@ func (a *Adapter) MatchesSystemState(iface config.Interface) bool {
 
 	permanent, dynamic := deviceAddresses(device)
 
-	// En brandvägg får ha default-rutt ENDAST via WAN. En kvarglömd
-	// default-rutt via ett internt kort räknas som drift även om adressen
-	// stämmer — det var just den (via LAN-kortets DHCP-lease) som gjorde
-	// egress-valet slumpartat under incidenten.
-	if !strings.EqualFold(iface.Zone, "WAN") && hasDefaultRoute(device) {
+	// Default-rutten måste ligga på rätt kort, åt BÅDA håll.
+	//
+	// Ett INTERNT kort (det finns ett WAN som är att föredra) får inte ha
+	// någon default-rutt: en kvarglömd sådan via LAN-kortets DHCP-lease var
+	// det som gjorde egress-valet slumpartat under incidenten, och räknas
+	// som drift även om adressen stämmer.
+	//
+	// Omvänt måste ett kort som SKA bära default-rutten faktiskt ha en.
+	// Utan den kontrollen läker en trasig maskin aldrig av sig själv:
+	// drift-kontrollen tittade bara på adressen, så ett kort med rätt
+	// DHCP-adress men utan rutt bedömdes som "i synk" och
+	// persistenslagrets profil skrevs aldrig om. Precis det tillståndet
+	// uppstod på 10.0.0.152 i host-läge (2026-08-30) — kortet hade sin
+	// adress men never-default=yes låg kvar i NetworkManager-profilen, och
+	// maskinen blev utan både default-rutt och DNS tills profilen skrevs om
+	// för hand.
+	uplink := CarriesDefaultRoute(iface, all)
+	if !uplink && hasDefaultRoute(device) {
+		return false
+	}
+	if uplink && !hasDefaultRoute(device) && !systemHasDefaultRoute() {
+		// Bara när maskinen saknar default-rutt HELT. Har den en via ett
+		// annat kort (t.ex. under en omkonfigurering) är det inte den här
+		// enhetens fel, och att flagga drift här hade gett en ändlös
+		// omkonfigureringsloop.
 		return false
 	}
 
@@ -625,6 +648,13 @@ func hasDefaultRoute(device string) bool {
 		return false
 	}
 	return strings.TrimSpace(string(out)) != ""
+}
+
+// systemHasDefaultRoute säger om maskinen har någon default-rutt alls,
+// oavsett kort. Används för att skilja "det här kortet saknar sin rutt" från
+// "maskinen har ingen väg ut över huvud taget".
+func systemHasDefaultRoute() bool {
+	return DefaultRouteDevice() != ""
 }
 
 // PhysicalDevices returnerar namnen på maskinens FYSISKA nätverkskort, i

@@ -413,7 +413,7 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 
 		// Finns ingen tidigare konfiguration att jämföra med (boot, eller ett
 		// nytillkommet gränssnitt) avgör systemets faktiska tillstånd.
-		drifted := !hadPrev && !netAdapter.MatchesSystemState(iface)
+		drifted := !hadPrev && !netAdapter.MatchesSystemState(iface, newCfg.Interfaces)
 
 		if !changed && !drifted && !(isVLAN && deviceMissing) {
 			continue
@@ -474,7 +474,7 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 	// trigga en andra, onödig förhandling direkt efter den första).
 	for i, iface := range touch {
 		if !persisted {
-			if err := netAdapter.ApplyInterfaceConfig(ctx, iface); err != nil {
+			if err := netAdapter.ApplyInterfaceConfig(ctx, iface, newCfg.Interfaces); err != nil {
 				log.Printf("[NET] kunde inte tillämpa gränssnitt %s: %v", iface.Device, err)
 			}
 		}
@@ -482,7 +482,9 @@ func (e *Engine) applyInterfaces(ctx context.Context, newCfg, prevCfg *config.Co
 		// Persistenslagren är konfigurerade att inte skapa någon, men en rutt
 		// som redan LIGGER där (t.ex. från en DHCP-lease kortet hade innan
 		// det byttes till statiskt) försvinner inte av sig själv.
-		if iface.Enabled && !strings.EqualFold(iface.Zone, "WAN") {
+		// Undantag i host-läge: där finns ingen WAN-zon, och kortet är
+		// maskinens enda uppkoppling. Se network.CarriesDefaultRoute.
+		if iface.Enabled && !network.CarriesDefaultRoute(iface, newCfg.Interfaces) {
 			netAdapter.RemoveDefaultRoute(ctx, devices[i])
 		}
 	}

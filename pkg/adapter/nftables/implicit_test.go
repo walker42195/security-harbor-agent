@@ -1,6 +1,7 @@
 package nftables
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -31,6 +32,7 @@ func TestImplicitRulesMatchRendered(t *testing.T) {
 	commentFor := map[string]string{
 		"Loopback":                "Allow loopback",
 		"Etablerade anslutningar": "Allow established/related connections",
+		"Garanterad SSH-åtkomst":  sshLifelineComment,
 		"WireGuard VPN":           "Allow WireGuard",
 		"OpenVPN":                 "Allow OpenVPN",
 		"WAN Drop":                "HARD WAN DROP",
@@ -38,6 +40,11 @@ func TestImplicitRulesMatchRendered(t *testing.T) {
 		"DNS till brandväggen":    "Allow DNS",
 		"DHCP till brandväggen":   "Allow DHCP",
 	}
+
+	// "Utgående trafik" förverkligas av OUTPUT-kedjans POLICY, inte av en
+	// regel — den kan därför inte matchas mot en regelkommentar som de
+	// övriga. Den kontrolleras separat mot chain-policyn längre ned.
+	const outboundName = "Utgående trafik från brandväggen"
 
 	var inputComments []string
 	for _, r := range renderRules(t, cfg) {
@@ -47,12 +54,38 @@ func TestImplicitRulesMatchRendered(t *testing.T) {
 	}
 
 	described := DescribeImplicitRules(cfg)
-	if len(described) != len(commentFor) {
-		t.Fatalf("beskrivna regler: %d, förväntade %d", len(described), len(commentFor))
+	if len(described) != len(commentFor)+1 { // +1 = den utgående regeln
+		var names []string
+		for _, d := range described {
+			names = append(names, d.Name)
+		}
+		t.Fatalf("beskrivna regler: %d (%v), förväntade %d", len(described), names, len(commentFor)+1)
+	}
+
+	// Den utgående regeln måste stämma med OUTPUT-kedjans faktiska policy.
+	// Skulle kedjan någon gång bli default-drop är beskrivningen "allt är
+	// tillåtet" direkt felaktig, och det ska testet fånga.
+	var outbound *ImplicitRule
+	for i := range described {
+		if described[i].Name == outboundName {
+			outbound = &described[i]
+		}
+	}
+	if outbound == nil {
+		t.Fatalf("den utgående regeln %q beskrivs inte", outboundName)
+	}
+	if got := outputChainPolicy(t, cfg); got != outbound.Action {
+		t.Errorf("OUTPUT-kedjans policy är %q men regeln beskrivs som %q", got, outbound.Action)
+	}
+	if outbound.Chain != "output" {
+		t.Errorf("den utgående regeln säger kedja %q, ska vara \"output\"", outbound.Chain)
 	}
 
 	// 1. Varje beskriven regel finns renderad.
 	for _, d := range described {
+		if d.Name == outboundName {
+			continue // kontrollerad mot chain-policyn ovan
+		}
 		prefix, ok := commentFor[d.Name]
 		if !ok {
 			t.Errorf("okänd beskriven regel %q — lägg till den i testets karta", d.Name)
@@ -73,7 +106,8 @@ func TestImplicitRulesMatchRendered(t *testing.T) {
 	// 2. Ingen implicit regel saknar beskrivning. Policyregler har sina egna
 	// namn som kommentar och räknas inte hit.
 	for _, c := range inputComments {
-		if !strings.HasPrefix(c, "Allow ") && !strings.HasPrefix(c, "HARD ") {
+		if !strings.HasPrefix(c, "Allow ") && !strings.HasPrefix(c, "HARD ") &&
+			!strings.HasPrefix(c, sshLifelineComment) {
 			continue
 		}
 		matched := false
@@ -138,4 +172,33 @@ func TestNilConfigIsSafe(t *testing.T) {
 	if DescribeImplicitRules(nil) != nil {
 		t.Error("nil-config ska ge nil")
 	}
+}
+
+// outputChainPolicy läser OUTPUT-kedjans default-policy ur det renderade
+// regelsetet. Behövs eftersom den utgående implicita regeln inte är en regel
+// utan just kedjans policy.
+func outputChainPolicy(t *testing.T, cfg *config.Config) string {
+	t.Helper()
+	out, err := NewAdapter().RenderJSON(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Nftables []struct {
+			Chain *struct {
+				Name   string `json:"name"`
+				Policy string `json:"policy"`
+			} `json:"chain"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range root.Nftables {
+		if e.Chain != nil && e.Chain.Name == "output" {
+			return e.Chain.Policy
+		}
+	}
+	t.Fatal("ingen output-kedja i det renderade regelsetet")
+	return ""
 }

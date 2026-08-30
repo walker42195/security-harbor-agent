@@ -105,7 +105,7 @@ func renderNetworkdFiles(ifaces []config.Interface) (map[string]string, error) {
 					"[NetDev]\nName=%s\nKind=vlan\n\n[VLAN]\nId=%d\n", device, iface.VLANID)
 		}
 
-		body, err := renderNetworkdNetwork(iface, device)
+		body, err := renderNetworkdNetwork(iface, device, ifaces)
 		if err != nil {
 			return nil, err
 		}
@@ -140,7 +140,7 @@ func insertIntoNetworkSection(body, extra string) string {
 	return body + extra
 }
 
-func renderNetworkdNetwork(iface config.Interface, device string) (string, error) {
+func renderNetworkdNetwork(iface config.Interface, device string, all []config.Interface) (string, error) {
 	isWAN := strings.EqualFold(iface.Zone, "WAN")
 
 	var b strings.Builder
@@ -191,9 +191,11 @@ func renderNetworkdNetwork(iface config.Interface, device string) (string, error
 	}
 
 	b.WriteString("DHCP=ipv4\n")
-	if !isWAN {
+	if !CarriesDefaultRoute(iface, all) {
 		// Motsvarigheten till netplans dhcp4-overrides: hämta adressen, men
 		// aldrig default-rutt eller DNS (se paketkommentaren i netplan.go).
+		// Gäller INTERNA kort — i host-läge finns inget WAN och kortet är
+		// maskinens uppkoppling, se CarriesDefaultRoute.
 		b.WriteString("\n[DHCPv4]\nUseRoutes=no\nUseGateway=no\nUseDNS=no\n")
 	}
 	return b.String(), nil

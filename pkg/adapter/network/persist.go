@@ -51,6 +51,41 @@ type PersistBackend interface {
 	Renew(ctx context.Context, device string) error
 }
 
+// CarriesDefaultRoute avgör om ett kort får bära default-rutt och ta emot
+// DNS-servrar från DHCP.
+//
+// Grundregeln är en GATEWAY-regel: en brandvägg med två sidor får ha default-
+// rutt bara via WAN, annars kan egress-trafiken gå ut på insidan, och den ska
+// inte ta DNS från en intern DHCP-server. Fram till 2026-08-30 uttrycktes den
+// som `zone == "WAN"` rakt av, på fyra ställen (netplan, NetworkManager,
+// networkd och den imperativa ip-vägen).
+//
+// I HOST-läge finns ingen WAN-zon — maskinens enda kort ligger i zonen HOST —
+// så villkoret blev falskt för det enda kort som fanns. Resultatet: agenten
+// satte never-default/UseGateway=no och ignore-auto-dns/UseDNS=no på maskinens
+// enda uppkoppling, vilket tog bort default-rutten och lämnade
+// /etc/resolv.conf tomt. Maskinen kunde nå sitt eget subnät men ingenting
+// annat, och namnuppslag slutade fungera helt. Bekräftat skarpt på
+// 10.0.0.152 i host-läge.
+//
+// Villkoret formuleras därför som "det finns ingen WAN-zon att föredra"
+// snarare än som ett läges-flagga: det behöver inte veta om configen är
+// gateway eller host, och det överlever att zonen döps om i GUI:t.
+func CarriesDefaultRoute(iface config.Interface, all []config.Interface) bool {
+	if strings.EqualFold(iface.Zone, "WAN") {
+		return true
+	}
+	for _, other := range all {
+		if other.Enabled && strings.EqualFold(other.Zone, "WAN") {
+			// Det FINNS ett WAN-kort — då är det bara det som får rutten.
+			return false
+		}
+	}
+	// Ingen WAN-zon i hela konfigurationen = host-läge. Maskinens kort är
+	// dess enda väg ut och måste bete sig som en vanlig värddators.
+	return true
+}
+
 type netplanBackend struct{}
 
 func (b *netplanBackend) Name() string { return "netplan" }

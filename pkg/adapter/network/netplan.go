@@ -110,7 +110,7 @@ func RenderNetplan(ifaces []config.Interface) (string, error) {
 			return "", fmt.Errorf("VLAN %q har ett ogiltigt föräldrakort %q", device, iface.Parent)
 		}
 
-		body, err := renderInterfaceBody(iface, isVLAN)
+		body, err := renderInterfaceBody(iface, isVLAN, ifaces)
 		if err != nil {
 			return "", err
 		}
@@ -154,9 +154,13 @@ func writeSection(b *strings.Builder, name string, entries map[string]string) {
 	}
 }
 
-func renderInterfaceBody(iface config.Interface, isVLAN bool) (string, error) {
+func renderInterfaceBody(iface config.Interface, isVLAN bool, all []config.Interface) (string, error) {
 	var b strings.Builder
 	isWAN := strings.EqualFold(iface.Zone, "WAN")
+	// uplink skiljer sig från isWAN bara i host-läge, där det inte finns
+	// någon WAN-zon och maskinens enda kort ändå måste bära default-rutt och
+	// ta DNS från DHCP. Se CarriesDefaultRoute.
+	uplink := CarriesDefaultRoute(iface, all)
 
 	if isVLAN {
 		fmt.Fprintf(&b, "      id: %d\n", iface.VLANID)
@@ -180,7 +184,7 @@ func renderInterfaceBody(iface config.Interface, isVLAN bool) (string, error) {
 	// IPv6-fält, och en oväntad RA-inlärd default-rutt via ett internt kort
 	// skulle ge samma egress-problem som en DHCP-inlärd (se paketkommentaren).
 	b.WriteString("      dhcp6: false\n")
-	if !isWAN {
+	if !uplink {
 		b.WriteString("      accept-ra: false\n")
 	}
 
@@ -211,7 +215,7 @@ func renderInterfaceBody(iface config.Interface, isVLAN bool) (string, error) {
 		// DHCP (eller statiskt utan adress, vilket inte går att applicera —
 		// då är DHCP det enda vettiga: kortet får åtminstone en adress).
 		b.WriteString("      dhcp4: true\n")
-		if !isWAN {
+		if !uplink {
 			b.WriteString("      dhcp4-overrides:\n")
 			b.WriteString("        use-routes: false\n")
 			b.WriteString("        use-dns: false\n")

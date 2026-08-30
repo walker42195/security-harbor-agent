@@ -70,7 +70,7 @@ func (b *networkManagerBackend) Write(ctx context.Context, ifaces []config.Inter
 			continue
 		}
 
-		settings, err := nmSettingsFor(iface, device, isVLAN)
+		settings, err := nmSettingsFor(iface, device, isVLAN, ifaces)
 		if err != nil {
 			return changed, err
 		}
@@ -103,8 +103,11 @@ func (b *networkManagerBackend) Write(ctx context.Context, ifaces []config.Inter
 
 // nmSettingsFor översätter ett gränssnitt till NM-egenskaper. Ordningen i
 // kartan spelar ingen roll — nmcli tar dem som fristående key/value-par.
-func nmSettingsFor(iface config.Interface, device string, isVLAN bool) (map[string]string, error) {
+func nmSettingsFor(iface config.Interface, device string, isVLAN bool, all []config.Interface) (map[string]string, error) {
 	isWAN := strings.EqualFold(iface.Zone, "WAN")
+	// Se CarriesDefaultRoute: i host-läge finns ingen WAN-zon, och då måste
+	// maskinens enda kort få både default-rutt och DNS från DHCP.
+	uplink := CarriesDefaultRoute(iface, all)
 	s := map[string]string{
 		"connection.autoconnect": boolYesNo(iface.Enabled),
 		// Vinn över NM:s egen auto-skapade "Wired connection N" för kortet.
@@ -113,9 +116,11 @@ func nmSettingsFor(iface config.Interface, device string, isVLAN bool) (map[stri
 		// RA-inlärd default-rutt via ett internt kort ger samma
 		// egress-problem som en DHCP-inlärd.
 		"ipv6.method": "disabled",
-		// ALDRIG default-rutt eller DHCP-DNS via annat än WAN.
-		"ipv4.never-default":   boolYesNo(!isWAN),
-		"ipv4.ignore-auto-dns": boolYesNo(!isWAN),
+		// ALDRIG default-rutt eller DHCP-DNS via ett INTERNT kort — men i
+		// host-läge är det enda kortet inte internt, det är maskinens
+		// uppkoppling.
+		"ipv4.never-default":   boolYesNo(!uplink),
+		"ipv4.ignore-auto-dns": boolYesNo(!uplink),
 	}
 
 	if iface.MTU > 0 {
