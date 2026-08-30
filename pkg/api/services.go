@@ -170,6 +170,7 @@ func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Okänd tjänst", http.StatusBadRequest)
 		return
 	}
+	cfg := s.engine.GetRunningConfig()
 
 	// Agentens EGEN omstart får ett eget, kort svar innan processen dör —
 	// annars hinner klienten aldrig se ett svar alls (anslutningen bryts
@@ -182,6 +183,25 @@ func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(300 * time.Millisecond)
 			_ = exec.Command("systemctl", "restart", svc.Unit).Start()
 		}()
+		return
+	}
+
+	// Vägra starta en tjänst vars FUNKTION är avstängd i konfigurationen.
+	//
+	// Agenten äger start/stopp av de här tjänsterna — den stoppar dem när
+	// funktionen slås av. En omstart härifrån startar dem igen, och då säger
+	// konfigurationen en sak medan maskinen gör en annan, utan att något
+	// senare rättar till det förrän nästa applicering.
+	//
+	// Rapporterat 2026-08-30 på en skarp gateway: IDS var avstängt i
+	// konfigurationen men suricata.service kördes, eftersom någon tryckt
+	// "starta om" på tjänsten. Panelen visade den då som aktiv, vilket såg ut
+	// som att IDS var påslaget.
+	if !serviceConfigured(svc.ID, cfg) {
+		http.Error(w,
+			"Tjänsten "+svc.Name+" kan inte startas om eftersom funktionen är avstängd i konfigurationen. "+
+				"Slå på den först, så startar agenten tjänsten själv.",
+			http.StatusConflict)
 		return
 	}
 

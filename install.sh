@@ -308,6 +308,26 @@ if [ -f /etc/suricata/suricata.yaml ]; then
   chgrp security-harbor /etc/suricata/suricata.yaml
   chmod g+w /etc/suricata/suricata.yaml
 fi
+# Suricata: agenten äger start/stopp via IDS-reglaget i GUI:t. Distributionens
+# paket både AKTIVERAR och STARTAR suricata.service vid installationen, med
+# paketets default-config (fel gränssnitt, inget regelset) — den startar då
+# inte, och enheten hamnar i "failed".
+#
+# Rapporterat 2026-08-30: på en helt ny gateway-installation visade
+# Tjänste-sidan ett fel för Suricata trots att IDS aldrig slagits på. Att
+# stoppa räcker inte, för enheten är fortfarande ENABLED och startas om vid
+# varje boot, misslyckas igen och lägger sig i failed på nytt. Det såg ut att
+# "läka" av att slå på och av IDS i GUI:t — men bara för att agenten då hade
+# skrivit en giltig suricata.yaml, så nästa automatiska start lyckades.
+#
+# Samma mönster som haproxy nedan: inaktivera enheten, stoppa den, och nolla
+# ett ev. failed-tillstånd så det inte ligger kvar i GUI:t efter en
+# uppgradering.
+if [ "$HAVE_SURICATA" = "1" ]; then
+  systemctl disable suricata.service 2>/dev/null || true
+  systemctl stop suricata.service 2>/dev/null || true
+  systemctl reset-failed suricata.service 2>/dev/null || true
+fi
 # Bara när rsyslog faktiskt är installerat - syslog-vidarebefordran är en
 # VALFRI funktion och saknas t.ex. helt i Arch officiella repon.
 if [ "$HAVE_RSYSLOG" = "1" ] && [ -d /etc/rsyslog.d ]; then

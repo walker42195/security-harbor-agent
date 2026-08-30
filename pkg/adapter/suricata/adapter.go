@@ -99,6 +99,11 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 			return nil
 		}
 		_ = exec.CommandContext(ctx, "systemctl", "stop", unit).Run()
+		// Nolla ett ev. failed-tillstånd. IDS är AVSTÄNGT här, så tjänsten ska
+		// inte köra — men en enhet som tidigare kraschat blir kvar som
+		// "failed" och visas röd på Tjänste-sidan, vilket ser ut som ett fel
+		// att åtgärda fast det bara speglar att funktionen är av.
+		_ = exec.CommandContext(ctx, "systemctl", "reset-failed", unit).Run()
 		return nil
 	}
 
