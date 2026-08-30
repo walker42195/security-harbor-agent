@@ -32,7 +32,18 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 RuntimeDirectory=security-harbor
-ReadWritePaths=/var/lib/security-harbor /etc/security-harbor /run/security-harbor /etc/kea /etc/wireguard /etc/openvpn /etc/unbound /etc/rsyslog.d /etc/suricata /var/log/suricata /etc/haproxy /etc/chrony/conf.d
+# "-"-prefixet gör en sökväg VALFRI. Utan det vägrar systemd starta enheten
+# över huvud taget om EN enda av katalogerna saknas (status 226/NAMESPACE,
+# "Failed to set up mount namespacing"). Bara de tre första skapas av
+# installern; resten kommer från andra distributioners paket och finns inte
+# alltid: i host-läge installeras varken Kea, Unbound, OpenVPN, HAProxy eller
+# Suricata, och på Arch saknas dessutom /etc/rsyslog.d (rsyslog finns bara i
+# AUR) och chrony-drop-in-katalogen heter /etc/chrony.d i stället för
+# /etc/chrony/conf.d. Upptäckt 2026-08-30 på en Arch-installation i host-läge.
+ReadWritePaths=/var/lib/security-harbor /etc/security-harbor /run/security-harbor
+ReadWritePaths=-/etc/kea -/etc/wireguard -/etc/openvpn -/etc/unbound
+ReadWritePaths=-/etc/rsyslog.d -/etc/suricata -/var/log/suricata -/etc/haproxy
+ReadWritePaths=-/etc/chrony/conf.d -/etc/chrony.d
 ProtectKernelTunables=false
 ProtectKernelModules=false
 ProtectControlGroups=true

@@ -154,7 +154,8 @@ func (a *Adapter) checkWritable() error {
 		return f.Close()
 	}
 	if os.IsNotExist(err) {
-		return fmt.Errorf("IDS kan inte aktiveras: %s saknas — är paketet suricata installerat? (apt install suricata suricata-update)", a.yamlPath)
+		return fmt.Errorf("IDS kan inte aktiveras: %s saknas — är paketet suricata installerat? "+
+			"(Debian/Ubuntu: apt install suricata suricata-update, Arch: finns bara i AUR, t.ex. yay -S suricata)", a.yamlPath)
 	}
 	if os.IsPermission(err) {
 		return fmt.Errorf("IDS kan inte aktiveras: agenten saknar skrivrätt på %s. Kör på brandväggen: sudo chgrp security-harbor %s && sudo chmod g+w %s", a.yamlPath, a.yamlPath, a.yamlPath)

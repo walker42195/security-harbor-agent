@@ -36,6 +36,13 @@ func main() {
 	webUIDir := flag.String("webui-dir", "/var/lib/security-harbor/webui", "Sökväg till statiska filer för web-UI (flutter build web)")
 	dryRun := flag.Bool("dry-run", false, "Starta i dry-run läge utan att ändra nftables i kärnan")
 	seedMode := flag.String("mode", "", "Driftläge för EN HELT NY installation (\"\"/\"gateway\" eller \"host\", Fas 13) — rör bara den allra första uppstarten, ignoreras om running.json redan finns")
+	// Kortvalen kommer från installern, där administratören pekar ut dem i en
+	// lista över maskinens faktiska nätverkskort. Utelämnade => agenten
+	// detekterar själv (se store.resolveSeedDevices). Precis som --mode rör de
+	// BARA seedningen av en ny installation.
+	seedWANDevice := flag.String("wan-device", "", "Gateway-läge, NY installation: nätverkskort mot internet (t.ex. ens18). Detekteras om det utelämnas")
+	seedLANDevice := flag.String("lan-device", "", "Gateway-läge, NY installation: nätverkskort mot det interna nätet (t.ex. ens19). Detekteras om det utelämnas")
+	seedHostDevice := flag.String("host-device", "", "Host-läge, NY installation: maskinens enda nätverkskort. Detekteras om det utelämnas")
 	showVersion := flag.Bool("version", false, "Skriv ut versionen och avsluta")
 	verifyTarball := flag.String("verify-update", "", "Verifiera en release-bunt (Ed25519) mot den inbyggda publika nyckeln och avsluta (0=ok). Används av root-installern.")
 	verifySig := flag.String("verify-sig", "", "Signaturfil till --verify-update")
@@ -69,7 +76,12 @@ func main() {
 	// Master-nyckeln för kryptering at-rest genereras slumpmässigt per
 	// installation och sparas i --data-dir (se pkg/store/masterkey.go) —
 	// inget hårdkodat här längre.
-	st, err := store.NewStore(*configDir, *seedMode)
+	st, err := store.NewStore(*configDir, store.SeedOptions{
+		Mode:       *seedMode,
+		WANDevice:  *seedWANDevice,
+		LANDevice:  *seedLANDevice,
+		HostDevice: *seedHostDevice,
+	})
 	if err != nil {
 		log.Fatalf("Kunde inte starta store: %v", err)
 	}

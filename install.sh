@@ -32,15 +32,26 @@ BIN_DIR="/usr/local/bin"
 
 MODE=""
 WAN_DEVICE=""
+LAN_DEVICE=""
+HOST_DEVICE=""
+SKIP_PACKAGES=0
 for arg in "$@"; do
   case "$arg" in
     --mode=*) MODE="${arg#*=}" ;;
     --wan-device=*) WAN_DEVICE="${arg#*=}" ;;
+    --lan-device=*) LAN_DEVICE="${arg#*=}" ;;
+    --host-device=*) HOST_DEVICE="${arg#*=}" ;;
+    --skip-packages) SKIP_PACKAGES=1 ;;
     -h|--help)
-      echo "Användning: $0 [--mode=gateway|host] [--wan-device=<namn>]"
-      echo "  --mode        Hoppa över den interaktiva frågan om driftläge."
-      echo "  --wan-device  (Endast gateway-läge) Gränssnittsnamn för WAN-sidan"
-      echo "                i failsafe-regelsetet. Auto-detekteras/frågas annars."
+      echo "Användning: $0 [--mode=gateway|host] [kortval] [--skip-packages]"
+      echo "  --mode           Hoppa över den interaktiva frågan om driftläge."
+      echo "  --wan-device     (gateway) Kortet mot internet. Frågas annars."
+      echo "  --lan-device     (gateway) Kortet mot det interna nätet. Frågas annars."
+      echo "  --host-device    (host) Maskinens nätverkskort. Frågas annars, och"
+      echo "                   väljs automatiskt om maskinen bara har ett."
+      echo "  --skip-packages  Installera inga systempaket (för distributioner"
+      echo "                   installern inte kan paketnamnen för - installera"
+      echo "                   motsvarigheterna för hand först)."
       exit 0
       ;;
   esac
@@ -96,37 +107,138 @@ fi
 echo "-> Installerar i läge: $MODE"
 
 echo "=== 1. Installerar systempaket ==="
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+
+# --- Distro-detektering -------------------------------------------------
+#
+# Installern var ursprungligen hårdkodad mot apt-get + Debians paketnamn.
+# Upptäckt 2026-08-30 vid ett test på Arch: `pacman -S` avbröt med "target
+# not found" på bind9-dnsutils/rsyslog/polkitd, och eftersom skriptet kör
+# med `set -e` dog HELA installationen mitt i steg 1 — ingen binär, ingen
+# systemd-enhet, inget TLS-certifikat. Appen visade då "Kunde inte
+# kontrollera certifikatet", vilket i själva verket var ett connection
+# refused mot en agent som aldrig installerats.
+#
+# ID_LIKE fångar derivat (Linux Mint => debian, EndeavourOS/Manjaro => arch)
+# utan att varje enskild distro behöver listas.
+DISTRO_ID="$(. /etc/os-release 2>/dev/null && echo "$ID")"
+DISTRO_LIKE="$(. /etc/os-release 2>/dev/null && echo "$ID_LIKE")"
+PKG_FAMILY=""
+case " $DISTRO_ID $DISTRO_LIKE " in
+  *" debian "*|*" ubuntu "*) PKG_FAMILY="debian" ;;
+  *" arch "*)                PKG_FAMILY="arch" ;;
+esac
+if [ -z "$PKG_FAMILY" ]; then
+  echo "Okänd distribution: ID=${DISTRO_ID:-?} ID_LIKE=${DISTRO_LIKE:-?}" >&2
+  echo "Installern kan paketnamn för Debian/Ubuntu och Arch. Installera" >&2
+  echo "motsvarande paket för hand och kör om med --skip-packages." >&2
+  [ "$SKIP_PACKAGES" = "1" ] || exit 1
+fi
+echo "-> Distribution: ${DISTRO_ID:-okänd} (paketfamilj: ${PKG_FAMILY:-ingen})"
+
+pkg_refresh() {
+  case "$PKG_FAMILY" in
+    debian) apt-get update -qq ;;
+    # Arch stödjer inte partiella uppgraderingar: `pacman -Sy paket` mot en
+    # gammal lokal databas kan dra in ett paket byggt mot nyare bibliotek än
+    # de installerade och lämna systemet trasigt. -Syu är därför inte ett
+    # val installern gör av bekvämlighet utan det enda säkra sättet att
+    # installera ett paket på Arch.
+    arch)   pacman -Syu --noconfirm ;;
+  esac
+}
+pkg_available() {
+  case "$PKG_FAMILY" in
+    debian) apt-cache show "$1" >/dev/null 2>&1 ;;
+    arch)   pacman -Si "$1" >/dev/null 2>&1 ;;
+  esac
+}
+pkg_installed() {
+  case "$PKG_FAMILY" in
+    debian) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed' ;;
+    arch)   pacman -Qi "$1" >/dev/null 2>&1 ;;
+  esac
+}
+pkg_install() {
+  case "$PKG_FAMILY" in
+    debian) apt-get install -y "$@" ;;
+    arch)   pacman -S --needed --noconfirm "$@" ;;
+  esac
+}
+
+# --- Paketnamn per familj -----------------------------------------------
+#
+# REQUIRED = utan dessa fungerar inte agenten alls; misslyckas de avbryts
+# installationen. OPTIONAL = funktioner som degraderar snyggt när paketet
+# saknas (syslog-vidarebefordran och IDS) — de får INTE fälla installationen,
+# vilket är precis vad som hände på Arch där varken rsyslog eller suricata
+# finns i de officiella repona (båda ligger i AUR).
+case "$PKG_FAMILY" in
+  debian)
+    export DEBIAN_FRONTEND=noninteractive
+    REQ_COMMON="nftables tcpdump nmap bind9-dnsutils polkitd jq"
+    REQ_GATEWAY="chrony kea-dhcp4-server unbound wireguard-tools openvpn haproxy"
+    # suricata-update är ett eget paket på Debian; på Arch ingår verktyget
+    # i suricata-paketet, därav skillnaden i listan nedan.
+    OPT_COMMON="rsyslog"
+    OPT_GATEWAY="suricata suricata-update"
+    ;;
+  arch)
+    REQ_COMMON="nftables tcpdump nmap bind polkit jq"
+    REQ_GATEWAY="chrony kea unbound wireguard-tools openvpn haproxy"
+    OPT_COMMON="rsyslog"
+    OPT_GATEWAY="suricata"
+    ;;
+esac
+
 if [ "$MODE" = "host" ]; then
   # Enkelkorts-/värddator-läge (Fas 13): ingen DHCP-server, ingen
   # rekursiv DNS-resolver, ingen VPN-server, ingen IDS - det här skyddar
   # EN dator, det kör inte en gateway-roll åt andra.
-  apt-get install -y \
-    nftables \
-    tcpdump \
-    nmap \
-    bind9-dnsutils \
-    rsyslog \
-    polkitd \
-    jq
+  REQUIRED_PKGS="$REQ_COMMON"
+  OPTIONAL_PKGS="$OPT_COMMON"
 else
-  apt-get install -y \
-    nftables \
-    chrony \
-    kea-dhcp4-server \
-    unbound \
-    wireguard-tools \
-    openvpn \
-    haproxy \
-    tcpdump \
-    nmap \
-    bind9-dnsutils \
-    suricata \
-    suricata-update \
-    rsyslog \
-    polkitd \
-    jq
+  REQUIRED_PKGS="$REQ_COMMON $REQ_GATEWAY"
+  OPTIONAL_PKGS="$OPT_COMMON $OPT_GATEWAY"
+fi
+
+SKIPPED_PKGS=""
+if [ "$SKIP_PACKAGES" = "1" ]; then
+  echo "-> --skip-packages angivet: hoppar över paketinstallationen helt."
+else
+  pkg_refresh
+  # shellcheck disable=SC2086 -- listorna är avsiktligt ordseparerade
+  pkg_install $REQUIRED_PKGS
+
+  for p in $OPTIONAL_PKGS; do
+    if pkg_installed "$p"; then
+      continue
+    fi
+    if pkg_available "$p"; then
+      if ! pkg_install "$p"; then
+        echo "VARNING: kunde inte installera valfritt paket '$p' - fortsätter." >&2
+        SKIPPED_PKGS="$SKIPPED_PKGS $p"
+      fi
+    else
+      echo "-> Valfritt paket '$p' finns inte i ${DISTRO_ID}s paketrepon - hoppar över."
+      SKIPPED_PKGS="$SKIPPED_PKGS $p"
+    fi
+  done
+fi
+
+# Vilka VALFRIA funktioner som faktiskt är tillgängliga avgörs av vad som
+# finns på disk efteråt - inte av om paketinstallationen gick bra. Då
+# fungerar det också när paketet redan installerats för hand (t.ex. via AUR
+# på Arch) eller när --skip-packages använts.
+HAVE_RSYSLOG=0
+HAVE_SURICATA=0
+command -v rsyslogd >/dev/null 2>&1 && HAVE_RSYSLOG=1
+command -v suricata >/dev/null 2>&1 && HAVE_SURICATA=1
+
+if [ "$MODE" = "gateway" ] && [ "$PKG_FAMILY" != "debian" ]; then
+  echo "VARNING: gateway-läge är i dagsläget bara verifierat på Debian/Ubuntu." >&2
+  echo "         Tjänstenamnen för Kea/Unbound/OpenVPN skiljer sig mellan" >&2
+  echo "         distributioner (t.ex. kea-dhcp4-server.service på Debian mot" >&2
+  echo "         kea-dhcp4.service på Arch) och agenten använder Debians namn." >&2
 fi
 
 echo "=== 2. Skapar systemanvändare/grupp 'security-harbor' ==="
@@ -134,7 +246,14 @@ if ! getent group security-harbor >/dev/null; then
   groupadd --system security-harbor
 fi
 if ! id -u security-harbor >/dev/null 2>&1; then
-  useradd --system --no-create-home --shell /usr/sbin/nologin \
+  # nologin ligger i /usr/sbin på Debian och i /usr/bin på Arch (där
+  # /usr/sbin visserligen är en symlänk till /usr/bin, men det gäller inte
+  # alla distributioner) - leta upp den i stället för att gissa.
+  NOLOGIN=""
+  for _c in /usr/sbin/nologin /usr/bin/nologin /sbin/nologin; do
+    [ -x "$_c" ] && { NOLOGIN="$_c"; break; }
+  done
+  useradd --system --no-create-home --shell "${NOLOGIN:-/bin/false}" \
     --gid security-harbor security-harbor
 fi
 # _kea-gruppen skapas av kea-dhcp4-server-paketet (gateway-läge) - krävs
@@ -178,7 +297,9 @@ if [ -f /etc/suricata/suricata.yaml ]; then
   chgrp security-harbor /etc/suricata/suricata.yaml
   chmod g+w /etc/suricata/suricata.yaml
 fi
-if [ -d /etc/rsyslog.d ]; then
+# Bara när rsyslog faktiskt är installerat - syslog-vidarebefordran är en
+# VALFRI funktion och saknas t.ex. helt i Arch officiella repon.
+if [ "$HAVE_RSYSLOG" = "1" ] && [ -d /etc/rsyslog.d ]; then
   chgrp security-harbor /etc/rsyslog.d
   chmod g+ws /etc/rsyslog.d
 fi
@@ -213,7 +334,10 @@ fi
 # ligger också root:root efter paketinstallationen. Missades 2026-08-23:
 # /etc/unbound blev grupp-skrivbar men conf.d inte, så DNS-applicering failade
 # med "open .../security-harbor.conf: permission denied". Ta med conf.d i loopen.
-for d in /etc/kea /etc/unbound /etc/unbound/unbound.conf.d /etc/openvpn /etc/wireguard /etc/chrony/conf.d; do
+# /etc/chrony/conf.d på Debian, /etc/chrony.d på Arch - loopen hoppar över
+# den som inte finns.
+for d in /etc/kea /etc/unbound /etc/unbound/unbound.conf.d /etc/openvpn \
+         /etc/wireguard /etc/chrony/conf.d /etc/chrony.d; do
   if [ -d "$d" ]; then
     chgrp security-harbor "$d"
     chmod g+wx "$d"
@@ -273,32 +397,165 @@ if [ -d "$SCRIPT_DIR/webui" ]; then
   chown -R security-harbor:security-harbor "$DATA_DIR/webui"
 fi
 
-echo "=== 5. Genererar failsafe-regelsetet ==="
+echo "=== 5. Väljer nätverkskort ==="
+#
+# Kortvalet styr TVÅ saker som båda måste peka på samma fysiska kort:
+#   1) failsafe-regelsetet (WAN-sidan, gateway-läge)
+#   2) agentens seed-config, via --wan-device/--lan-device/--host-device
+#      på ExecStart nedan
+#
+# Fram till 2026-08-30 frågade installern bara efter WAN-kortet, och bara i
+# gateway-läge — seed-configen hade korten HÅRDKODADE ("eth0" i host-läge,
+# "ens18"/"ens19" i gateway-läge). Policyerna som släpper in SSH och
+# Management-API:t matchar på kortets namn via zonen, så på en maskin med
+# andra namn matchade de ingenting och maskinen låste ute sig själv så fort
+# agenten applicerade sin första config.
+
+# Bara FYSISKA kort. /sys/class/net/<namn>/device är symlänken till den
+# underliggande PCI-/USB-enheten och saknas för bryggor, veth, docker0,
+# tun/tap och wireguard - inget av dem är ett giltigt val här.
+list_physical_nics() {
+  for _n in $(ls /sys/class/net 2>/dev/null); do
+    [ "$_n" = "lo" ] && continue
+    [ -e "/sys/class/net/$_n/device" ] || continue
+    echo "$_n"
+  done
+}
+
+NICS="$(list_physical_nics)"
+NIC_COUNT="$(echo "$NICS" | grep -c .)"
+DEFAULT_NIC="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+
+if [ "$NIC_COUNT" -eq 0 ]; then
+  echo "FEL: hittade inga fysiska nätverkskort. Brandväggen kan inte" >&2
+  echo "     konfigureras utan minst ett kort." >&2
+  exit 1
+fi
+
+# Skriver ut korten numrerade, med IP och länkstatus. Ett kort utan
+# inkopplad sladd syns som "down"/utan IP - praktiskt när man installerar
+# innan WAN kopplas in. Kortet med default-rutten märks ut eftersom det per
+# definition är det man administrerar maskinen över just nu.
+print_nic_list() {
+  echo ""
+  echo "Nätverkskort på den här maskinen:"
+  _i=0
+  for _n in $NICS; do
+    _i=$((_i + 1))
+    _ip="$(ip -4 -o addr show dev "$_n" 2>/dev/null | awk '{print $4}' | paste -sd', ' -)"
+    _state="$(cat "/sys/class/net/$_n/operstate" 2>/dev/null || echo '?')"
+    _mark=""
+    [ "$_n" = "$DEFAULT_NIC" ] && _mark="  <- du är ansluten hit nu (default-rutt)"
+    printf "  [%d] %-12s %-20s [%s]%s\n" "$_i" "$_n" "${_ip:-(ingen IP)}" "$_state" "$_mark"
+  done
+  echo ""
+}
+
+# nic_by_index <nummer> - översätter ett listnummer till kortnamn. Tomt om
+# numret är utanför listan.
+nic_by_index() {
+  echo "$NICS" | sed -n "$1p"
+}
+
+# ask_nic <fråga> <förvalt kort> [kort att utesluta]
+# Svaret får vara antingen ett listnummer eller ett kortnamn. Sätter ASK_NIC.
+ask_nic() {
+  _prompt="$1"
+  _default="$2"
+  _exclude="$3"
+  if [ ! -r /dev/tty ]; then
+    echo "Ingen terminal tillgänglig - använder $_default" >&2
+    ASK_NIC="$_default"
+    return
+  fi
+  while :; do
+    read -r -p "$_prompt [${_default}]: " _ans </dev/tty
+    _ans="${_ans:-$_default}"
+    # Ett rent siffersvar tolkas som listnummer.
+    case "$_ans" in
+      ''|*[!0-9]*) : ;;
+      *) _byidx="$(nic_by_index "$_ans")"; [ -n "$_byidx" ] && _ans="$_byidx" ;;
+    esac
+    if ! echo "$NICS" | grep -qx "$_ans"; then
+      echo "  '$_ans' är inget av maskinens nätverkskort. Försök igen." >&2
+      continue
+    fi
+    if [ -n "$_exclude" ] && [ "$_ans" = "$_exclude" ]; then
+      echo "  '$_ans' är redan valt som WAN - WAN och LAN måste vara olika kort." >&2
+      continue
+    fi
+    ASK_NIC="$_ans"
+    return
+  done
+}
+
 if [ "$MODE" = "host" ]; then
+  if [ -z "$HOST_DEVICE" ]; then
+    if [ "$NIC_COUNT" -eq 1 ]; then
+      HOST_DEVICE="$NICS"
+      echo "-> Enda nätverkskortet: $HOST_DEVICE"
+    else
+      print_nic_list
+      echo "Host-läge skyddar EN dator. Välj det kort brandväggen ska gälla för"
+      echo "- normalt det du administrerar maskinen över."
+      ask_nic "Nätverkskort" "${DEFAULT_NIC:-$(nic_by_index 1)}"
+      HOST_DEVICE="$ASK_NIC"
+    fi
+  fi
+  if ! echo "$NICS" | grep -qx "$HOST_DEVICE"; then
+    echo "FEL: '$HOST_DEVICE' är inget fysiskt nätverkskort på den här maskinen." >&2
+    echo "     Tillgängliga: $(echo "$NICS" | paste -sd', ' -)" >&2
+    exit 1
+  fi
+  echo "-> Brandväggen gäller kortet: $HOST_DEVICE"
   cp "$SCRIPT_DIR/systemd/security-harbor-failsafe-host.nft.tmpl" "$CONF_DIR/security-harbor-failsafe.nft"
 else
-  if [ -z "$WAN_DEVICE" ]; then
-    DETECTED="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
-    # Lista nätverkskorten med namn, nuvarande IP och länkstatus så man ser
-    # vilket som är WAN (utsidan/internet). Ett WAN-kort utan inkopplad sladd
-    # syns som "down" / utan IP — praktiskt när man installerar innan WAN
-    # kopplas in.
-    echo ""
-    echo "Nätverkskort på den här servern:"
-    for IFACE in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
-      IPADDR="$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | paste -sd', ' -)"
-      STATE="$(cat "/sys/class/net/$IFACE/operstate" 2>/dev/null || echo '?')"
-      printf "  - %-12s %-20s [%s]\n" "$IFACE" "${IPADDR:-(ingen IP)}" "$STATE"
-    done
-    echo "(WAN = kortet mot internet/utsidan. Det som du administrerar brandväggen"
-    echo " genom, med serverns nuvarande IP, är LAN-sidan — välj INTE det som WAN.)"
-    echo ""
-    if [ -r /dev/tty ]; then
-      read -r -p "WAN-gränssnittets namn för failsafe-regelsetet [${DETECTED:-ens18}]: " WAN_DEVICE </dev/tty
-    fi
-    WAN_DEVICE="${WAN_DEVICE:-${DETECTED:-ens18}}"
+  if [ "$NIC_COUNT" -lt 2 ] && { [ -z "$WAN_DEVICE" ] || [ -z "$LAN_DEVICE" ]; }; then
+    echo "FEL: gateway-läge kräver minst två nätverkskort (WAN och LAN), hittade" >&2
+    echo "     $NIC_COUNT: $(echo "$NICS" | paste -sd', ' -)" >&2
+    echo "     Kör om med --mode=host för att bara skydda den här datorn." >&2
+    exit 1
   fi
-  echo "-> WAN-gränssnitt för failsafe: $WAN_DEVICE"
+  if [ -z "$WAN_DEVICE" ] || [ -z "$LAN_DEVICE" ]; then
+    print_nic_list
+    echo "WAN = kortet mot internet/utsidan."
+    echo "LAN = det interna nätet, och det du administrerar brandväggen genom."
+    if [ -n "$DEFAULT_NIC" ]; then
+      echo ""
+      echo "OBS: du är ansluten via $DEFAULT_NIC just nu. Väljer du det som WAN"
+      echo "     tappar du åtkomsten till brandväggen så fort den startar."
+    fi
+  fi
+  if [ -z "$WAN_DEVICE" ]; then
+    ask_nic "WAN-kort (mot internet)" "$(nic_by_index 1)"
+    WAN_DEVICE="$ASK_NIC"
+  fi
+  if [ -z "$LAN_DEVICE" ]; then
+    # Förval: det kort som INTE är WAN. Med exakt två kort är det entydigt.
+    _lan_default=""
+    for _n in $NICS; do
+      [ "$_n" = "$WAN_DEVICE" ] && continue
+      _lan_default="$_n"
+      break
+    done
+    [ -n "$DEFAULT_NIC" ] && [ "$DEFAULT_NIC" != "$WAN_DEVICE" ] && _lan_default="$DEFAULT_NIC"
+    ask_nic "LAN-kort (internt nät)" "$_lan_default" "$WAN_DEVICE"
+    LAN_DEVICE="$ASK_NIC"
+  fi
+  for _pair in "WAN:$WAN_DEVICE" "LAN:$LAN_DEVICE"; do
+    _role="${_pair%%:*}"; _dev="${_pair#*:}"
+    if ! echo "$NICS" | grep -qx "$_dev"; then
+      echo "FEL: $_role-kortet '$_dev' finns inte på den här maskinen." >&2
+      echo "     Tillgängliga: $(echo "$NICS" | paste -sd', ' -)" >&2
+      exit 1
+    fi
+  done
+  if [ "$WAN_DEVICE" = "$LAN_DEVICE" ]; then
+    echo "FEL: WAN och LAN kan inte vara samma kort ($WAN_DEVICE)." >&2
+    exit 1
+  fi
+  echo "-> WAN: $WAN_DEVICE"
+  echo "-> LAN: $LAN_DEVICE"
   sed "s/{{WAN_DEVICE}}/$WAN_DEVICE/g" \
     "$SCRIPT_DIR/systemd/security-harbor-failsafe-gateway.nft.tmpl" > "$CONF_DIR/security-harbor-failsafe.nft"
 fi
@@ -336,7 +593,7 @@ if [ -f "$SCRIPT_DIR/systemd/journald-security-harbor.conf" ]; then
   journalctl --vacuum-time=2weeks >/dev/null 2>&1 || true
 fi
 
-if [ -f "$SCRIPT_DIR/systemd/logrotate-suricata.conf" ] && [ -d /etc/logrotate.d ]; then
+if [ "$HAVE_SURICATA" = "1" ] && [ -f "$SCRIPT_DIR/systemd/logrotate-suricata.conf" ] && [ -d /etc/logrotate.d ]; then
   if [ -f /etc/logrotate.d/suricata ] && [ ! -f /etc/logrotate.d/suricata.security-harbor-orig ]; then
     cp /etc/logrotate.d/suricata /etc/logrotate.d/suricata.security-harbor-orig
   fi
@@ -362,7 +619,7 @@ fi
 # ligger i detect-motorn (52 000+ regler) och den enda riktiga hävstången där
 # är att minska regelsetet, vilket är ett säkerhetsbeslut installern inte ska
 # fatta åt någon.
-if [ -f "$SCRIPT_DIR/systemd/suricata-memory.conf.tmpl" ] && [ "$MODE" = "gateway" ]; then
+if [ "$HAVE_SURICATA" = "1" ] && [ -f "$SCRIPT_DIR/systemd/suricata-memory.conf.tmpl" ] && [ "$MODE" = "gateway" ]; then
   TOTAL_MB=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
   # MJUKT tak: stryper och återvinner, dödar inte.
   #
@@ -420,12 +677,56 @@ else
   echo "VARNING: hoppar över wait-online-drop-in (binären eller mallen saknas)." >&2
   echo "         Suricata kan då starta flera minuter efter boot." >&2
 fi
-if [ "$MODE" = "host" ] && ! grep -q -- '--mode=host' /etc/systemd/system/security-harbor-agent.service; then
-  # --mode styr bara SEEDNINGEN av en helt ny installation (se
-  # store.NewStore) - ofarligt att lämna kvar på ExecStart permanent,
-  # ignoreras efter första uppstarten. grep-vakten ovan gör detta
-  # idempotent (annars skulle en omkörning stapla på flaggan flera gånger).
-  sed -i 's|^ExecStart=/usr/local/bin/security-harbor-agent .*|& --mode=host|' \
+# SupplementaryGroups: filtrera bort grupper som inte finns på maskinen.
+# systemd är kompromisslös här - en enda okänd grupp gör att enheten inte
+# ens startar (status 216/GROUP, "Failed to determine supplementary groups"),
+# den hoppar inte över den. `_kea` skapas av Debians kea-dhcp4-server-paket
+# och finns inte alls på Arch, och inte heller i host-läge på Debian där Kea
+# aldrig installeras. Upptäckt 2026-08-30: agenten restartloopade oändligt på
+# en Arch-installation, utan att något i loggen pekade ut _kea som orsaken.
+AGENT_UNIT=/etc/systemd/system/security-harbor-agent.service
+SUPP_LINE="$(grep -m1 '^SupplementaryGroups=' "$AGENT_UNIT" 2>/dev/null || true)"
+if [ -n "$SUPP_LINE" ]; then
+  KEEP=""
+  DROPPED=""
+  for g in ${SUPP_LINE#SupplementaryGroups=}; do
+    if getent group "$g" >/dev/null 2>&1; then
+      KEEP="$KEEP $g"
+    else
+      DROPPED="$DROPPED $g"
+    fi
+  done
+  KEEP="${KEEP# }"
+  if [ -n "$DROPPED" ]; then
+    echo "-> Hoppar över okända grupper i SupplementaryGroups:$DROPPED"
+  fi
+  if [ -n "$KEEP" ]; then
+    sed -i "s|^SupplementaryGroups=.*|SupplementaryGroups=$KEEP|" "$AGENT_UNIT"
+  else
+    sed -i "s|^SupplementaryGroups=.*|# SupplementaryGroups: ingen av grupperna finns på den här maskinen|" "$AGENT_UNIT"
+  fi
+fi
+
+# Seed-flaggor på ExecStart: driftläge och de valda korten. De styr BARA
+# seedningen av en helt ny installation (se store.NewStore/SeedOptions) och
+# ignoreras när running.json redan finns - ofarliga att lämna kvar permanent.
+#
+# Enheten kopieras om från paketet vid varje installation, så raden byggs
+# alltid från grunden i stället för att lägga till flaggor på en befintlig.
+# Den tidigare varianten la på "--mode=host" med en grep-vakt; med fyra
+# flaggor blir det både ordkänsligt och lätt att stapla dubbletter.
+SEED_ARGS=""
+if [ "$MODE" = "host" ]; then
+  SEED_ARGS="--mode=host"
+  [ -n "$HOST_DEVICE" ] && SEED_ARGS="$SEED_ARGS --host-device=$HOST_DEVICE"
+else
+  [ -n "$WAN_DEVICE" ] && SEED_ARGS="$SEED_ARGS --wan-device=$WAN_DEVICE"
+  [ -n "$LAN_DEVICE" ] && SEED_ARGS="$SEED_ARGS --lan-device=$LAN_DEVICE"
+fi
+SEED_ARGS="${SEED_ARGS# }"
+if [ -n "$SEED_ARGS" ]; then
+  echo "-> Seed-argument till agenten: $SEED_ARGS"
+  sed -i "s|^ExecStart=/usr/local/bin/security-harbor-agent .*|ExecStart=/usr/local/bin/security-harbor-agent --data-dir $DATA_DIR $SEED_ARGS|" \
     /etc/systemd/system/security-harbor-agent.service
 fi
 systemctl daemon-reload
@@ -445,20 +746,71 @@ echo "=== 7. Startar (eller startar OM) tjänster ==="
 systemctl disable security-harbor-failsafe.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/multi-user.target.wants/security-harbor-failsafe.service
 systemctl enable security-harbor-failsafe.service
+
+# nf_tables måste vara laddad INNAN failsafe-enheten kör `nft -f`.
+# /etc/modules-load.d-filen ovan gäller först vid nästa boot, och till
+# skillnad från Debians nftables-paket laddar Arch-paketet ingen modul vid
+# installation. Utan detta dog failsafe med "Unable to initialize Netlink
+# socket: Protocol not supported" (upptäckt 2026-08-30 på Arch).
+if ! modprobe nf_tables 2>/dev/null; then
+  # Vanligaste orsaken på ett rullande system: kärnan har uppgraderats men
+  # maskinen har inte startats om, så /lib/modules för den KÖRANDE kärnan är
+  # borttagen och INGEN modul går att ladda. Felet har inget med Security
+  # Harbor att göra, men utan den här kontrollen syns det bara som ett
+  # obegripligt "Protocol not supported" från nft.
+  if [ ! -d "/lib/modules/$(uname -r)" ]; then
+    echo "" >&2
+    echo "FEL: /lib/modules/$(uname -r) saknas - kärnan har uppgraderats men" >&2
+    echo "     maskinen har inte startats om. Inga kärnmoduler (inklusive" >&2
+    echo "     nf_tables) går att ladda förrän du startat om." >&2
+    echo "" >&2
+    echo "     Starta om maskinen och kör installern igen." >&2
+    exit 1
+  fi
+  if ! grep -q nf_tables /proc/modules 2>/dev/null && [ ! -d /proc/sys/net/netfilter ]; then
+    echo "FEL: kunde inte ladda kärnmodulen nf_tables - brandväggen kan inte" >&2
+    echo "     sätta några regler på den här kärnan." >&2
+    exit 1
+  fi
+fi
 systemctl restart security-harbor-failsafe.service
 systemctl enable security-harbor-agent.service
 systemctl restart security-harbor-agent.service
-if [ "$MODE" = "gateway" ]; then
+if [ "$MODE" = "gateway" ] && [ "$HAVE_SURICATA" = "1" ]; then
   systemctl enable --now security-harbor-suricata-update.timer
   echo "=== 8. Hämtar initialt Suricata-regelset (ET Open) ==="
-  if ! suricata-update; then
-    echo "VARNING: suricata-update misslyckades (t.ex. inget nätverk just nu)." >&2
-    echo "Kör 'sudo suricata-update' manuellt senare, eller vänta på nästa schemalagda körning." >&2
+  if command -v suricata-update >/dev/null 2>&1; then
+    if ! suricata-update; then
+      echo "VARNING: suricata-update misslyckades (t.ex. inget nätverk just nu)." >&2
+      echo "Kör 'sudo suricata-update' manuellt senare, eller vänta på nästa schemalagda körning." >&2
+    fi
+  else
+    echo "VARNING: suricata är installerat men suricata-update saknas - IDS startar utan regelset." >&2
   fi
 fi
 
 echo ""
 echo "=== Installation klar (läge: $MODE) ==="
+
+# Valfria funktioner som INTE är tillgängliga på den här maskinen. Skrivs ut
+# sist så det är det sista man ser - annars är det lätt att missa varför
+# IDS-reglaget i GUI:t inte går att slå på.
+if [ "$HAVE_RSYSLOG" != "1" ] || { [ "$MODE" = "gateway" ] && [ "$HAVE_SURICATA" != "1" ]; }; then
+  echo ""
+  echo "Valfria funktioner som inte är tillgängliga här:"
+  if [ "$HAVE_RSYSLOG" != "1" ]; then
+    echo "  - Syslog-vidarebefordran (kräver rsyslog). All lokal loggning sker"
+    echo "    ändå i journald som vanligt; det som saknas är möjligheten att"
+    echo "    skicka loggarna vidare till en central syslog-mottagare."
+    [ "$PKG_FAMILY" = "arch" ] && \
+      echo "    På Arch: 'yay -S rsyslog' (AUR) och kör om installern."
+  fi
+  if [ "$MODE" = "gateway" ] && [ "$HAVE_SURICATA" != "1" ]; then
+    echo "  - IDS (kräver suricata + suricata-update)."
+    [ "$PKG_FAMILY" = "arch" ] && \
+      echo "    På Arch: 'yay -S suricata' (AUR) och kör om installern."
+  fi
+fi
 if [ "$MODE" = "host" ]; then
   echo "Management-gränssnitt: https://<den här datorns IP>:8443"
 else

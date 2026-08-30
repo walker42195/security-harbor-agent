@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -624,4 +625,53 @@ func hasDefaultRoute(device string) bool {
 		return false
 	}
 	return strings.TrimSpace(string(out)) != ""
+}
+
+// PhysicalDevices returnerar namnen på maskinens FYSISKA nätverkskort, i
+// stabil ordning (kärnans egen). Loopback, VLAN och rent virtuella kort
+// (bryggor, tun/tap, docker, veth, wireguard ...) filtreras bort — de är
+// aldrig ett giltigt val för WAN- eller LAN-sidan vid installation.
+//
+// Ett fysiskt kort känns igen på att /sys/class/net/<namn>/device finns:
+// den symlänken pekar på den underliggande PCI-/USB-enheten och saknas för
+// virtuella kort. Det är samma kriterium `ip link` använder för att skilja
+// dem åt, och det är oberoende av namnschema (eth0, ens18, enp1s0, wlan0).
+func PhysicalDevices() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, iface := range ifaces {
+		if (iface.Flags & net.FlagLoopback) != 0 {
+			continue
+		}
+		if strings.Contains(iface.Name, ".") {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join("/sys/class/net", iface.Name, "device")); err != nil {
+			continue
+		}
+		out = append(out, iface.Name)
+	}
+	return out
+}
+
+// DefaultRouteDevice returnerar det kort som default-rutten går ut genom,
+// eller "" om ingen default-rutt finns. På en maskin som administreras över
+// nätet är det per definition kortet man når den på, vilket gör det till det
+// enda säkra automatiska valet för WAN (gateway-läge) respektive för det
+// enda kortet (host-läge).
+func DefaultRouteDevice() string {
+	out, err := exec.Command("ip", "-4", "route", "show", "default").Output()
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(string(out))
+	for i, f := range fields {
+		if f == "dev" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
 }

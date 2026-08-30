@@ -79,6 +79,15 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 	// problemet först mitt i ett skarpt apply, efter att nftables redan
 	// ändrats.
 	if conf != "" {
+		// rsyslog är en VALFRI komponent: den finns inte i Arch officiella
+		// paketrepon (bara i AUR), och installern hoppar därför över den i
+		// stället för att fälla hela installationen (2026-08-30). Utan den
+		// här kontrollen upptäcktes det först vid `systemctl
+		// reload-or-restart rsyslog.service` längst ner, med ett
+		// felmeddelande som inte sa något om vad som faktiskt saknades.
+		if err := checkRsyslogInstalled(); err != nil {
+			return err
+		}
 		if err := checkDirWritable(a.dir); err != nil {
 			return err
 		}
@@ -110,6 +119,18 @@ func (a *Adapter) ApplyConfig(ctx context.Context, cfg *config.Config, dryRun bo
 
 	if out, err := exec.CommandContext(ctx, "systemctl", "reload-or-restart", "rsyslog.service").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl reload-or-restart rsyslog.service misslyckades: %w - output: %s", err, string(out))
+	}
+	return nil
+}
+
+// checkRsyslogInstalled verifierar att rsyslog över huvud taget finns på
+// maskinen. All LOKAL loggning sköts av journald oavsett — rsyslog behövs
+// bara för att vidarebefordra loggarna till en central mottagare.
+func checkRsyslogInstalled() error {
+	if _, err := exec.LookPath("rsyslogd"); err != nil {
+		return fmt.Errorf("syslog-vidarebefordran kan inte aktiveras: rsyslog är inte installerat på den här maskinen. " +
+			"Lokal loggning i journald påverkas inte. Installera rsyslog (Debian/Ubuntu: apt install rsyslog, " +
+			"Arch: finns bara i AUR, t.ex. yay -S rsyslog) och kör om installern")
 	}
 	return nil
 }

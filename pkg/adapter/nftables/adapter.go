@@ -592,6 +592,17 @@ func cidrsToSetElements(cidrs []string) []interface{} {
 // Loggprefixet följer samma konvention som policyreglerna
 // (SH-ACCEPT/DENY-INPUT-namn:), så parseFirewallLog i pkg/api plockar upp
 // dem utan ändring och de dyker upp i trafikloggen som allt annat.
+// sshPort är porten livlineregeln ovan öppnar. Konstant och inte
+// konfigurerbar: en livlina vars port kan ändras i samma GUI som kan göra
+// den obehövlig är ingen livlina. Flyttar man sshd till en annan port får
+// man öppna den med en vanlig policy.
+const sshPort = 22
+
+// sshLifelineComment identifierar livlineregeln i det renderade regelsetet.
+// Konstant (och inte bara en literal på plats) för att tester ska kunna
+// skilja den från policy-genererade SSH-regler.
+const sshLifelineComment = "Garanterad SSH-åtkomst (administratörens livlina, aldrig på WAN)"
+
 func implicitTail(accept bool, name string) []interface{} {
 	word := "DENY"
 	verdict := map[string]interface{}{"drop": nil}
@@ -867,6 +878,53 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 					},
 				},
 			}, implicitCounterOnly()...),
+		},
+	})
+
+	// Input 2.1: GARANTERAD SSH-åtkomst — administratörens livlina.
+	//
+	// Den här regeln byggs ALLTID, oberoende av policylistan, och ligger
+	// tidigt i INPUT så ingen senare Deny-policy kan hamna före den. Den
+	// finns för att en brandvägg aldrig ska kunna låsa ute den som
+	// administrerar den: policy-baserad SSH-åtkomst matchar via zonen på
+	// kortets NAMN, och varje sätt det kan bli fel på (fel kort i configen,
+	// ett kort som bytt namn efter en uppgradering, en raderad SSH-policy,
+	// en backup återställd på annan hårdvara) ger annars en maskin som bara
+	// går att rädda via konsolen. Hände skarpt 2026-08-30.
+	//
+	// Regeln uttrycks som "INTE på WAN" i stället för "på LAN-korten": då
+	// beror den inte alls på att LAN-kortens namn är rätt i configen, vilket
+	// är precis det som brukar vara fel när man behöver livlinan. I
+	// host-läge finns inget WAN alls och regeln blir därmed ovillkorlig —
+	// samma semantik som failsafe-regelsetet har före agenten startat (se
+	// systemd/security-harbor-failsafe-*.nft.tmpl), så åtkomsten ser likadan
+	// ut före och efter att agenten applicerat sin config.
+	//
+	// SSH exponeras alltså ALDRIG mot internet av den här regeln.
+	sshLifelineExpr := []interface{}{}
+	if len(wanDevices) > 0 {
+		sshLifelineExpr = append(sshLifelineExpr, map[string]interface{}{
+			"match": map[string]interface{}{
+				"op":    "!=",
+				"left":  map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}},
+				"right": map[string]interface{}{"set": wanDevices},
+			},
+		})
+	}
+	sshLifelineExpr = append(sshLifelineExpr, map[string]interface{}{
+		"match": map[string]interface{}{
+			"op":    "==",
+			"left":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "tcp", "field": "dport"}},
+			"right": sshPort,
+		},
+	})
+	root.Nftables = append(root.Nftables, NFTElement{
+		Rule: &Rule{
+			Family:  a.family,
+			Table:   a.tableName,
+			Chain:   "input",
+			Comment: sshLifelineComment,
+			Expr:    append(sshLifelineExpr, implicitTail(true, "SSH livlina")...),
 		},
 	})
 

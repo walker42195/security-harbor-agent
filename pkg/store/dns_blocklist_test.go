@@ -15,7 +15,7 @@ import (
 // praktiken kunde nå VILKEN katalog agenten alls har skrivrättighet till.
 func TestSaveDNSBlocklistDomainsRejectsPathTraversal(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, "")
+	s, err := NewStore(dir, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}

@@ -63,7 +63,7 @@ func craftBackupWithName(t *testing.T, passphrase, entryName string) []byte {
 
 func TestRestoreRejectsPathTraversal(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, "")
+	s, err := NewStore(dir, SeedOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestRestoreRejectsPathTraversal(t *testing.T) {
 }
 
 func TestBackupRequiresStrongPassphrase(t *testing.T) {
-	s, err := NewStore(t.TempDir(), "")
+	s, err := NewStore(t.TempDir(), SeedOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

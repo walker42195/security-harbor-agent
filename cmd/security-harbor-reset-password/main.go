@@ -23,7 +23,7 @@ func main() {
 		log.Fatal("--password krävs")
 	}
 
-	st, err := store.NewStore(*configDir, "")
+	st, err := store.NewStore(*configDir, store.SeedOptions{})
 	if err != nil {
 		log.Fatalf("Kunde inte öppna store: %v", err)
 	}

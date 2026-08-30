@@ -42,12 +42,11 @@ type Store struct {
 // första anropet på en ny installation, laddas därefter från disk. Ingen
 // hårdkodad/delad nyckel någonstans i källkoden längre.
 //
-// seedMode styr VILKEN standardkonfiguration som skapas om baseDir är
-// tom (helt ny installation) — config.ModeGateway (eller "") för en
-// router/appliance-seed, config.ModeHost för enkortsdator-seed (Fas 13).
-// Rör bara den allra första uppstarten; en redan initierad installation
-// läser sin befintliga running.json oavsett vad som skickas in här.
-func NewStore(baseDir string, seedMode string) (*Store, error) {
+// seed styr VILKEN standardkonfiguration som skapas om baseDir är tom
+// (helt ny installation). Rör bara den allra första uppstarten; en redan
+// initierad installation läser sin befintliga running.json oavsett vad som
+// skickas in här.
+func NewStore(baseDir string, seed SeedOptions) (*Store, error) {
 	if err := os.MkdirAll(baseDir, 0700); err != nil {
 		return nil, fmt.Errorf("misslyckades skapa store-katalog %s: %w", baseDir, err)
 	}
@@ -68,7 +67,7 @@ func NewStore(baseDir string, seedMode string) (*Store, error) {
 	}
 
 	// Ladda eller skapa standardkonfiguration
-	if err := s.loadOrInit(seedMode); err != nil {
+	if err := s.loadOrInit(seed); err != nil {
 		return nil, err
 	}
 
@@ -81,7 +80,7 @@ func NewStore(baseDir string, seedMode string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) loadOrInit(seedMode string) error {
+func (s *Store) loadOrInit(seed SeedOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -97,7 +96,7 @@ func (s *Store) loadOrInit(seedMode string) error {
 	// första GUI-ändringen, men fönstret dessförinnan var verkligt.)
 	runningPath := filepath.Join(s.baseDir, "running.json")
 	if _, err := os.Stat(runningPath); os.IsNotExist(err) {
-		defaultCfg := defaultSeedConfig(seedMode)
+		defaultCfg := defaultSeedConfig(seed)
 		adoptSystemAddressing(defaultCfg)
 		s.runningCfg = defaultCfg
 		s.candidateCfg = cloneConfig(defaultCfg)
@@ -221,7 +220,74 @@ func cloneConfig(cfg *config.Config) *config.Config {
 // matcha 10.0.0.163) av bakåtkompatibilitetsskäl — host-läge (Fas 13) får
 // ett genuint topologi-neutralt seed: ett enda, generiskt namngivet
 // interface, ingen WAN/LAN-uppdelning, ingen hårdkodad IP.
-func defaultSeedConfig(seedMode string) *config.Config {
+// SeedOptions är de val installationen gör åt en HELT NY installation:
+// driftläge och vilka fysiska nätverkskort seed-configen ska peka på.
+//
+// Korten är det som gör skillnaden mellan en brandvägg som går att nå och
+// en som låser ute administratören. Fram till 2026-08-30 var de hårdkodade
+// ("eth0" i host-läge, "ens18"/"ens19" i gateway-läge). Policyerna som
+// släpper in SSH och Management-API:t matchar på `iifname` via zonen, så på
+// varje maskin vars kort INTE råkade heta så matchade de ingenting alls och
+// default-policyn drop tog all trafik — maskinen låste ute sig själv i samma
+// sekund som agenten applicerade sin första config. Bekräftat skarpt på en
+// Arch-installation i host-läge (kortet hette ens18).
+//
+// Tomma fält betyder "detektera": se resolveSeedDevices.
+type SeedOptions struct {
+	Mode       string // config.ModeGateway ("" = gateway) eller config.ModeHost
+	WANDevice  string // gateway-läge: kortet mot internet
+	LANDevice  string // gateway-läge: kortet mot det interna nätet
+	HostDevice string // host-läge: maskinens enda kort
+}
+
+// resolveSeedDevices bestämmer vilka kort seed-configen ska peka på när
+// installationen inte angett dem explicit (t.ex. en agent som startas för
+// hand, eller en äldre installer). Att gissa ett namn är inte ett alternativ
+// — se kommentaren på SeedOptions — så vi läser av maskinen.
+//
+// Ordningen är vald för att det ALLTID ska gå att nå brandväggen efteråt:
+// kortet med default-rutten är per definition det man administrerar maskinen
+// över just nu, så det blir WAN i gateway-läge och det enda kortet i
+// host-läge. Först därefter fylls resten på i kärnans ordning.
+func resolveSeedDevices(seed SeedOptions) (hostDev, wanDev, lanDev string) {
+	physical := network.PhysicalDevices()
+	defaultDev := network.DefaultRouteDevice()
+
+	pick := func(explicit string, exclude ...string) string {
+		if explicit != "" {
+			return explicit
+		}
+		skip := func(name string) bool {
+			for _, e := range exclude {
+				if e == name {
+					return true
+				}
+			}
+			return false
+		}
+		if defaultDev != "" && !skip(defaultDev) {
+			return defaultDev
+		}
+		for _, d := range physical {
+			if !skip(d) {
+				return d
+			}
+		}
+		return ""
+	}
+
+	hostDev = pick(seed.HostDevice)
+	wanDev = pick(seed.WANDevice)
+	lanDev = pick(seed.LANDevice, wanDev)
+
+	// Sista utväg: hellre ett tomt device (som syns direkt i GUI:t som ett
+	// okonfigurerat kort) än ett påhittat namn som tyst matchar ingenting.
+	log.Printf("[INIT] Seed-kort: host=%q wan=%q lan=%q (fysiska: %v, default-rutt: %q)",
+		hostDev, wanDev, lanDev, physical, defaultDev)
+	return hostDev, wanDev, lanDev
+}
+
+func defaultSeedConfig(seed SeedOptions) *config.Config {
 	base := config.Config{
 		Version:   1,
 		Revision:  1,
@@ -266,10 +332,12 @@ func defaultSeedConfig(seedMode string) *config.Config {
 		},
 	}
 
-	if seedMode == config.ModeHost {
+	hostDev, wanDev, lanDev := resolveSeedDevices(seed)
+
+	if seed.Mode == config.ModeHost {
 		base.Settings.Mode = config.ModeHost
 		base.Interfaces = []config.Interface{
-			{ID: "host0", Device: "eth0", Zone: "HOST", Enabled: true, AddressType: "dhcp"},
+			{ID: "host0", Device: hostDev, Zone: "HOST", Enabled: true, AddressType: "dhcp"},
 		}
 		base.Zones = []config.Zone{
 			{Name: "HOST", Description: "Denna dators enda gränssnitt"},
@@ -283,14 +351,14 @@ func defaultSeedConfig(seedMode string) *config.Config {
 	}
 
 	base.Interfaces = []config.Interface{
-		{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+		{ID: "wan0", Device: wanDev, Zone: "WAN", Enabled: true, AddressType: "dhcp"},
 		// Adresstyperna här är bara ett utgångsläge: adoptSystemAddressing
 		// skriver över dem med vad korten FAKTISKT är inställda på innan
 		// configen sparas första gången. En hårdkodad statisk IP hade annars
 		// varit en fälla — ett Apply hade flyttat lådan dit och kapat
 		// administratörens anslutning — medan ett hårdkodat "dhcp" lika tyst
 		// hade kastat bort en redan satt statisk management-adress.
-		{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "dhcp"},
+		{ID: "lan0", Device: lanDev, Zone: "LAN", Enabled: true, AddressType: "dhcp"},
 	}
 	base.Zones = []config.Zone{
 		{Name: "WAN", Description: "Utsida / Internet"},

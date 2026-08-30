@@ -10,7 +10,7 @@ import (
 
 func TestBackupRestoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, "")
+	s, err := NewStore(dir, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	// Återställ i en NY store-katalog med en ANNAN master-nyckel, för att
 	// verifiera att backupen är portabel oavsett master-nyckel-skillnad.
 	dir2 := t.TempDir()
-	s2, err := NewStore(dir2, "")
+	s2, err := NewStore(dir2, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore (mål) misslyckades: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 
 	// running.json ska nu finnas i mål-katalogen med rätt innehåll.
-	restored, err := NewStore(dir2, "")
+	restored, err := NewStore(dir2, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore (läs tillbaka) misslyckades: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 
 func TestRestoreWrongPassphraseFails(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, "")
+	s, err := NewStore(dir, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestRestoreWrongPassphraseFails(t *testing.T) {
 	}
 
 	dir2 := t.TempDir()
-	s2, err := NewStore(dir2, "")
+	s2, err := NewStore(dir2, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestRestoreWrongPassphraseFails(t *testing.T) {
 
 func TestRestoreGarbageDataFails(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, "")
+	s, err := NewStore(dir, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestRestoreGarbageDataFails(t *testing.T) {
 
 func TestFactoryResetRemovesStateKeepsAuditLog(t *testing.T) {
 	dir := t.TempDir()
-	s, err := NewStore(dir, "")
+	s, err := NewStore(dir, SeedOptions{})
 	if err != nil {
 		t.Fatalf("NewStore misslyckades: %v", err)
 	}

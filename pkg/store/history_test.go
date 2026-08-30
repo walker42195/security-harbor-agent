@@ -7,7 +7,7 @@ import (
 // Historiken ska hålla exakt de tre senaste BEKRÄFTADE konfigurationerna,
 // nyast först, och gallra äldre automatiskt.
 func TestConfigHistoryKeepsLastThree(t *testing.T) {
-	s, err := NewStore(t.TempDir(), "")
+	s, err := NewStore(t.TempDir(), SeedOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestConfigHistoryKeepsLastThree(t *testing.T) {
 // ID:t kommer från klienten och byggs till en filsökväg — sökvägstraversering
 // måste avvisas.
 func TestLoadHistoricConfigRejectsTraversal(t *testing.T) {
-	s, err := NewStore(t.TempDir(), "")
+	s, err := NewStore(t.TempDir(), SeedOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

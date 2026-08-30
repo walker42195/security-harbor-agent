@@ -64,9 +64,9 @@ type Engine struct {
 	// ta den stora engine-mutexen i båda vore att låta en realtidsvy vänta på
 	// en pågående konfigurationsapplicering.
 	trafficLiveUntil atomic.Int64
-	inventory    *traffic.Inventory
-	catStore     *traffic.CategoryStore
-	eveReader    *traffic.EveReader
+	inventory        *traffic.Inventory
+	catStore         *traffic.CategoryStore
+	eveReader        *traffic.EveReader
 
 	// idsLastAlertTS håller den senaste larm-tidsstämpeln vi redan hanterat
 	// för auto-block (Fas 9), så samma larm inte blockeras om och om igen.
@@ -626,6 +626,30 @@ func (e *Engine) GetDHCPLeases() ([]dhcp.LeaseDetail, error) {
 // återskapa det tillstånd som redan var bekräftat innan omstarten.
 func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
 	running := e.store.GetRunningConfig()
+
+	// Skyddsnät mot självutlåsning. Policyerna som släpper in SSH och
+	// Management-API:t matchar på kortets NAMN (via zonen -> iifname). Pekar
+	// configen ut kort som inte finns på maskinen matchar de reglerna noll
+	// paket, och default-policyn drop tar all trafik - inklusive
+	// administratörens egen anslutning. Enda vägen tillbaka är då konsolen.
+	//
+	// Hände skarpt 2026-08-30: seed-configen hade "eth0" hårdkodat i
+	// host-läge och maskinens kort hette ens18. Roten är fixad (korten väljs
+	// vid installation, se store.SeedOptions), men en config kan bli fel även
+	// på andra sätt - ett kort som bytt namn efter en hårdvaru- eller
+	// kärnuppgradering, eller en backup återställd på annan hårdvara.
+	//
+	// Att INTE applicera är det säkra valet: failsafe-regelsetet ligger redan
+	// laddat och släpper in SSH + Management-API, så maskinen går att nå och
+	// rätta till via GUI:t.
+	if missing := missingConfiguredDevices(running); missing != nil {
+		log.Printf("[VARNING] Hoppar över boot-applicering: inget av de konfigurerade "+
+			"nätverkskorten finns på maskinen (%v). Failsafe-regelsetet ligger kvar, "+
+			"så SSH och Management-API:t är fortfarande nåbara. Rätta korten i GUI:t "+
+			"under Nätverk och applicera om.", missing)
+		return nil
+	}
+
 	// prevCfg=nil → ingen tidigare konfiguration att jämföra med. Då avgör
 	// systemets faktiska tillstånd vilka kort som behöver röras: de som redan
 	// stämmer lämnas orörda, de som glidit ifrån konfigurationen (t.ex. en
@@ -636,6 +660,35 @@ func (e *Engine) ApplyRunningConfigAtBoot(ctx context.Context) error {
 	// atBoot=true: gränssnitten konfigurerades precis om ovan, så tjänster
 	// som binder mot dem måste startas om även om deras konfig är oförändrad.
 	return e.applyBackends(ctx, running, false, true)
+}
+
+// missingConfiguredDevices returnerar de konfigurerade device-namnen när
+// INGET av dem finns på maskinen — alltså det läge där en applicering
+// garanterat låser ute administratören. Returnerar nil så fort minst ett kort
+// matchar: en config med ett trasigt kort av flera är ett vanligt (och
+// åtgärdbart) driftläge som inte ska blockera boot-applicering.
+//
+// VLAN-kort räknas inte: de skapas av agenten själv och finns per definition
+// inte innan appliceringen körts.
+func missingConfiguredDevices(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	present := map[string]bool{}
+	for _, d := range network.PhysicalDevices() {
+		present[d] = true
+	}
+	var missing []string
+	for _, iface := range cfg.Interfaces {
+		if !iface.Enabled || iface.VLANID > 0 || iface.Device == "" {
+			continue
+		}
+		if present[iface.Device] {
+			return nil
+		}
+		missing = append(missing, iface.Device)
+	}
+	return missing
 }
 
 // UpdateIDSRuleSelection sparar regelurvalet och startar om regeluppdateringen
