@@ -1996,6 +1996,18 @@ func (e *Engine) RestoreConfigFromHistory(id, user string) (*config.Config, erro
 // brandväggsregler och byta till en statisk adress i lugn och ro — inte
 // mötas av ett Apply som vägrar gå igenom.
 func lanDHCPWarnings(cfg *config.Config) []BackendWarning {
+	// Host-läge: varningen bygger på att brandväggen delar ut sin egen adress
+	// till KLIENTER som gateway och DNS. En värddator-brandvägg skyddar en
+	// enda dator och har inga klienter — där är DHCP på kortet det normala,
+	// och varningen bara brus som inte går att åtgärda.
+	//
+	// Zon-undantaget nedan räckte inte: ett kort som lagts till i efterhand
+	// hamnar i zon LAN (en zon som inte ens finns i host-lägets zonlista) och
+	// utlöste varningen ändå. Rapporterat 2026-08-30 med en host-installation
+	// som visade "Gränssnittet ens18 (zon LAN) hämtar sin adress via DHCP".
+	if cfg.IsHostMode() {
+		return nil
+	}
 	var out []BackendWarning
 	for _, iface := range cfg.Interfaces {
 		if !iface.Enabled || iface.AddressType != "dhcp" {
