@@ -30,6 +30,17 @@ DATA_DIR="/var/lib/security-harbor"
 CONF_DIR="/etc/security-harbor"
 BIN_DIR="/usr/local/bin"
 
+# have_tty svarar på om skriptet kan ställa en interaktiv fråga.
+#
+# `[ -r /dev/tty ]` är FEL test och var orsaken till att självuppdateringen
+# kraschade i 0.45.0/0.45.1: i en systemd-tjänst finns enhetsnoden /dev/tty och
+# är läsbar för root, men processen har ingen KONTROLLERANDE terminal, så
+# open() ger ENXIO ("No such device or address") och `read </dev/tty` dör. Det
+# enda tillförlitliga testet är att faktiskt försöka öppna den.
+have_tty() {
+	(exec 3</dev/tty) 2>/dev/null
+}
+
 MODE=""
 WAN_DEVICE=""
 LAN_DEVICE=""
@@ -84,7 +95,7 @@ done
 
 # --- Läge: router (gateway) eller denna dator (host)? ---
 if [ -z "$MODE" ]; then
-  if [ -r /dev/tty ]; then
+  if have_tty; then
     echo ""
     echo "Vilken typ av installation är det här?"
     echo "  [1] Router/brandvägg (flera nätverkskort, WAN+LAN, DHCP/NAT/VPN/IDS)"
@@ -399,6 +410,39 @@ fi
 
 echo "=== 5. Väljer nätverkskort ==="
 #
+# UPPGRADERING: korten är redan valda en gång och ska inte frågas om igen.
+# Läs dem ur den installerade enhetens ExecStart (dit steg 6 skrev dem).
+#
+# Det här är inte bara bekvämlighet: självuppdateringen kör install.sh från en
+# systemd-oneshot utan terminal, och en fråga där kraschar hela uppdateringen.
+# Precis det hände i 0.45.0/0.45.1 — update-runner.sh skickar `--mode=host`
+# men inget kortval, steg 5 nedan frågade, och `read </dev/tty` dog med
+# "No such device or address". Att lita på att anroparen skickar rätt flaggor
+# räcker inte: update-runner.sh på en REDAN installerad maskin är den GAMLA
+# versionen, medan install.sh kommer från den nya bunten. install.sh måste
+# alltså klara sig själv.
+AGENT_UNIT_INSTALLED=/etc/systemd/system/security-harbor-agent.service
+if [ -f "$AGENT_UNIT_INSTALLED" ]; then
+  PREV_EXEC="$(grep -m1 '^ExecStart=' "$AGENT_UNIT_INSTALLED" 2>/dev/null || true)"
+  # OBS: "--" måste stå EFTER -oE och före mönstret, annars tolkar grep
+  # mönstret "--host-device=..." som flaggor. Att skicka "--" som ett eget
+  # argument till funktionen gjorde att $1 blev "--" och mönstret matchade
+  # aldrig något - uppgraderingen föll då tillbaka på auto-detektering i
+  # stället för att behålla det valda kortet.
+  prev_flag() {
+    # "|| true": grep returnerar 1 när flaggan saknas (host-läge har ingen
+    # --wan-device, och en pre-0.45.0-installation har inga alls). Skriptet
+    # kör med set -e, så ett oskyddat fel här hade avbrutit installationen.
+    printf '%s' "$PREV_EXEC" | grep -oE -- "$1=[^ ]+" | head -1 | cut -d= -f2 || true
+  }
+  [ -z "$HOST_DEVICE" ] && HOST_DEVICE="$(prev_flag --host-device)"
+  [ -z "$WAN_DEVICE" ] && WAN_DEVICE="$(prev_flag --wan-device)"
+  [ -z "$LAN_DEVICE" ] && LAN_DEVICE="$(prev_flag --lan-device)"
+  if [ -n "$HOST_DEVICE$WAN_DEVICE$LAN_DEVICE" ]; then
+    echo "-> Uppgradering: behåller tidigare kortval från den installerade enheten."
+  fi
+fi
+#
 # Kortvalet styr TVÅ saker som båda måste peka på samma fysiska kort:
 #   1) failsafe-regelsetet (WAN-sidan, gateway-läge)
 #   2) agentens seed-config, via --wan-device/--lan-device/--host-device
@@ -463,7 +507,7 @@ ask_nic() {
   _prompt="$1"
   _default="$2"
   _exclude="$3"
-  if [ ! -r /dev/tty ]; then
+  if ! have_tty; then
     echo "Ingen terminal tillgänglig - använder $_default" >&2
     ASK_NIC="$_default"
     return

@@ -61,12 +61,29 @@ if grep -q -- '--mode=host' /etc/systemd/system/security-harbor-agent.service 2>
     MODE="host"
 fi
 INSTALL_ARGS=("--mode=$MODE")
+
+# Kortvalen: läs dem ur den installerade enhetens ExecStart (dit install.sh
+# skrev dem vid förra installationen) och skicka vidare. Den nya install.sh
+# klarar sig även utan detta - den läser samma rad själv - men en uppdatering
+# ska inte förlita sig på att motparten är ny nog.
+PREV_EXEC="$(grep -m1 '^ExecStart=' /etc/systemd/system/security-harbor-agent.service 2>/dev/null || true)"
+for _flag in --host-device --wan-device --lan-device; do
+    # "|| true": skriptet kör med `set -euo pipefail`, och grep returnerar 1
+    # när flaggan inte finns i ExecStart-raden (helt normalt - host-läge har
+    # ingen --wan-device). Utan detta dog uppdateringen tyst just där.
+    _val="$(printf '%s' "$PREV_EXEC" | grep -oE -- "$_flag=[^ ]+" | head -1 | cut -d= -f2 || true)"
+    [ -n "$_val" ] && INSTALL_ARGS+=("$_flag=$_val")
+done
+
 if [ "$MODE" = "gateway" ]; then
     WAN_DEV="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
     if [ -z "$WAN_DEV" ] && [ -f /etc/security-harbor/security-harbor-failsafe.nft ]; then
         WAN_DEV="$(grep -oE 'iifname "[^"]+"' /etc/security-harbor/security-harbor-failsafe.nft 2>/dev/null | head -1 | sed -E 's/iifname "([^"]+)"/\1/')"
     fi
-    [ -n "$WAN_DEV" ] && INSTALL_ARGS+=("--wan-device=$WAN_DEV")
+    # Bara om vi inte redan fick den ur ExecStart ovan.
+    if [ -n "$WAN_DEV" ] && [[ ! " ${INSTALL_ARGS[*]} " == *" --wan-device="* ]]; then
+        INSTALL_ARGS+=("--wan-device=$WAN_DEV")
+    fi
 fi
 
 log "kör install.sh --mode=$MODE (idempotent uppdatering av binärer, webb-GUI, systemd)..."
