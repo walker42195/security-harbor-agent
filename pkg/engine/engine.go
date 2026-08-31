@@ -833,6 +833,7 @@ func (e *Engine) ValidateCandidate(ctx context.Context, cfg *config.Config) erro
 	if err := validatePolicies(cfg); err != nil {
 		return err
 	}
+	warnIfNoSSHAccess(cfg)
 	if err := validateSNIRoutes(cfg); err != nil {
 		return err
 	}
@@ -969,6 +970,45 @@ func findPolicyByID(policies []config.Policy, id string) (config.Policy, bool) {
 		}
 	}
 	return config.Policy{}, false
+}
+
+// warnIfNoSSHAccess loggar när ingen aktiverad policy släpper in SSH till
+// brandväggen själv. VARNAR bara — den blockerar inte, för det är ett
+// fullt legitimt val att administrera enbart via GUI:t eller konsolen.
+//
+// Fram till 2026-08-31 byggde nftables-adaptern en implicit "Garanterad
+// SSH-åtkomst" som öppnade tcp/22 från ALLA interna kort oavsett
+// policylistan. Den är borta: SSH styrs nu enbart av policyerna. Den som
+// hade raderat eller begränsat sin SSH-policy och ändå kom in tack vare den
+// implicita regeln ska få veta att vägen stängs vid nästa Apply, i stället
+// för att upptäcka det när anslutningen dör.
+func warnIfNoSSHAccess(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	for _, pol := range cfg.Policies {
+		if !pol.Local || !pol.Enabled {
+			continue
+		}
+		action := pol.Action
+		if action == "" {
+			action = config.ActionAccept
+		}
+		if action != config.ActionAccept {
+			continue
+		}
+		// Tjänstefältet kan vara "22", "tcp/22", "22,443" eller ett
+		// tjänsteobjekt. En grov kontroll räcker för en varning: hellre
+		// tyst i ett gränsfall än en varning som skriker i onödan.
+		for _, part := range strings.Split(pol.Service, ",") {
+			part = strings.TrimSpace(part)
+			if part == "22" || strings.HasSuffix(part, ":22") || strings.HasSuffix(part, "/22") {
+				return
+			}
+		}
+	}
+	log.Printf("[SSH] Ingen aktiverad policy tillåter SSH (tcp/22) till brandväggen. " +
+		"Administration sker via GUI:t eller konsolen tills en sådan policy läggs till.")
 }
 
 func validatePolicies(cfg *config.Config) error {

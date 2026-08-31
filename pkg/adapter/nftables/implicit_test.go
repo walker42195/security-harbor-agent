@@ -32,7 +32,6 @@ func TestImplicitRulesMatchRendered(t *testing.T) {
 	commentFor := map[string]string{
 		"Loopback":                "Allow loopback",
 		"Etablerade anslutningar": "Allow established/related connections",
-		"Garanterad SSH-åtkomst":  sshLifelineComment,
 		"WireGuard VPN":           "Allow WireGuard",
 		"OpenVPN":                 "Allow OpenVPN",
 		"WAN Drop":                "HARD WAN DROP",
@@ -106,8 +105,7 @@ func TestImplicitRulesMatchRendered(t *testing.T) {
 	// 2. Ingen implicit regel saknar beskrivning. Policyregler har sina egna
 	// namn som kommentar och räknas inte hit.
 	for _, c := range inputComments {
-		if !strings.HasPrefix(c, "Allow ") && !strings.HasPrefix(c, "HARD ") &&
-			!strings.HasPrefix(c, sshLifelineComment) {
+		if !strings.HasPrefix(c, "Allow ") && !strings.HasPrefix(c, "HARD ") {
 			continue
 		}
 		matched := false

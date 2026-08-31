@@ -155,12 +155,6 @@ func inputRulesFor(t *testing.T, cfg *config.Config, comment string) []Rule {
 	t.Helper()
 	var out []Rule
 	for _, r := range renderRules(t, cfg) {
-		// Livlineregeln (garanterad SSH-åtkomst) byggs alltid, oberoende av
-		// policylistan, och ska inte räknas som en policy-genererad regel av
-		// testerna här — de handlar om hur POLICYER renderas.
-		if r.Comment == sshLifelineComment {
-			continue
-		}
 		if r.Chain == "input" && strings.Contains(r.Comment, comment) {
 			out = append(out, r)
 		}
