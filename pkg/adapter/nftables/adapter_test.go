@@ -1504,3 +1504,43 @@ func TestRenderJSONDNSFloodMeter(t *testing.T) {
 		t.Errorf("accept-regeln ska finnas även med flodskydd av")
 	}
 }
+
+// TestRenderJSONVPNAutoBlockOrder verifierar att VPN-auto-block-dropen renderas
+// FÖRE WireGuard-accepten i input (annars släpps angriparen in först), samt att
+// WireGuard-flodskyddets meter finns med. Objektet måste ha minst en post.
+func TestRenderJSONVPNAutoBlockOrder(t *testing.T) {
+	cfg := &config.Config{
+		Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.5.5.1/24"},
+		},
+		WireGuard: &config.WireGuardConfig{Enabled: true, ListenPort: 51820},
+		Objects:   []config.Object{{ID: "obj-vpn-autoblock", Name: "VPN - Auto block", Type: config.ObjectTypeIPList, Values: []string{"203.0.113.7"}}},
+		Policies:  []config.Policy{{ID: "sys-vpn-autoblock-deny", Enabled: true, DestZone: "ANY", SourceObj: "obj-vpn-autoblock", DestObj: "ANY", Service: "ANY", Action: config.ActionDrop, Logging: true}},
+		Settings:  config.Settings{APIPort: 8443},
+	}
+	data, err := NewAdapter().RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	s := string(data)
+	drop := strings.Index(s, "VPN auto-block (WAN brute-force) — drop before VPN accepts")
+	wgMeter := strings.Index(s, "WireGuard flood-skydd")
+	wgAccept := strings.Index(s, "Allow WireGuard (UDP 51820)")
+	if drop < 0 || wgAccept < 0 || wgMeter < 0 {
+		t.Fatalf("saknar regler: drop=%d meter=%d accept=%d", drop, wgMeter, wgAccept)
+	}
+	if !(drop < wgAccept) {
+		t.Errorf("VPN-auto-block-dropen (%d) måste ligga före WireGuard-accepten (%d)", drop, wgAccept)
+	}
+	if !(wgMeter < wgAccept) {
+		t.Errorf("WireGuard-flodmetern (%d) måste ligga före accepten (%d)", wgMeter, wgAccept)
+	}
+	// Tomt objekt → ingen drop-regel (undviker att en påslagen men tom regel råkar matcha allt)
+	cfg.Objects[0].Values = nil
+	data2, _ := NewAdapter().RenderJSON(cfg)
+	if strings.Contains(string(data2), "VPN auto-block (WAN brute-force) — drop before") {
+		t.Error("tomt objekt ska inte ge någon VPN-auto-block-drop")
+	}
+}

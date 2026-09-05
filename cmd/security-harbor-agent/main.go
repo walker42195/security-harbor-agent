@@ -203,6 +203,25 @@ func main() {
 				}
 			}
 		}()
+
+		// VPN-auto-block (WAN): tailar OpenVPN-journalen och blockerar käll-IP:n
+		// som upprepat misslyckas autentisera. Samma "eftersläpande"-mönster.
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-idsCtx.Done():
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(idsCtx, 20*time.Second)
+					if err := eng.ProcessVPNAutoBlock(ctx); err != nil {
+						log.Printf("[vpn-autoblock] misslyckades: %v", err)
+					}
+					cancel()
+				}
+			}
+		}()
 	}
 
 	stopChan := make(chan os.Signal, 1)

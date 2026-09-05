@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -74,6 +76,11 @@ type Engine struct {
 	// engine-tillståndet) — värsta fallet efter en omstart är att de senast
 	// hanterade larmen bedöms på nytt, inte att något missas.
 	idsLastAlertTS string
+
+	// VPN-auto-block (WAN): räknar misslyckade OpenVPN-auth per käll-IP och
+	// håller journal-markören så samma rader inte räknas om. Se ProcessVPNAutoBlock.
+	vpnFailCounts    map[string]int
+	vpnJournalCursor string
 
 	// degradedBackends håller icke-blockerande fel från senaste applyBackends
 	// (t.ex. att Suricata inte kunde starta). Se applyBackends för
@@ -2074,4 +2081,104 @@ func lanDHCPWarnings(cfg *config.Config) []BackendWarning {
 // DeleteDHCPLease frigör en aktiv DHCP-lease via Kea:s kommandokanal.
 func (e *Engine) DeleteDHCPLease(ctx context.Context, ip string) error {
 	return e.dhcpAdapter.DeleteLease(ctx, ip)
+}
+
+// vpnFailRe matchar rader i OpenVPN-loggen som indikerar ett misslyckat auth-/
+// TLS-försök. vpnIPv4Re plockar käll-IP:t (första IPv4 i raden — timestamp och
+// hostname innehåller ingen IPv4, klientens adress kommer först i meddelandet).
+var vpnFailRe = regexp.MustCompile(`TLS Error|VERIFY ERROR|TLS handshake failed|AUTH_FAILED|Auth failed|tls-crypt unwrap error|HMAC authentication failed|Bad LZO decompression|CRYPTO error`)
+var vpnIPv4Re = regexp.MustCompile(`\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b`)
+
+// ProcessVPNAutoBlock läser OpenVPN-journalen sedan senast (via journal-markör)
+// och lägger käll-IP:n som upprepat (>= store.VPNAutoBlockThreshold) misslyckats
+// autentisera i objektet som sys-vpn-autoblock-deny pekar på — permanent, tills
+// en administratör tar bort dem. Blockeringen är PÅ som standard; stängs av
+// genom att inaktivera policyn. Kallas periodiskt från main.go.
+func (e *Engine) ProcessVPNAutoBlock(ctx context.Context) error {
+	cfg := e.store.GetRunningConfig()
+	if cfg == nil {
+		return nil
+	}
+	var objID string
+	enabled := false
+	for _, p := range cfg.Policies {
+		if p.ID == "sys-vpn-autoblock-deny" {
+			enabled = p.Enabled
+			objID = p.SourceObj
+			break
+		}
+	}
+	if !enabled || objID == "" {
+		return nil
+	}
+	var values []string
+	found := false
+	for i := range cfg.Objects {
+		if cfg.Objects[i].ID == objID {
+			values = append(values, cfg.Objects[i].Values...)
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil
+	}
+	blocked := map[string]bool{}
+	for _, ip := range values {
+		blocked[ip] = true
+	}
+	if e.vpnFailCounts == nil {
+		e.vpnFailCounts = map[string]int{}
+	}
+
+	args := []string{"-u", "openvpn@sh-server.service", "--no-pager", "-o", "short-iso", "--show-cursor"}
+	if e.vpnJournalCursor != "" {
+		args = append(args, "--after-cursor", e.vpnJournalCursor)
+	} else {
+		// Första körningen: bara de senaste minuterna, inte hela historiken.
+		args = append(args, "--since", "-5min", "-n", "5000")
+	}
+	cmd := exec.CommandContext(ctx, "journalctl", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	added := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "-- cursor:") {
+			e.vpnJournalCursor = strings.TrimSpace(strings.TrimPrefix(line, "-- cursor:"))
+			continue
+		}
+		if !vpnFailRe.MatchString(line) {
+			continue
+		}
+		ip := vpnIPv4Re.FindString(line)
+		if ip == "" || ip == "127.0.0.1" {
+			continue
+		}
+		if blocked[ip] {
+			continue
+		}
+		e.vpnFailCounts[ip]++
+		if e.vpnFailCounts[ip] >= store.VPNAutoBlockThreshold {
+			blocked[ip] = true
+			values = append(values, ip)
+			added = true
+			log.Printf("[vpn-autoblock] blockerar %s efter %d misslyckade OpenVPN-försök", ip, e.vpnFailCounts[ip])
+		}
+	}
+	_ = cmd.Wait()
+	if !added {
+		return nil
+	}
+	if err := e.store.UpdateObjectValuesDirect(objID, values); err != nil {
+		return fmt.Errorf("vpn-autoblock: kunde inte spara objektet: %w", err)
+	}
+	return e.ReapplyNftablesOnly(ctx)
 }

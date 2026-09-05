@@ -118,6 +118,9 @@ func (s *Store) loadOrInit(seed SeedOptions) error {
 	// gäller bara nya). Säker utan commit — den injicerade Deny-policyn är
 	// avstängd. Sparas direkt så den överlever omstart.
 	changed := ensureDefaultAutoBlock(&cfg)
+	if ensureDefaultVPNAutoBlock(&cfg) {
+		changed = true
+	}
 	if ensureDefaultMgmtAPIPolicy(&cfg) {
 		changed = true
 	}
@@ -170,6 +173,9 @@ func (s *Store) loadCandidateOrFallback(candidatePath string, running *config.Co
 		return cloneConfig(running)
 	}
 	changed := ensureDefaultAutoBlock(&cand)
+	if ensureDefaultVPNAutoBlock(&cand) {
+		changed = true
+	}
 	if ensureDefaultMgmtAPIPolicy(&cand) {
 		changed = true
 	}
@@ -430,6 +436,81 @@ func ensureDefaultMgmtAPIPolicy(cfg *config.Config) bool {
 }
 
 const ipsAutoBlockObjectID = "obj-ips-autoblock"
+
+// VPN-auto-block (WAN): käll-IP:n som upprepat misslyckas att autentisera mot
+// OpenVPN från WAN samlas i objektet "VPN - Auto block" och blockeras av
+// sys-vpn-autoblock-deny. Till skillnad från IPS-auto-block är detta PÅSLAGET
+// som standard (användarval 2026-09-05) och blockerar permanent. Själva
+// drop-regeln renderas SPECIELLT tidigt i input-kedjan (före VPN-accept-
+// reglerna) av nftables-adaptern — en vanlig policy renderas efter dem och
+// skulle aldrig hinna blockera. VPNAutoBlockThreshold = antal misslyckade
+// försök per käll-IP innan det blockeras.
+const (
+	vpnAutoBlockObjectID   = "obj-vpn-autoblock"
+	vpnAutoBlockObjectName = "VPN - Auto block"
+	vpnAutoBlockPolicyID   = "sys-vpn-autoblock-deny"
+	VPNAutoBlockThreshold  = 5
+)
+
+func vpnAutoBlockDenyPolicy() config.Policy {
+	return config.Policy{
+		ID:          vpnAutoBlockPolicyID,
+		Name:        "Blockera auto-blockerade IP:n (VPN WAN)",
+		Enabled:     true, // PÅ som standard
+		Priority:    1,
+		SourceZone:  "",
+		DestZone:    "ANY",
+		SourceObj:   vpnAutoBlockObjectID,
+		DestObj:     "ANY",
+		Service:     "ANY",
+		Action:      config.ActionDrop,
+		Logging:     true,
+		Description: "Släpper (drop) ALL trafik permanent från käll-IP:n som upprepat misslyckats logga in på OpenVPN från WAN (samlas automatiskt i objektet \"VPN - Auto block\"). Renderas tidigt i input-kedjan så att den blockerar även på VPN-portarna. Stäng av regeln för att pausa både blockering och insamling. Ta bort en IP i objektet för att låsa upp den.",
+	}
+}
+
+// ensureDefaultVPNAutoBlock injicerar VPN-auto-block-objektet och den
+// (påslagna) deny-policyn i en config som saknar dem. Speglar
+// ensureDefaultAutoBlock men policyn är aktiverad som standard.
+func ensureDefaultVPNAutoBlock(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	changed := false
+	hasObj := false
+	for _, o := range cfg.Objects {
+		if o.ID == vpnAutoBlockObjectID || o.Name == vpnAutoBlockObjectName {
+			hasObj = true
+			break
+		}
+	}
+	if !hasObj {
+		cfg.Objects = append(cfg.Objects, config.Object{
+			ID:          vpnAutoBlockObjectID,
+			Name:        vpnAutoBlockObjectName,
+			Type:        config.ObjectTypeIPList,
+			Values:      []string{},
+			Description: "Käll-IP:n som upprepat misslyckats autentisera mot OpenVPN från WAN. Fylls automatiskt. Ta bort en post för att låsa upp den IP:n.",
+		})
+		changed = true
+	}
+	hasPolicy := false
+	for i := range cfg.Policies {
+		if cfg.Policies[i].ID == vpnAutoBlockPolicyID {
+			hasPolicy = true
+			if cfg.Policies[i].SourceObj != vpnAutoBlockObjectID {
+				cfg.Policies[i].SourceObj = vpnAutoBlockObjectID
+				changed = true
+			}
+			break
+		}
+	}
+	if !hasPolicy {
+		cfg.Policies = append([]config.Policy{vpnAutoBlockDenyPolicy()}, cfg.Policies...)
+		changed = true
+	}
+	return changed
+}
 
 // ipsAutoBlockDenyPolicy är den färdiga men AVSTÄNGDA Deny-policyn som
 // refererar auto-block-objektet. Den finns med i regellistan från start så att

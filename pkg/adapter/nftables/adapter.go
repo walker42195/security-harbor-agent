@@ -167,6 +167,11 @@ func validPort(p int) bool { return p >= 1 && p <= 65535 }
 // använder samma tak.
 const defaultDNSRateLimitPerIP = 200
 
+// wgHandshakeRateLimitPerIP är per-käll-IP-taket (paket/sekund) för WireGuard-
+// portens flodskydd. En legitim klient gör bara enstaka handskakningar, så 10/s
+// (burst 30) stryper en flod men rör inte normal användning.
+const wgHandshakeRateLimitPerIP = 10
+
 // sanitizeMeterName gör ett interface-namn till ett giltigt nft-meter/set-namn
 // (bokstäver, siffror, understreck) — t.ex. "eth1.10" → "eth1_10".
 func sanitizeMeterName(s string) string {
@@ -890,6 +895,39 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 		},
 	})
 
+	// Input 2.2: VPN-auto-block. Släpp ALL trafik från IP:n i objektet som
+	// sys-vpn-autoblock-deny pekar på — käll-IP:n som upprepat misslyckats mot
+	// OpenVPN från WAN. MÅSTE ligga FÖRE VPN-accepten (2.5/2.6) nedan, annars
+	// släpper accepten in dem först (första matchande regel vinner). Renderas
+	// bara när policyn är påslagen OCH objektet har minst en post (tomt objekt
+	// → objectMatchExpr ger isAny=false + tom expr → ingen regel).
+	vpnBlockExpr := func() []interface{} {
+		var srcObj string
+		for _, p := range cfg.Policies {
+			if p.ID == "sys-vpn-autoblock-deny" && p.Enabled {
+				srcObj = p.SourceObj
+				break
+			}
+		}
+		if srcObj == "" {
+			return nil
+		}
+		expr, isAny := objectMatchExpr(cfg, srcObj, "saddr", reg)
+		if isAny || len(expr) == 0 {
+			return nil
+		}
+		return expr
+	}
+	if e := vpnBlockExpr(); e != nil {
+		root.Nftables = append(root.Nftables, NFTElement{
+			Rule: &Rule{
+				Family: a.family, Table: a.tableName, Chain: "input",
+				Comment: "VPN auto-block (WAN brute-force) — drop before VPN accepts",
+				Expr:    append(append([]interface{}{}, e...), implicitTail(false, "VPN auto-block")...),
+			},
+		})
+	}
+
 	// Input 2.1: HÄR LÅG "Garanterad SSH-åtkomst" — borttagen 2026-08-31.
 	//
 	// Regeln byggdes alltid, oberoende av policylistan, och släppte in SSH
@@ -914,6 +952,27 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	// Måste ligga FÖRE Input 3 (HARD WAN DROP) annars är VPN:en meningslös.
 	if cfg.WireGuard != nil && cfg.WireGuard.Enabled && cfg.WireGuard.ListenPort > 0 {
 		for _, wanDev := range wanDevices {
+			// Volymskydd: WireGuard svarar aldrig på ogiltiga paket (inget
+			// auth-fel att blockera på), så skyddet mot brute-force/flod är
+			// en per-käll-IP pps-gräns FÖRE accept. En legitim klient gör en
+			// handskakning då och då; en flodare stryps. nft-metern verifieras
+			// med `nft -j -c` (samma konstruktion som DNS-flodskyddet).
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family: a.family, Table: a.tableName, Chain: "input",
+					Comment: fmt.Sprintf("WireGuard flood-skydd (%d/s per käll-IP) på WAN %s", wgHandshakeRateLimitPerIP, wanDev),
+					Expr: []interface{}{
+						map[string]interface{}{"match": map[string]interface{}{"op": "==", "left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}}, "right": wanDev}},
+						map[string]interface{}{"match": map[string]interface{}{"op": "==", "left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}}, "right": cfg.WireGuard.ListenPort}},
+						map[string]interface{}{"meter": map[string]interface{}{
+							"name": "sh_wgrl_" + sanitizeMeterName(wanDev),
+							"key":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "saddr"}},
+							"stmt": map[string]interface{}{"limit": map[string]interface{}{"rate": wgHandshakeRateLimitPerIP, "per": "second", "burst": wgHandshakeRateLimitPerIP * 3, "inv": true}},
+						}},
+						map[string]interface{}{"drop": nil},
+					},
+				},
+			})
 			root.Nftables = append(root.Nftables, NFTElement{
 				Rule: &Rule{
 					Family:  a.family,
@@ -1382,9 +1441,26 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			},
 		})
 
+		// VPN-auto-block även i forward (samma objekt som input-dropen ovan),
+		// så en blockerad IP inte heller kan RUTAS genom brandväggen.
+		if e := vpnBlockExpr(); e != nil {
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family: a.family, Table: a.tableName, Chain: "forward",
+					Comment: "VPN auto-block (WAN brute-force) — drop forwarded",
+					Expr:    append(append([]interface{}{}, e...), implicitTail(false, "VPN auto-block")...),
+				},
+			})
+		}
+
 		// Användarpolicies
 		for _, pol := range cfg.Policies {
 			if !pol.Enabled || pol.Local {
+				continue
+			}
+			// sys-vpn-autoblock-deny renderas SPECIELLT tidigt (input+forward
+			// ovan) — hoppa den här så den inte dubbelrenderas sent/verkningslöst.
+			if pol.ID == "sys-vpn-autoblock-deny" {
 				continue
 			}
 
