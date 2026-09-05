@@ -36,10 +36,15 @@ func (a *Adapter) LeaseDatabasePath() string {
 	return a.leaseDBPath
 }
 
-// controlSocketPath ligger i samma katalog som lease-memfilen (som redan finns
-// och är skrivbar för Kea), så ingen extra katalog behöver skapas.
+// controlSocketPath MÅSTE ligga under /run/kea: Kea 3.x avvisar varje annan
+// sökväg ("invalid path specified ... supported path is '/run/kea'") och vägrar
+// då starta HELA DHCP-servern. /run/kea skapas av kea-dhcp4-serverns systemd-
+// enhet (RuntimeDirectory=kea, ägs av _kea). Tidigare låg den i lease-filens
+// katalog (/var/lib/kea) vilket sänkte DHCP på Kea 3.0.3 (fixat i 0.48.1).
+const keaControlSocketPath = "/run/kea/kea4-ctrl-socket"
+
 func (a *Adapter) controlSocketPath() string {
-	return filepath.Join(filepath.Dir(a.leaseDBPath), "kea4-ctrl-socket")
+	return keaControlSocketPath
 }
 
 // DeleteLease frigör EN aktiv DHCP-lease via Kea:s kommandokanal (lease4-del),
