@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/network"
@@ -903,6 +904,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	memTotalGB, memFreePercent := readMemoryTotals()
+	diskPct, diskTotalGB, diskFreeGB := readDiskUsage()
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"hostname":        hostname,
 		"state":           st,
@@ -914,6 +916,9 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		"memory":          readMemoryPercent(),
 		"memory_total_gb": memTotalGB,
 		"memory_free_pct": memFreePercent,
+		"disk":            diskPct,
+		"disk_total_gb":   diskTotalGB,
+		"disk_free_gb":    diskFreeGB,
 		// Backends som inte kunde appliceras men som inte är trafikstyrande
 		// (i praktiken IDS) — appliceringen gick igenom, men funktionen är
 		// inte igång och det ska synas i GUI:t i stället för att tyst
@@ -1074,6 +1079,29 @@ func readMemoryTotals() (totalGB float64, freePercent float64) {
 	totalGB = math.Round(float64(total)/1024/1024*10) / 10
 	freePercent = math.Round(float64(available)/float64(total)*1000) / 10
 	return totalGB, freePercent
+}
+
+// readDiskUsage returnerar rotfilsystemets användning i procent samt total-
+// och ledigt utrymme i GB. En full disk gör brandväggen oanvändbar (Kea/
+// Unbound/agent kan inte skriva) — därför ska det synas i GUI:t. Använder
+// statfs på "/"; utrymme reserverat för root räknas som använt (Bavail =
+// det som faktiskt går att använda).
+func readDiskUsage() (usedPercent float64, totalGB float64, freeGB float64) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs("/", &st); err != nil {
+		return 0, 0, 0
+	}
+	bs := float64(st.Bsize)
+	total := bs * float64(st.Blocks)
+	free := bs * float64(st.Bavail)
+	if total <= 0 {
+		return 0, 0, 0
+	}
+	used := total - free
+	usedPercent = math.Round(used/total*1000) / 10
+	totalGB = math.Round(total/1e9*10) / 10
+	freeGB = math.Round(free/1e9*10) / 10
+	return usedPercent, totalGB, freeGB
 }
 
 // handleRenewDHCP kör om DHCP-förhandlingen för ETT gränssnitt i
