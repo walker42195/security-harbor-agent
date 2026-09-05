@@ -33,6 +33,23 @@ DIST_DIR="dist"
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
+# 0. Test-gate: bygg aldrig en release av kod som inte passerar testerna.
+# Inkluderar bl.a. att den genererade Kea-configen har control-socket under
+# /run/kea (Kea 3.x-krav) och — där kea-dhcp4 finns i PATH — en skarp
+# `kea-dhcp4 -t`-validering. Sätt SKIP_TESTS=1 bara om du VET vad du gör.
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+  echo "=== 0. Kör go vet + go test (release-gate) ==="
+  go vet ./... || { echo "go vet misslyckades — avbryter release."; exit 1; }
+  go test ./... || { echo "go test misslyckades — avbryter release."; exit 1; }
+  if command -v kea-dhcp4 >/dev/null 2>&1; then
+    echo "-> kea-dhcp4 finns: skarp DHCP-config-validering kördes i testerna."
+  else
+    echo "-> OBS: kea-dhcp4 saknas i PATH — skarp DHCP-config-validering hoppades."
+    echo "   /run/kea-sökvägskontrollen kördes ändå (alltid). Kör bygget på en"
+    echo "   Kea-maskin för full validering mot din Kea-version."
+  fi
+fi
+
 echo "=== 1. Cross-kompilerar binärer (linux/amd64), version $VERSION ==="
 LDFLAGS="-X main.version=$VERSION"
 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "$DIST_DIR/security-harbor-agent" ./cmd/security-harbor-agent

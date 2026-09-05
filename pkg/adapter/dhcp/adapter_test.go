@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -98,11 +100,49 @@ func TestKeaConfigHasControlSocket(t *testing.T) {
 	if !strings.Contains(s, `"control-socket"`) || !strings.Contains(s, `"socket-type": "unix"`) || !strings.Contains(s, "kea4-ctrl-socket") {
 		t.Errorf("control-socket saknas i genererad Kea-config:\n%s", s)
 	}
+
+	// Kea 3.x KRÄVER att socket-name ligger under /run/kea — annars vägrar
+	// hela DHCP-servern starta. Detta test hade fångat regressionen i 0.47.0.
+	if !strings.Contains(s, `"socket-name": "/run/kea/kea4-ctrl-socket"`) {
+		t.Errorf("control-socket måste ligga under /run/kea (Kea 3.x-krav):\n%s", s)
+	}
 }
 
 func TestDeleteLeaseValidatesIP(t *testing.T) {
 	a := NewAdapter("")
 	if err := a.DeleteLease(context.Background(), "inte-en-ip"); err == nil {
 		t.Error("förväntade fel för ogiltig IP")
+	}
+}
+
+// TestGenerateKeaConfigValidatesWithKea kör `kea-dhcp4 -t` på den genererade
+// configen när Kea finns i PATH — fångar allt en viss Kea-version underkänner
+// (t.ex. control-socket-sökvägen). Skippas där Kea saknas (t.ex. CI utan Kea).
+func TestGenerateKeaConfigValidatesWithKea(t *testing.T) {
+	kea, err := exec.LookPath("kea-dhcp4")
+	if err != nil {
+		t.Skip("kea-dhcp4 saknas i PATH — hoppar skarp config-validering")
+	}
+	a := NewAdapter("")
+	cfg := &config.Config{Interfaces: []config.Interface{
+		{Device: "ens18.5", Zone: "LAN", Enabled: true, IPv4: "10.5.5.1/24",
+			DHCP: &config.DHCPConfig{Enabled: true, RangeStart: "10.5.5.100", RangeEnd: "10.5.5.200", Gateway: "10.5.5.1", DNSServers: []string{"10.5.5.1"}}},
+	}}
+	data, err := a.GenerateKeaConfig(cfg)
+	if err != nil {
+		t.Fatalf("GenerateKeaConfig: %v", err)
+	}
+	tmp, err := os.CreateTemp("", "kea-*.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	tmp.Close()
+	out, err := exec.Command(kea, "-t", tmp.Name()).CombinedOutput()
+	if err != nil {
+		t.Fatalf("kea-dhcp4 -t underkände genererad config: %v\n%s", err, out)
 	}
 }
