@@ -33,6 +33,15 @@ type Adapter struct {
 // att skriva hit kräver ingen ändring av systemets bas-unbound.conf.
 const defaultDir = "/etc/unbound/unbound.conf.d"
 
+// defaultQueryRateLimitPerIP är per-käll-IP-taket (frågor/sekund) som används
+// när DNSConfig.QueryRateLimitPerIP är 0 (ej satt). 200 q/s är rikligt för en
+// legitim klient men stryper en flod. defaultDomainRateLimitFactor sätter det
+// (grövre) per-domän-taket relativt per-IP-taket.
+const (
+	defaultQueryRateLimitPerIP   = 200
+	defaultDomainRateLimitFactor = 5
+)
+
 func NewAdapter(dir string) *Adapter {
 	if dir == "" {
 		dir = defaultDir
@@ -89,6 +98,25 @@ func GenerateServerConfig(cfg *config.Config, blocklistPath string, hostsPath st
 	fmt.Fprintf(&b, "    do-tcp: yes\n")
 	fmt.Fprintf(&b, "    hide-identity: yes\n")
 	fmt.Fprintf(&b, "    hide-version: yes\n")
+
+	// Flod-/svältningsskydd (motverkar det som pentest-harnessets tier2/30
+	// DNS-flod visar): per-käll-IP-tak stryper en enskild flodande klient
+	// utan att drabba legitima klienter på andra IP:n. Kombineras med
+	// nftables-lagret (per-käll pps-drop på udp/53) för skydd även mot rå
+	// paketflod som aldrig blir en giltig fråga.
+	ipRL := d.QueryRateLimitPerIP
+	if ipRL == 0 {
+		ipRL = defaultQueryRateLimitPerIP // säker default när inget angetts
+	}
+	if ipRL > 0 {
+		fmt.Fprintf(&b, "    ip-ratelimit: %d\n", ipRL)
+		// Per-domän-RRL som andra backstop mot en flod av samma fråga.
+		fmt.Fprintf(&b, "    ratelimit: %d\n", ipRL*defaultDomainRateLimitFactor)
+	}
+	// Större mottagarbuffert + jostle gör att resolvern håller kvar
+	// legitima frågor i kö i stället för att tappa dem under tryck.
+	fmt.Fprintf(&b, "    so-rcvbuf: 4m\n")
+	fmt.Fprintf(&b, "    jostle-timeout: 200\n")
 	fmt.Fprintf(&b, "    access-control: 127.0.0.0/8 allow\n")
 	for _, net := range lanNetworks {
 		fmt.Fprintf(&b, "    access-control: %s allow\n", net)

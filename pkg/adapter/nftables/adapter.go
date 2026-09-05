@@ -161,6 +161,26 @@ func parseMultiProtocolServiceSets(spec string) (sets [][]interface{}, ok bool) 
 // obegripligt lågnivåfel istället för ett tydligt valideringsfel).
 func validPort(p int) bool { return p >= 1 && p <= 65535 }
 
+// defaultDNSRateLimitPerIP är per-käll-IP-taket (paket/sekund) för DNS-
+// flodskyddet i input-kedjan när DNSConfig.QueryRateLimitPerIP är 0. Speglar
+// pkg/adapter/dns.defaultQueryRateLimitPerIP så kärn- och resolver-lagret
+// använder samma tak.
+const defaultDNSRateLimitPerIP = 200
+
+// sanitizeMeterName gör ett interface-namn till ett giltigt nft-meter/set-namn
+// (bokstäver, siffror, understreck) — t.ex. "eth1.10" → "eth1_10".
+func sanitizeMeterName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
 // serviceMatchExpr bygger nftables match-uttryck för en Service-sträng, t.ex.
 // "ANY", "ICMP", "22", "UDP:53", "TCP:8000-8100". Delas mellan FORWARD-kedjans
 // policies och INPUT-kedjans lokala åtkomstpolicies för att undvika dubblerad
@@ -1225,7 +1245,38 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 	// DNS.Enabled automatiskt, samma mönster som WAN-allow-reglerna för
 	// WireGuard/OpenVPN (Fas 3/4) följer sina respektive Enabled-flaggor.
 	if cfg.DNS != nil && cfg.DNS.Enabled {
+		// Effektivt per-käll-IP-tak (pps) för DNS-flodskydd i kärnan. Matchar
+		// Unbounds ip-ratelimit men stoppar RÅ paketflod (t.ex. hping3 --flood
+		// --udp) innan den ens når resolvern. 0 → säker default; <0 → av.
+		// nft-JSON:en (meter + limit inv:true → drop över taket) är verifierad
+		// med `nft -j -c`. Se pentest-harnessets tier2/30 för det fynd detta stänger.
+		dnsRL := defaultDNSRateLimitPerIP
+		if cfg.DNS.QueryRateLimitPerIP != 0 {
+			dnsRL = cfg.DNS.QueryRateLimitPerIP
+		}
 		for _, lanDev := range lanDevices {
+			// UDP-flodskydd FÖRE accept: droppa paket från en käll-IP som
+			// överskrider taket, så en enskild flodare inte mättar resolvern.
+			if dnsRL > 0 {
+				root.Nftables = append(root.Nftables, NFTElement{
+					Rule: &Rule{
+						Family:  a.family,
+						Table:   a.tableName,
+						Chain:   "input",
+						Comment: fmt.Sprintf("DNS flood-skydd (%d/s per käll-IP) på LAN %s", dnsRL, lanDev),
+						Expr: []interface{}{
+							map[string]interface{}{"match": map[string]interface{}{"op": "==", "left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}}, "right": lanDev}},
+							map[string]interface{}{"match": map[string]interface{}{"op": "==", "left": map[string]interface{}{"payload": map[string]interface{}{"protocol": "udp", "field": "dport"}}, "right": 53}},
+							map[string]interface{}{"meter": map[string]interface{}{
+								"name": "sh_dnsrl_" + sanitizeMeterName(lanDev),
+								"key":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "saddr"}},
+								"stmt": map[string]interface{}{"limit": map[string]interface{}{"rate": dnsRL, "per": "second", "burst": dnsRL * 2, "inv": true}},
+							}},
+							map[string]interface{}{"drop": nil},
+						},
+					},
+				})
+			}
 			for _, proto := range []string{"udp", "tcp"} {
 				root.Nftables = append(root.Nftables, NFTElement{
 					Rule: &Rule{

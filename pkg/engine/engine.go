@@ -2070,3 +2070,8 @@ func lanDHCPWarnings(cfg *config.Config) []BackendWarning {
 	}
 	return out
 }
+
+// DeleteDHCPLease frigör en aktiv DHCP-lease via Kea:s kommandokanal.
+func (e *Engine) DeleteDHCPLease(ctx context.Context, ip string) error {
+	return e.dhcpAdapter.DeleteLease(ctx, ip)
+}

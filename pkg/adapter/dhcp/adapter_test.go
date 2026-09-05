@@ -2,7 +2,9 @@ package dhcp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/walker42195/security-harbor-agent/pkg/config"
@@ -79,5 +81,28 @@ func TestGenerateKeaConfigNoDHCPZonesEmitsEmptyArray(t *testing.T) {
 	}
 	if len(parsed.Dhcp4.Subnet4) != 0 {
 		t.Fatalf("förväntade 0 subnet4-poster, fick %d", len(parsed.Dhcp4.Subnet4))
+	}
+}
+
+func TestKeaConfigHasControlSocket(t *testing.T) {
+	a := NewAdapter("")
+	cfg := &config.Config{Interfaces: []config.Interface{
+		{Device: "ens18.5", Zone: "LAN", Enabled: true, IPv4: "10.5.5.1/24",
+			DHCP: &config.DHCPConfig{Enabled: true, RangeStart: "10.5.5.100", RangeEnd: "10.5.5.200", Gateway: "10.5.5.1"}},
+	}}
+	data, err := a.GenerateKeaConfig(cfg)
+	if err != nil {
+		t.Fatalf("GenerateKeaConfig: %v", err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `"control-socket"`) || !strings.Contains(s, `"socket-type": "unix"`) || !strings.Contains(s, "kea4-ctrl-socket") {
+		t.Errorf("control-socket saknas i genererad Kea-config:\n%s", s)
+	}
+}
+
+func TestDeleteLeaseValidatesIP(t *testing.T) {
+	a := NewAdapter("")
+	if err := a.DeleteLease(context.Background(), "inte-en-ip"); err == nil {
+		t.Error("förväntade fel för ogiltig IP")
 	}
 }

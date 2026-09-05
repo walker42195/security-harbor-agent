@@ -208,3 +208,38 @@ func TestGenerateBlocklistConfigAllowlistOverride(t *testing.T) {
 		t.Errorf("förväntade en transparent (allowlist-)post för malware.example.com: %s", conf)
 	}
 }
+
+// TestDNSFloodProtection verifierar att flod-/svältningsskyddet (ip-ratelimit
+// per käll-IP + ratelimit + buffertar) renderas, med säker default när inget
+// angetts, och att -1 stänger av per-IP-taket.
+func TestDNSFloodProtection(t *testing.T) {
+	base := func(rl int) *config.Config {
+		return &config.Config{
+			Interfaces: []config.Interface{{Device: "ens19", Enabled: true, Zone: "LAN", IPv4: "10.5.5.1/24"}},
+			DNS:        &config.DNSConfig{Enabled: true, UpstreamServers: []string{"1.1.1.1"}, QueryRateLimitPerIP: rl},
+		}
+	}
+	// Default (0 → 200)
+	out, err := GenerateServerConfig(base(0), "", "")
+	if err != nil {
+		t.Fatalf("fel: %v", err)
+	}
+	for _, want := range []string{"ip-ratelimit: 200", "ratelimit: 1000", "so-rcvbuf: 4m", "jostle-timeout: 200"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("saknar %q i:\n%s", want, out)
+		}
+	}
+	// Explicit värde
+	out2, _ := GenerateServerConfig(base(500), "", "")
+	if !strings.Contains(out2, "ip-ratelimit: 500") || !strings.Contains(out2, "ratelimit: 2500") {
+		t.Errorf("förväntade ip-ratelimit: 500 / ratelimit: 2500, fick:\n%s", out2)
+	}
+	// -1 stänger av per-IP-taket (men buffertarna ska finnas kvar)
+	out3, _ := GenerateServerConfig(base(-1), "", "")
+	if strings.Contains(out3, "ip-ratelimit:") {
+		t.Errorf("ip-ratelimit skulle vara avstängt vid -1, fick:\n%s", out3)
+	}
+	if !strings.Contains(out3, "so-rcvbuf: 4m") {
+		t.Errorf("buffertar ska finnas även med per-IP-tak av, fick:\n%s", out3)
+	}
+}

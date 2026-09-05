@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/svc"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
@@ -33,14 +36,81 @@ func (a *Adapter) LeaseDatabasePath() string {
 	return a.leaseDBPath
 }
 
+// controlSocketPath ligger i samma katalog som lease-memfilen (som redan finns
+// och är skrivbar för Kea), så ingen extra katalog behöver skapas.
+func (a *Adapter) controlSocketPath() string {
+	return filepath.Join(filepath.Dir(a.leaseDBPath), "kea4-ctrl-socket")
+}
+
+// DeleteLease frigör EN aktiv DHCP-lease via Kea:s kommandokanal (lease4-del),
+// utan omstart. ip måste vara en giltig IPv4-adress. Returnerar nil om leasen
+// togs bort ELLER inte fanns (idempotent), och fel vid socket-/protokollfel.
+func (a *Adapter) DeleteLease(ctx context.Context, ip string) error {
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("ogiltig IP-adress %q", ip)
+	}
+	sock := a.controlSocketPath()
+	cmd, _ := json.Marshal(map[string]interface{}{
+		"command":   "lease4-del",
+		"arguments": map[string]string{"ip-address": ip},
+	})
+
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "unix", sock)
+	if err != nil {
+		return fmt.Errorf("kunde inte nå Kea:s kommandosocket (%s) — kör en Apply så control-socket aktiveras: %w", sock, err)
+	}
+	defer conn.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	}
+
+	if _, err := conn.Write(cmd); err != nil {
+		return fmt.Errorf("skrivning till Kea-socket misslyckades: %w", err)
+	}
+	// Signalera slut på kommando så Kea svarar och stänger.
+	if uc, ok := conn.(*net.UnixConn); ok {
+		_ = uc.CloseWrite()
+	}
+	respBytes, err := io.ReadAll(conn)
+	if err != nil {
+		return fmt.Errorf("läsning från Kea-socket misslyckades: %w", err)
+	}
+	var resp []struct {
+		Result int    `json:"result"`
+		Text   string `json:"text"`
+	}
+	if err := json.Unmarshal(respBytes, &resp); err != nil || len(resp) == 0 {
+		return fmt.Errorf("oväntat svar från Kea: %s", string(respBytes))
+	}
+	// result: 0 = ok, 3 = tom (leasen fanns inte) — båda är OK/idempotent.
+	switch resp[0].Result {
+	case 0, 3:
+		log.Printf("[dhcp] lease4-del %s → result=%d (%s)", ip, resp[0].Result, resp[0].Text)
+		return nil
+	default:
+		return fmt.Errorf("Kea nekade lease4-del för %s: %s", ip, resp[0].Text)
+	}
+}
+
 type KeaConfig struct {
 	Dhcp4 Dhcp4Config `json:"Dhcp4"`
 }
 
 type Dhcp4Config struct {
 	InterfacesConfig InterfacesConfig `json:"interfaces-config"`
+	ControlSocket    *ControlSocket   `json:"control-socket,omitempty"`
 	LeaseDatabase    LeaseDatabase    `json:"lease-database"`
 	Subnet4          []Subnet4        `json:"subnet4"`
+}
+
+// ControlSocket aktiverar Kea:s kommandokanal (unix-socket) så agenten kan
+// skicka t.ex. lease4-del för att frigöra en enskild lease utan omstart.
+type ControlSocket struct {
+	SocketType string `json:"socket-type"`
+	SocketName string `json:"socket-name"`
 }
 
 type InterfacesConfig struct {
@@ -137,6 +207,10 @@ func (a *Adapter) GenerateKeaConfig(cfg *config.Config) ([]byte, error) {
 	keaCfg := KeaConfig{
 		Dhcp4: Dhcp4Config{
 			InterfacesConfig: InterfacesConfig{Interfaces: listeningIfaces},
+			ControlSocket: &ControlSocket{
+				SocketType: "unix",
+				SocketName: a.controlSocketPath(),
+			},
 			LeaseDatabase: LeaseDatabase{
 				Type:    "memfile",
 				Name:    a.leaseDBPath,

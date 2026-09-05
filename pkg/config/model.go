@@ -133,6 +133,13 @@ type DNSConfig struct {
 	// (och skickade ett värdnamn i sin DHCP-förfrågan) automatiskt
 	// registreras i den lokala DNS-zonen. Se pkg/adapter/dhcp.ParseLeases.
 	DHCPHostnameRegistration bool `json:"dhcp_hostname_registration"`
+
+	// QueryRateLimitPerIP är max antal DNS-frågor per sekund och käll-IP som
+	// resolvern besvarar (Unbound `ip-ratelimit`). Skyddar mot DNS-flod/
+	// -svältning: en enskild flodande klient stryps medan legitima klienter
+	// på andra IP:n är opåverkade. 0 = använd säker default
+	// (defaultQueryRateLimitPerIP). Sätt till -1 för att stänga av helt.
+	QueryRateLimitPerIP int `json:"query_rate_limit_per_ip,omitempty"`
 }
 
 // DNSStaticRecord är en manuellt inmatad A-post i den lokala DNS-zonen.

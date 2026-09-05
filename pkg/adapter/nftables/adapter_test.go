@@ -1465,3 +1465,42 @@ func TestRenderJSONNamedSetHandlesOverlappingIntervals(t *testing.T) {
 		t.Fatal("ingen namngiven mängd genererades")
 	}
 }
+
+// TestRenderJSONDNSFloodMeter verifierar att DNS-flodskyddet (per-käll-IP meter
+// som droppar över taket) renderas FÖRE accept-regeln på LAN, och styrs av
+// DNSConfig.QueryRateLimitPerIP (-1 stänger av). nft-JSON:en är verifierad att
+// ladda med `nft -j -c`.
+func TestRenderJSONDNSFloodMeter(t *testing.T) {
+	mk := func(rl int) *config.Config {
+		return &config.Config{
+			Version: 1,
+			Interfaces: []config.Interface{
+				{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+				{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.5.5.1/24"},
+			},
+			DNS:      &config.DNSConfig{Enabled: true, UpstreamServers: []string{"1.1.1.1"}, QueryRateLimitPerIP: rl},
+			Settings: config.Settings{APIPort: 8443},
+		}
+	}
+	// Default (0) → meter finns med taket 200
+	data, err := NewAdapter().RenderJSON(mk(0))
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "sh_dnsrl_ens19") || !strings.Contains(s, "DNS flood-skydd (200/s per käll-IP) på LAN ens19") {
+		t.Errorf("förväntade DNS-flodskydds-meter (200/s), saknas:\n%s", s)
+	}
+	// Metern måste komma FÖRE accept-regeln i outputen
+	if mi, ai := strings.Index(s, "sh_dnsrl_ens19"), strings.Index(s, "Allow DNS (UDP 53) on LAN ens19"); mi < 0 || ai < 0 || mi > ai {
+		t.Errorf("flodskydds-metern måste renderas före accept-regeln (meter=%d accept=%d)", mi, ai)
+	}
+	// -1 stänger av metern (men accept ska finnas kvar)
+	data2, _ := NewAdapter().RenderJSON(mk(-1))
+	if strings.Contains(string(data2), "sh_dnsrl_ens19") {
+		t.Errorf("meter skulle vara av vid -1:\n%s", string(data2))
+	}
+	if !strings.Contains(string(data2), "Allow DNS (UDP 53) on LAN ens19") {
+		t.Errorf("accept-regeln ska finnas även med flodskydd av")
+	}
+}

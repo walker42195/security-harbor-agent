@@ -115,6 +115,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/objects/refresh-source", s.authMiddlewareAdmin(s.handleRefreshObjectSource))
 	mux.HandleFunc("/api/v1/dns/refresh-blocklist", s.authMiddlewareAdmin(s.handleRefreshDNSBlocklist))
 	mux.HandleFunc("/api/v1/interfaces/renew-dhcp", s.authMiddlewareAdmin(s.handleRenewDHCP))
+	mux.HandleFunc("/api/v1/dhcp/leases/delete", s.authMiddlewareAdmin(s.handleDeleteDHCPLease))
 	mux.HandleFunc("/api/v1/services/status", s.authMiddleware(s.handleServicesStatus))
 	mux.HandleFunc("/api/v1/services/restart", s.authMiddlewareAdmin(s.handleServiceRestart))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig)) // GET=alla, POST/PUT kräver admin internt (se handlern)
@@ -2242,6 +2243,28 @@ func (s *Server) handleDHCPLeases(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(leases)
+}
+
+// handleDeleteDHCPLease frigör en aktiv DHCP-lease (admin-only) via Kea:s
+// lease4-del. Body: {"ip":"10.5.5.123"}.
+func (s *Server) handleDeleteDHCPLease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		IP string `json:"ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
+		http.Error(w, "IP saknas", http.StatusBadRequest)
+		return
+	}
+	if err := s.engine.DeleteDHCPLease(r.Context(), req.IP); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "ip": req.IP})
 }
 
 func (s *Server) handleGetDNSBlocklistDomains(w http.ResponseWriter, r *http.Request) {
