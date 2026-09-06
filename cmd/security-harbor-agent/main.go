@@ -117,6 +117,17 @@ func main() {
 		} else {
 			fmt.Println("[INIT] Initial konfiguration laddad.")
 		}
+
+		// Hindra brandväggens nft-loggar från att dubbellagras i /var/log
+		// (fyllde disken under en pentest 2026-09-06) — de bevaras i journald.
+		// Körs i bakgrunden så en långsam rsyslog-omladdning inte fördröjer start.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := syslogAdapter.EnsureFwlogSuppression(ctx); err != nil {
+				log.Printf("[VARNING] kunde inte sätta rsyslog fwlog-suppression: %v", err)
+			}
+		}()
 	}
 
 	// Self-signat TLS-certifikat för Management-API:et — genereras

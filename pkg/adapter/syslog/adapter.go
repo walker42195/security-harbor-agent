@@ -150,3 +150,43 @@ func checkDirWritable(dir string) error {
 	_ = os.Remove(probe)
 	return nil
 }
+
+// fwlogFilename ligger LÅGT (05-) så regeln körs FÖRE distributionens default-
+// regler (50-default.conf) som annars skriver kärnloggen till /var/log/syslog
+// och /var/log/kern.log.
+const fwlogFilename = "05-security-harbor-fwlog.conf"
+
+const fwlogConf = `# Genererad av Security Harbor — rör inte.
+# Brandväggens nftables-loggrader (SH-ACCEPT-*/SH-DENY-*) finns redan i journald
+# (SystemMaxUse=512M, se journald-security-harbor.conf) och läses därifrån av
+# GUI:ts loggvy. Att rsyslog DESSUTOM skriver dem till /var/log/syslog +
+# /var/log/kern.log är dubbellagrat, och under en flod/pentest växer de
+# traditionella filerna OBEGRÄNSAT (uppmätt 20 GB -> full disk 2026-09-06,
+# journald klarade sig tack vare sitt tak). Kasta dem därför här, före
+# default-reglerna. journald behåller dem (capped), så GUI:ts loggvy påverkas
+# inte. OBS: de vidarebefordras då inte heller till en central syslog-mottagare.
+if ($msg contains "SH-ACCEPT-") or ($msg contains "SH-DENY-") then { stop }
+`
+
+// EnsureFwlogSuppression skriver rsyslog-regeln som hindrar brandväggens
+// nft-loggar från att fylla /var/log lokalt. Idempotent; no-op om rsyslog inte
+// är installerat. Anropas vid agentens uppstart.
+func (a *Adapter) EnsureFwlogSuppression(ctx context.Context) error {
+	if err := checkRsyslogInstalled(); err != nil {
+		return nil // rsyslog saknas (t.ex. Arch utan AUR) — inget att göra.
+	}
+	if err := checkDirWritable(a.dir); err != nil {
+		return nil
+	}
+	path := filepath.Join(a.dir, fwlogFilename)
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == fwlogConf {
+		return nil // redan på plats och oförändrad.
+	}
+	if err := os.WriteFile(path, []byte(fwlogConf), 0644); err != nil {
+		return fmt.Errorf("misslyckades skriva %s: %w", fwlogFilename, err)
+	}
+	if out, err := exec.CommandContext(ctx, "systemctl", "reload-or-restart", "rsyslog.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("kunde inte ladda om rsyslog: %v (%s)", err, out)
+	}
+	return nil
+}
