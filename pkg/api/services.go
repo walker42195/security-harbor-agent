@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -220,4 +222,34 @@ func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
 		Sub:            sub,
 		Configured:     serviceConfigured(svc.ID, s.engine.GetRunningConfig()),
 	})
+}
+
+// StartServiceFailureWatcher pollar de hanterade tjänsternas status och skickar
+// en e-postnotifiering när en tjänst går från icke-failed till "failed" (Fas
+// 14). Endast övergångar notifieras, så samma fel inte mejlas om och om igen.
+// En redan-failed tjänst vid start notifieras en gång (prev seedas som tom).
+func (s *Server) StartServiceFailureWatcher(ctx context.Context) {
+	prev := map[string]string{}
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, svc := range managedServices {
+				qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				active, sub := queryUnitState(qctx, svc.Unit)
+				cancel()
+				if active == "failed" && prev[svc.Unit] != "failed" {
+					host, _ := os.Hostname()
+					s.engine.Notify("service",
+						fmt.Sprintf("Security Harbor — tjänst i fel-läge: %s", svc.Name),
+						fmt.Sprintf("Tjänsten \"%s\" (%s) har hamnat i fel-läge på brandväggen %s.\n\nStatus: %s (%s).\n\nKontrollera Tjänster-sidan i GUI:t.",
+							svc.Name, svc.Unit, host, active, sub))
+				}
+				prev[svc.Unit] = active
+			}
+		}
+	}
 }

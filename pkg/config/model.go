@@ -574,3 +574,23 @@ type SecurityEvent struct {
 	DstPort  int    `json:"dst_port,omitempty"`
 	Protocol string `json:"protocol,omitempty"`
 }
+
+// NotificationConfig styr e-postnotifieringar (Fas 14). Lagras KRYPTERAT och
+// separat från running.json (pkg/store: notifications.enc) — SMTP-lösenordet
+// ska aldrig hamna i klartext-config eller i candidate/apply-flödet, och
+// notiser påverkar inte brandväggsregelverket.
+type NotificationConfig struct {
+	Enabled  bool   `json:"enabled"`
+	SMTPHost string `json:"smtp_host"`
+	SMTPPort int    `json:"smtp_port"` // 587 (STARTTLS), 465 (implicit TLS) eller 25
+	SMTPUser string `json:"smtp_user,omitempty"`
+	SMTPPass string `json:"smtp_pass,omitempty"`
+	FromAddr string `json:"from_addr"`
+	ToAddr   string `json:"to_addr"`
+	// Security: "starttls" (587), "tls" (465, implicit) eller "none" (25).
+	Security string `json:"security"`
+
+	// Vilka händelser som ska notifieras.
+	NotifyServiceFailure bool `json:"notify_service_failure"`
+	NotifyAutoBlock      bool `json:"notify_auto_block"`
+}

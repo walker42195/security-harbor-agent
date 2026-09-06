@@ -117,6 +117,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/dns/refresh-blocklist", s.authMiddlewareAdmin(s.handleRefreshDNSBlocklist))
 	mux.HandleFunc("/api/v1/interfaces/renew-dhcp", s.authMiddlewareAdmin(s.handleRenewDHCP))
 	mux.HandleFunc("/api/v1/dhcp/leases/delete", s.authMiddlewareAdmin(s.handleDeleteDHCPLease))
+	mux.HandleFunc("/api/v1/notifications", s.authMiddleware(s.handleNotifications))
+	mux.HandleFunc("/api/v1/notifications/test", s.authMiddlewareAdmin(s.handleNotificationsTest))
 	mux.HandleFunc("/api/v1/services/status", s.authMiddleware(s.handleServicesStatus))
 	mux.HandleFunc("/api/v1/services/restart", s.authMiddlewareAdmin(s.handleServiceRestart))
 	mux.HandleFunc("/api/v1/config/candidate", s.authMiddleware(s.handleCandidateConfig)) // GET=alla, POST/PUT kräver admin internt (se handlern)
@@ -2293,6 +2295,71 @@ func (s *Server) handleDeleteDHCPLease(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "ip": req.IP})
+}
+
+// handleNotifications GET returnerar notifieringskonfigurationen (SMTP-lösen
+// maskerat); POST/PUT sparar den (admin-only). Tomt lösenord vid spara behåller
+// det redan sparade.
+func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		cfg, err := s.engine.GetNotificationConfig()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		hasPass := cfg.SMTPPass != ""
+		cfg.SMTPPass = "" // maskera — skickas aldrig ut
+		w.Header().Set("Content-Type", "application/json")
+		out, _ := json.Marshal(cfg)
+		var m map[string]interface{}
+		_ = json.Unmarshal(out, &m)
+		m["has_password"] = hasPass
+		_ = json.NewEncoder(w).Encode(m)
+	case http.MethodPost, http.MethodPut:
+		if role, _ := r.Context().Value(ctxKeyRole).(string); role != string(store.RoleAdmin) {
+			http.Error(w, "Forbidden: kräver admin-roll", http.StatusForbidden)
+			return
+		}
+		var cfg config.NotificationConfig
+		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+			return
+		}
+		if cfg.SMTPPass == "" { // behåll befintligt lösen om GUI:t inte skickade nytt
+			if saved, err := s.engine.GetNotificationConfig(); err == nil {
+				cfg.SMTPPass = saved.SMTPPass
+			}
+		}
+		if err := s.engine.SaveNotificationConfig(&cfg); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleNotificationsTest skickar ett testmejl med den medskickade
+// konfigurationen (admin-only).
+func (s *Server) handleNotificationsTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var cfg config.NotificationConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+	if err := s.engine.SendTestNotification(&cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 func (s *Server) handleGetDNSBlocklistDomains(w http.ResponseWriter, r *http.Request) {

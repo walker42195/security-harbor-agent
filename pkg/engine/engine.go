@@ -27,6 +27,7 @@ import (
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/timezone"
 	"github.com/walker42195/security-harbor-agent/pkg/adapter/wireguard"
 	"github.com/walker42195/security-harbor-agent/pkg/config"
+	"github.com/walker42195/security-harbor-agent/pkg/notify"
 	"github.com/walker42195/security-harbor-agent/pkg/pki"
 	"github.com/walker42195/security-harbor-agent/pkg/store"
 	"github.com/walker42195/security-harbor-agent/pkg/threatfeed"
@@ -1813,6 +1814,7 @@ func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
 
 	newestSeen := e.idsLastAlertTS
 	added := false
+	var idsNewlyBlocked []string
 	for _, ev := range events {
 		if e.idsLastAlertTS != "" && ev.Timestamp <= e.idsLastAlertTS {
 			continue
@@ -1827,12 +1829,18 @@ func (e *Engine) ProcessIDSAutoBlock(ctx context.Context) error {
 			blocked[ev.SrcIP] = true
 			values = append(values, ev.SrcIP)
 			added = true
+			idsNewlyBlocked = append(idsNewlyBlocked, ev.SrcIP)
 		}
 	}
 	e.idsLastAlertTS = newestSeen
 
 	if !added {
 		return nil
+	}
+	if len(idsNewlyBlocked) > 0 {
+		e.Notify("autoblock", "Security Harbor — IP blockerad av IDS",
+			fmt.Sprintf("IDS auto-block lade till följande käll-IP:n efter säkerhetslarm:\n\n  %s\n\nDe ligger nu i auto-block-objektet.",
+				strings.Join(idsNewlyBlocked, "\n  ")))
 	}
 
 	if err := e.store.UpdateObjectValuesDirect(objID, values); err != nil {
@@ -2149,6 +2157,7 @@ func (e *Engine) ProcessVPNAutoBlock(ctx context.Context) error {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
 	added := false
+	var newlyBlocked []string
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "-- cursor:") {
@@ -2170,6 +2179,7 @@ func (e *Engine) ProcessVPNAutoBlock(ctx context.Context) error {
 			blocked[ip] = true
 			values = append(values, ip)
 			added = true
+			newlyBlocked = append(newlyBlocked, ip)
 			log.Printf("[vpn-autoblock] blockerar %s efter %d misslyckade OpenVPN-försök", ip, e.vpnFailCounts[ip])
 		}
 	}
@@ -2180,5 +2190,57 @@ func (e *Engine) ProcessVPNAutoBlock(ctx context.Context) error {
 	if err := e.store.UpdateObjectValuesDirect(objID, values); err != nil {
 		return fmt.Errorf("vpn-autoblock: kunde inte spara objektet: %w", err)
 	}
+	if len(newlyBlocked) > 0 {
+		e.Notify("autoblock", "Security Harbor — VPN-IP blockerad",
+			fmt.Sprintf("Följande käll-IP:n blockerades automatiskt efter upprepade misslyckade OpenVPN-inloggningar från WAN:\n\n  %s\n\nDe ligger nu i objektet \"VPN - Auto block\". Ta bort dem i GUI:t för att låsa upp.",
+				strings.Join(newlyBlocked, "\n  ")))
+	}
 	return e.ReapplyNftablesOnly(ctx)
+}
+
+// GetNotificationConfig / SaveNotificationConfig delegerar till store (Fas 14).
+func (e *Engine) GetNotificationConfig() (*config.NotificationConfig, error) {
+	return e.store.LoadNotificationConfig()
+}
+func (e *Engine) SaveNotificationConfig(c *config.NotificationConfig) error {
+	return e.store.SaveNotificationConfig(c)
+}
+
+// SendTestNotification skickar ett testmejl med den angivna (ej nödvändigtvis
+// sparade) konfigurationen, så användaren kan verifiera inställningarna innan
+// de sparas. Ett tomt lösenord i cfg ersätts med det redan sparade (så GUI:t
+// inte behöver skicka tillbaka det maskerade lösenordet).
+func (e *Engine) SendTestNotification(cfg *config.NotificationConfig) error {
+	if cfg.SMTPPass == "" {
+		if saved, err := e.store.LoadNotificationConfig(); err == nil {
+			cfg.SMTPPass = saved.SMTPPass
+		}
+	}
+	c := *cfg
+	c.Enabled = true // testet ska gå igenom även innan funktionen slås på
+	return notify.Send(&c, "Security Harbor — testnotifiering",
+		"Det här är ett testmeddelande från din Security Harbor-brandvägg.\n\n"+
+			"Om du får det här fungerar e-postnotifieringarna.")
+}
+
+// Notify skickar en notifiering (fire-and-forget) om notiser är på och den
+// aktuella händelsetypen är aktiverad. kind: "service" eller "autoblock".
+func (e *Engine) Notify(kind, subject, body string) {
+	cfg, err := e.store.LoadNotificationConfig()
+	if err != nil || cfg == nil || !cfg.Enabled {
+		return
+	}
+	if kind == "service" && !cfg.NotifyServiceFailure {
+		return
+	}
+	if kind == "autoblock" && !cfg.NotifyAutoBlock {
+		return
+	}
+	go func() {
+		if err := notify.Send(cfg, subject, body); err != nil {
+			log.Printf("[notify] kunde inte skicka e-post (%s): %v", kind, err)
+		} else {
+			log.Printf("[notify] skickade e-post: %s", subject)
+		}
+	}()
 }

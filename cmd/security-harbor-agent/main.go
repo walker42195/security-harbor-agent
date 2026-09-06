@@ -157,6 +157,11 @@ func main() {
 
 	server := api.NewServer(*bindAddr, eng, auth, tlsCert, *webUIDir, version)
 
+	// Fas 14: bevaka tjänster och skicka e-post när en hamnar i fel-läge.
+	if !*dryRun {
+		go server.StartServiceFailureWatcher(context.Background())
+	}
+
 	// Fas 5: periodisk uppdatering av hot-listor/GeoIP-objekt (Spamhaus,
 	// Tor-exit-noder, anpassade URL:er, landsblock). Körs var 15:e minut;
 	// varje objekt uppdateras bara när dess egen RefreshHours har passerat
