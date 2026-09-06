@@ -1544,3 +1544,26 @@ func TestRenderJSONVPNAutoBlockOrder(t *testing.T) {
 		t.Error("tomt objekt ska inte ge någon VPN-auto-block-drop")
 	}
 }
+
+// TestRenderJSONOpenVPNRateLimitOrder: OpenVPN-flodmetern före accepten.
+func TestRenderJSONOpenVPNRateLimitOrder(t *testing.T) {
+	cfg := &config.Config{Version: 1,
+		Interfaces: []config.Interface{
+			{ID: "wan0", Device: "ens18", Zone: "WAN", Enabled: true, AddressType: "dhcp"},
+			{ID: "lan0", Device: "ens19", Zone: "LAN", Enabled: true, AddressType: "static", IPv4: "10.5.5.1/24"}},
+		OpenVPN:  &config.OpenVPNConfig{Enabled: true, ListenPort: 1194, Protocol: "udp"},
+		Settings: config.Settings{APIPort: 8443}}
+	data, err := NewAdapter().RenderJSON(cfg)
+	if err != nil {
+		t.Fatalf("RenderJSON: %v", err)
+	}
+	s := string(data)
+	meter := strings.Index(s, "OpenVPN flood-skydd")
+	accept := strings.Index(s, "Allow OpenVPN (UDP 1194)")
+	if meter < 0 || accept < 0 {
+		t.Fatalf("saknar regler: meter=%d accept=%d", meter, accept)
+	}
+	if !(meter < accept) {
+		t.Errorf("OpenVPN-flodmetern (%d) måste ligga före accepten (%d)", meter, accept)
+	}
+}

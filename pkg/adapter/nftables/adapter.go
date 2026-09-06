@@ -172,6 +172,10 @@ const defaultDNSRateLimitPerIP = 200
 // (burst 30) stryper en flod men rör inte normal användning.
 const wgHandshakeRateLimitPerIP = 10
 
+// ovpnRateLimitPerIP är per-käll-IP-taket (paket/sekund) för OpenVPN-portens
+// flodskydd (samma resonemang som WireGuard).
+const ovpnRateLimitPerIP = 10
+
 // sanitizeMeterName gör ett interface-namn till ett giltigt nft-meter/set-namn
 // (bokstäver, siffror, understreck) — t.ex. "eth1.10" → "eth1_10".
 func sanitizeMeterName(s string) string {
@@ -1016,6 +1020,28 @@ func (a *Adapter) RenderJSON(cfg *config.Config) ([]byte, error) {
 			proto = "udp"
 		}
 		for _, wanDev := range wanDevices {
+			// Volymskydd: per-käll-IP pps-gräns på OpenVPN-porten FÖRE accept,
+			// samma konstruktion som WireGuard/DNS. Fångar brute-force-/floods-
+			// VOLYM även när tls-crypt döljer själva auth-felet (obehöriga
+			// försök loggas aldrig med IP, men de kan ändå stryps här). En
+			// legitim klient gör bara enstaka handskakningar. Verifierad med
+			// `nft -j -c`.
+			root.Nftables = append(root.Nftables, NFTElement{
+				Rule: &Rule{
+					Family: a.family, Table: a.tableName, Chain: "input",
+					Comment: fmt.Sprintf("OpenVPN flood-skydd (%d/s per käll-IP) på WAN %s", ovpnRateLimitPerIP, wanDev),
+					Expr: []interface{}{
+						map[string]interface{}{"match": map[string]interface{}{"op": "==", "left": map[string]interface{}{"meta": map[string]interface{}{"key": "iifname"}}, "right": wanDev}},
+						map[string]interface{}{"match": map[string]interface{}{"op": "==", "left": map[string]interface{}{"payload": map[string]interface{}{"protocol": proto, "field": "dport"}}, "right": cfg.OpenVPN.ListenPort}},
+						map[string]interface{}{"meter": map[string]interface{}{
+							"name": "sh_ovpnrl_" + sanitizeMeterName(wanDev),
+							"key":  map[string]interface{}{"payload": map[string]interface{}{"protocol": "ip", "field": "saddr"}},
+							"stmt": map[string]interface{}{"limit": map[string]interface{}{"rate": ovpnRateLimitPerIP, "per": "second", "burst": ovpnRateLimitPerIP * 3, "inv": true}},
+						}},
+						map[string]interface{}{"drop": nil},
+					},
+				},
+			})
 			root.Nftables = append(root.Nftables, NFTElement{
 				Rule: &Rule{
 					Family:  a.family,
