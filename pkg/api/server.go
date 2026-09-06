@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -907,6 +908,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	memTotalGB, memFreePercent := readMemoryTotals()
 	diskPct, diskTotalGB, diskFreeGB := readDiskUsage()
+	rebootRequired, rebootPkgs := readRebootRequired()
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"hostname":        hostname,
 		"state":           st,
@@ -921,6 +923,11 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		"disk":            diskPct,
 		"disk_total_gb":   diskTotalGB,
 		"disk_free_gb":    diskFreeGB,
+		// OS-omstart krävs efter paketuppdateringar (kärna/libc m.m.).
+		// apt/unattended-upgrades skapar /run/reboot-required; samma signal
+		// som visas i CLI:ns MOTD vid inloggning ska synas i GUI:t.
+		"reboot_required":      rebootRequired,
+		"reboot_required_pkgs": rebootPkgs,
 		// Backends som inte kunde appliceras men som inte är trafikstyrande
 		// (i praktiken IDS) — appliceringen gick igenom, men funktionen är
 		// inte igång och det ska synas i GUI:t i stället för att tyst
@@ -950,6 +957,45 @@ func readUptime() string {
 	hours := int(d.Hours())
 	minutes := int(d.Minutes()) % 60
 	return fmt.Sprintf("%dh %dm", hours, minutes)
+}
+
+// readRebootRequired speglar samma signal som CLI:ns inloggnings-MOTD:
+// apt/unattended-upgrades skapar /run/reboot-required när en installerad
+// uppdatering (kärna, libc, m.m.) inte träder i kraft förrän maskinen
+// startats om, och listar de utlösande paketen i .pkgs-filen. Returnerar
+// om omstart behövs samt en (avdubblerad) lista över paketen — så GUI:t kan
+// visa en banner i stället för att administratören bara ser det i CLI:n.
+func readRebootRequired() (required bool, pkgs []string) {
+	// /var/run är en symlänk till /run på moderna system; prova båda så att
+	// funktionen är robust oavsett distro-layout.
+	found := false
+	for _, p := range []string{"/run/reboot-required", "/var/run/reboot-required"} {
+		if _, err := os.Stat(p); err == nil {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, nil
+	}
+	seen := map[string]bool{}
+	for _, p := range []string{"/run/reboot-required.pkgs", "/var/run/reboot-required.pkgs"} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			name := strings.TrimSpace(line)
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			pkgs = append(pkgs, name)
+		}
+		break
+	}
+	sort.Strings(pkgs)
+	return true, pkgs
 }
 
 // cpuSample är den senast uträknade CPU-belastningen, uppdaterad av
